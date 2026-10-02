@@ -1980,6 +1980,32 @@ fn reconcile_cfg_attr_semantics(attrs: &mut Vec<rustdoc_types::Attribute>, cfg: 
         }
     }
 
+    let doc_features = cfg_attr_target_features(&doc);
+    let normal_features = cfg_attr_target_features(&normal);
+    if doc_features != normal_features {
+        let mut enable = attrs
+            .iter()
+            .filter_map(|attr| match attr {
+                rustdoc_types::Attribute::TargetFeature { enable } => Some(enable),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        for feature in &doc_features {
+            // Rustdoc merges annotations but retains duplicate entries. Remove
+            // one conditional occurrence so unconditional features survive.
+            if let Some(position) = enable.iter().position(|entry| entry == feature) {
+                enable.remove(position);
+            }
+        }
+        enable.extend(normal_features);
+        attrs.retain(|attr| !matches!(attr, rustdoc_types::Attribute::TargetFeature { .. }));
+        if !enable.is_empty() {
+            attrs.push(rustdoc_types::Attribute::TargetFeature { enable });
+        }
+    }
+
     let doc_repr = cfg_attr_repr(&doc);
     let normal_repr = cfg_attr_repr(&normal);
     if doc_repr != normal_repr {
@@ -2051,6 +2077,32 @@ fn semantic_cfg_attr_outputs(outputs: &[syn::Meta]) -> Vec<rustdoc_types::Attrib
             }
             _ => None,
         })
+        .collect()
+}
+
+fn cfg_attr_target_features(outputs: &[syn::Meta]) -> Vec<String> {
+    outputs
+        .iter()
+        .filter_map(|meta| match meta {
+            syn::Meta::List(list) if cfg_path(&list.path) == "target_feature" => {
+                syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated
+                    .parse2(list.tokens.clone())
+                    .ok()
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|field| {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = field.value
+            else {
+                return None;
+            };
+            (cfg_path(&field.path) == "enable").then(|| value.value())
+        })
+        .flat_map(|value| value.split(',').map(ToOwned::to_owned).collect::<Vec<_>>())
         .collect()
 }
 

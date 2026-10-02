@@ -85,6 +85,7 @@ pub(crate) enum ReportedAttribute {
     Repr(AttributeRepr),
     NonExhaustive,
     MustUse { reason: Option<String> },
+    TargetFeature { enable: Vec<String> },
 }
 
 impl ReportedAttribute {
@@ -96,6 +97,9 @@ impl ReportedAttribute {
             Self::MustUse {
                 reason: Some(reason),
             } => format!("#[must_use = {reason:?}]"),
+            Self::TargetFeature { enable } => {
+                format!("#[target_feature(enable = {:?})]", enable.join(","))
+            }
         }
     }
 }
@@ -1624,6 +1628,9 @@ fn reported_attributes(attrs: &[Attribute]) -> Vec<ReportedAttribute> {
             Attribute::NonExhaustive => Some(ReportedAttribute::NonExhaustive),
             Attribute::MustUse { reason } => Some(ReportedAttribute::MustUse {
                 reason: reason.clone(),
+            }),
+            Attribute::TargetFeature { enable } => Some(ReportedAttribute::TargetFeature {
+                enable: enable.clone(),
             }),
             _ => None,
         })
