@@ -1593,14 +1593,13 @@ fn expanded_api_shape(
                     .map(|(_, path, _)| text(source, path.span()))
                     .transpose()?
                     .unwrap_or_default();
-                if imp
-                    .attrs
-                    .iter()
-                    .any(|attr| attr.path().is_ident("automatically_derived"))
-                    && imp.trait_.is_some()
-                {
-                    let (_, trait_path, _) = imp.trait_.as_ref().unwrap();
-                    let trait_name = if trait_path.leading_colon.is_some()
+                if let Some((polarity, trait_path, _)) = &imp.trait_ {
+                    let derived = imp
+                        .attrs
+                        .iter()
+                        .any(|attr| attr.path().is_ident("automatically_derived"));
+                    let trait_name = if derived
+                        && trait_path.leading_colon.is_some()
                         && trait_path.segments.first().is_some_and(|segment| {
                             segment.ident == "core" || segment.ident == "std"
                         }) {
@@ -1625,10 +1624,14 @@ fn expanded_api_shape(
                     } else {
                         ""
                     };
+                    let polarity = if polarity.is_some() { "!" } else { "" };
+                    let prefix = if derived { "derived " } else { "" };
                     shapes.insert(format!(
-                        "derived {safety}impl{generics} {trait_name} for {owner}{where_clause}"
+                        "{prefix}{safety}impl{generics} {polarity}{trait_name} for {owner}{where_clause}"
                     ));
-                    continue;
+                    if derived {
+                        continue;
+                    }
                 }
                 let generics = text(source, imp.generics.span())?;
                 for member in &imp.items {
@@ -3796,6 +3799,37 @@ mod qualified_external {
             .collect::<Vec<_>>();
         assert_eq!(methods.len(), 1, "{methods:?}");
         assert!(methods[0].contains("fn real(&self)"), "{methods:?}");
+    }
+
+    #[test]
+    fn expansion_trait_impl_headers_preserve_semantic_constraints() {
+        let import = crate::imports::parse_use_line("use dep::S;").unwrap();
+        let source = "pub struct S<T>(T); impl<T: Copy> crate::Marker<(T,u8)> for crate::S<T> where T: Send {}";
+        let normal = expanded_api_shape(source, &import, false).unwrap();
+        assert!(
+            normal
+                .shapes
+                .contains("impl<T: Copy> crate::Marker<(T,u8)> for crate::S<T> where T: Send"),
+            "{:?}",
+            normal.shapes
+        );
+        for changed in [
+            source.replace("impl<T:", "unsafe impl<T:"),
+            source.replace("crate::Marker", "!crate::Marker"),
+            source.replace("T: Copy", "T: Clone"),
+            source.replace("where T: Send", "where T: Sync"),
+            source.replace("Marker<(T,u8)>", "Marker<(T,u16)>"),
+            source.replace("for crate::S<T>", "for crate::S<u8>"),
+        ] {
+            let doc = expanded_api_shape(&changed, &import, false).unwrap();
+            assert!(
+                normal
+                    .shapes
+                    .difference(&doc.shapes)
+                    .any(|shape| shape.contains("impl")),
+                "{changed}"
+            );
+        }
     }
 
     #[test]

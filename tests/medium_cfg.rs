@@ -203,6 +203,71 @@ fn normal_only_modules_report_missing_cross_module_methods() {
 }
 
 #[test]
+fn normal_only_empty_trait_impls_report_incomplete_extraction() {
+    let workspace = workspace("");
+    for (trait_definition, impl_header, consumer) in [
+        (
+            "pub trait Marker {}",
+            "impl crate::Marker for crate::S {}",
+            "fn require<T: dep::Marker>() {} pub fn check() { require::<dep::S>(); }",
+        ),
+        (
+            "pub trait Defaults { fn provided(&self) -> u8 { 7 } }",
+            "impl crate::Defaults for crate::S {}",
+            "pub fn check() -> u8 { <dep::S as dep::Defaults>::provided(&dep::S) }",
+        ),
+    ] {
+        let source = format!(
+            "pub struct S; pub use S as PublicAlias; pub struct Unrelated;\n{trait_definition}\n#[cfg(not(doc))] mod implementation {{ {impl_header} }}\n"
+        );
+        fs::write(workspace.path().join("dep/src/lib.rs"), &source).unwrap();
+        fs::write(workspace.path().join("app/src/lib.rs"), consumer).unwrap();
+        let compiler = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "-p", "app"])
+            .current_dir(workspace.path())
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            compiler.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiler.stderr)
+        );
+        for name in ["S", "PublicAlias"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_excra"))
+                .arg(format!("use dep::{name};"))
+                .arg("--root")
+                .arg(workspace.path())
+                .args(["--package", "app"])
+                .env("CARGO_NET_OFFLINE", "true")
+                .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+            assert!(
+                stderr.contains("non-doc API extraction is incomplete")
+                    && stderr.contains(impl_header.trim_end_matches(" {}"))
+                    && stderr.contains("absent under cfg(doc)"),
+                "{name}: {stderr}"
+            );
+        }
+        assert!(query(&workspace, "Unrelated", &[]).contains("pub struct Unrelated;"));
+        fs::write(
+            workspace.path().join("dep/src/lib.rs"),
+            source.replace("#[cfg(not(doc))] ", ""),
+        )
+        .unwrap();
+        let report = query(&workspace, "S", &[]);
+        let trait_name = trait_definition.split_whitespace().nth(2).unwrap();
+        assert!(
+            report.contains(&format!("impl {trait_name} for crate::S")),
+            "{report}"
+        );
+    }
+}
+
+#[test]
 fn feature_metadata_preserves_workspace_config_directory() {
     let workspace = workspace("pub struct S;\n");
     fs::create_dir_all(workspace.path().join("app/.cargo")).unwrap();
