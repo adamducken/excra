@@ -138,6 +138,169 @@ mod tests {
         transitive_query(true);
     }
 
+    #[test]
+    fn dependency_queries_do_not_require_consumer_documentation() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"facade\", \"origin\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        let app_manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\nautolib = false\nautobins = false\n[features]\nextra = [\"facade/extra\"]\n[dependencies]\nfacade = { path = \"../facade\" }\n";
+        write_package(&workspace, "app", &format!("{app_manifest}[lib]\n"), "");
+        write_package(
+            &workspace,
+            "facade",
+            "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\nextra = [\"origin/extra\"]\n[dependencies]\norigin = { path = \"../origin\" }\n",
+            "pub struct Thing; pub use origin::Versioned;\n",
+        );
+        write_package(
+            &workspace,
+            "origin",
+            "[package]\nname = \"origin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\nextra = []\n",
+            "#[cfg(feature = \"extra\")] pub struct Versioned { pub extra: u8 }\n#[cfg(not(feature = \"extra\"))] pub struct Versioned { pub basic: u16 }\n",
+        );
+        let lock = Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        assert!(
+            lock.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        fs::write(workspace.path().join("app/src/other.rs"), "fn main() {}\n").unwrap();
+
+        for (targets, filename, source) in [
+            ("[lib]\ndoc = false\n", "lib.rs", ""),
+            ("[lib]\n", "lib.rs", "use facade::DoesNotExist;\n"),
+            (
+                "[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\ndoc = false\n",
+                "main.rs",
+                "fn main() {}\n",
+            ),
+            (
+                "[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n",
+                "main.rs",
+                "use facade::DoesNotExist; fn main() {}\n",
+            ),
+            (
+                "[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\ndoc = false\n[[bin]]\nname = \"other\"\npath = \"src/other.rs\"\ndoc = false\n",
+                "main.rs",
+                "use facade::DoesNotExist; fn main() {}\n",
+            ),
+        ] {
+            fs::write(
+                workspace.path().join("app/Cargo.toml"),
+                format!("{app_manifest}{targets}"),
+            )
+            .unwrap();
+            fs::write(workspace.path().join("app/src").join(filename), source).unwrap();
+            for extra in [false, true] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_excra"));
+                command
+                    .arg("use facade::{Thing, Versioned};")
+                    .arg("--root")
+                    .arg(workspace.path())
+                    .args(["--package", "app"])
+                    .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                    .env("CARGO_NET_OFFLINE", "true")
+                    .env("RUSTDOCFLAGS", "--this-flag-is-invalid")
+                    .env("CARGO_ENCODED_RUSTDOCFLAGS", "--another-invalid-flag");
+                if extra {
+                    command.args(["--features", "extra"]);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{targets}: {source}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(stdout.contains("definition: pub struct Thing;"), "{stdout}");
+                let field = if extra { "extra: u8" } else { "basic: u16" };
+                assert!(
+                    stdout.contains(&format!(
+                        "definition: pub struct Versioned {{ pub {field} }}"
+                    )),
+                    "{stdout}"
+                );
+            }
+        }
+        let manifest = workspace.path().join("app/Cargo.toml");
+        let contents = fs::read_to_string(&manifest).unwrap();
+        fs::write(
+            manifest,
+            format!("{contents}[build-dependencies]\nfacade = {{ path = \"../facade\", features = [\"extra\"] }}\n"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("app/build.rs"),
+            "fn main() { let _ = facade::Versioned { extra: 1 }; }\n",
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_excra"))
+            .arg("use facade::Versioned;")
+            .arg("--root")
+            .arg(workspace.path())
+            .args(["--package", "app", "--include-build"])
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("basic: u16") && stdout.contains("extra: u8"),
+            "{stdout}"
+        );
+
+        fs::write(
+            workspace.path().join("app/build.rs"),
+            "fn main() { panic!(\"consumer build script intentionally fails\"); }\n",
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_excra"))
+            .arg("use facade::Thing;")
+            .arg("--root")
+            .arg(workspace.path())
+            .args(["--package", "app"])
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("consumer build script intentionally fails")
+        );
+
+        fs::write(
+            workspace.path().join("origin/src/lib.rs"),
+            "compile_error!(\"selected dependency intentionally fails\"); pub struct Versioned;\n",
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_excra"))
+            .arg("use facade::Versioned;")
+            .arg("--root")
+            .arg(workspace.path())
+            .args(["--package", "app"])
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("selected dependency intentionally fails")
+        );
+    }
+
     fn transitive_query(same_package: bool) {
         let workspace = TempDir::new().unwrap();
         fs::write(

@@ -2367,7 +2367,14 @@ fn generate_json_with_toolchain(
     if context_kind == DependencyKind::Development {
         command.args(["test", "--no-run"]);
     } else {
-        command.arg("rustdoc");
+        command
+            .arg("rustdoc")
+            .arg(root_target_selector(request.root_package));
+        // Cargo still compiles the dependencies in the selected root context.
+        // Rustdoc's help mode skips consumer source and documentation checks.
+        command
+            .env("RUSTDOCFLAGS", "--help")
+            .env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
     }
     command
         .args(["--manifest-path"])
@@ -3457,7 +3464,9 @@ pub(crate) fn resolved_unit(
     if only_dev {
         command.args(["test", "--no-run"]);
     } else {
-        command.arg("rustdoc");
+        command
+            .arg("rustdoc")
+            .arg(root_target_selector(root_package));
     }
     command.args(["--manifest-path"]).arg(manifest_path).args([
         "--locked",
@@ -3673,6 +3682,14 @@ fn unit_identity(unit: &Unit) -> CargoUnitIdentity {
         mode: unit.mode.clone(),
         platform: unit.platform.clone(),
         profile: serde_json::to_string(&unit.profile).expect("Cargo profile serializes"),
+    }
+}
+
+fn root_target_selector(package: &Package) -> &'static str {
+    if package.targets.iter().any(is_library_target) {
+        "--lib"
+    } else {
+        "--bins"
     }
 }
 
