@@ -1023,32 +1023,9 @@ fn reject_non_doc_expansion(
             paths.push(canonical);
         }
     }
-    let reported_trait_members = resolved_id
+    let reported_members = resolved_id
         .and_then(|id| krate.index.get(&id))
-        .and_then(|item| match &item.inner {
-            rustdoc_types::ItemEnum::Trait(trait_) => Some(trait_),
-            _ => None,
-        })
-        .map(|trait_| {
-            trait_
-                .items
-                .iter()
-                .filter_map(|id| {
-                    let item = krate.index.get(id)?;
-                    let (kind, has_default) = match &item.inner {
-                        rustdoc_types::ItemEnum::Function(method) => ("method", method.has_body),
-                        rustdoc_types::ItemEnum::AssocConst { value, .. } => {
-                            ("const", value.is_some())
-                        }
-                        rustdoc_types::ItemEnum::AssocType { type_, .. } => {
-                            ("type", type_.is_some())
-                        }
-                        _ => return None,
-                    };
-                    Some(trait_member_key(kind, item.name.as_deref()?, has_default))
-                })
-                .collect::<HashSet<_>>()
-        });
+        .and_then(|item| reported_api_members(krate, item));
     let mut missing_impls = Vec::new();
     for path in paths {
         let normal = expanded_api_shape(&normal, &path, legacy_use_paths)?;
@@ -1063,14 +1040,18 @@ fn reject_non_doc_expansion(
                 ));
             }
         }
-        if let Some(reported_members) = &reported_trait_members {
-            for (member, shape) in &normal.trait_members {
-                if !reported_members.contains(member) {
+        if let Some(mut reported_members) = reported_members.clone() {
+            // Count repeated names across inherent impls: one surviving method
+            // must not conceal a missing method on another specialization.
+            for (member, shape) in &normal.members {
+                let count = reported_members.entry(member.clone()).or_default();
+                if *count == 0 {
                     return Err(format!(
-                        "non-doc API extraction is incomplete: compiler expansion for '{}' contains {shape}, which is absent from the filtered Rustdoc JSON trait members",
+                        "non-doc API extraction is incomplete: compiler expansion for '{}' contains {shape}, which is absent from the filtered Rustdoc JSON members",
                         path.full_path()
                     ));
                 }
+                *count -= 1;
             }
         }
     }
@@ -1082,7 +1063,11 @@ fn reject_non_doc_expansion(
 #[derive(Default)]
 struct ExpandedApi {
     shapes: HashSet<String>,
-    trait_members: HashMap<String, String>,
+    members: Vec<(String, String)>,
+}
+
+fn member_key(prefix: &str, name: &str) -> String {
+    format!("{prefix} {}", crate::imports::identifier_key(name))
 }
 
 fn trait_member_key(kind: &str, name: &str, has_default: bool) -> String {
@@ -1091,6 +1076,110 @@ fn trait_member_key(kind: &str, name: &str, has_default: bool) -> String {
         "{requirement} trait {kind} {}",
         crate::imports::identifier_key(name)
     )
+}
+
+fn reported_api_members(
+    krate: &Crate,
+    item: &rustdoc_types::Item,
+) -> Option<HashMap<String, usize>> {
+    use rustdoc_types::{ItemEnum, StructKind, VariantKind, Visibility};
+
+    fn collect(
+        krate: &Crate,
+        item: &rustdoc_types::Item,
+        prefix: &str,
+        members: &mut HashMap<String, usize>,
+    ) {
+        let name = item.name.as_deref().unwrap_or_default();
+        let mut prefix = prefix.to_string();
+        let key = match &item.inner {
+            ItemEnum::StructField(_)
+                if matches!(item.visibility, Visibility::Public | Visibility::Default) =>
+            {
+                Some(member_key(&format!("{prefix} field"), name))
+            }
+            ItemEnum::Variant(_) => {
+                prefix = member_key("variant", name);
+                Some(prefix.clone())
+            }
+            ItemEnum::Function(method) if prefix == "trait" => {
+                Some(trait_member_key("method", name, method.has_body))
+            }
+            ItemEnum::AssocConst { value, .. } if prefix == "trait" => {
+                Some(trait_member_key("const", name, value.is_some()))
+            }
+            ItemEnum::AssocType { type_, .. } if prefix == "trait" => {
+                Some(trait_member_key("type", name, type_.is_some()))
+            }
+            ItemEnum::Function(_) | ItemEnum::AssocConst { .. }
+                if prefix == "inherent"
+                    && matches!(item.visibility, Visibility::Public | Visibility::Default) =>
+            {
+                let kind = if matches!(item.inner, ItemEnum::Function(_)) {
+                    "method"
+                } else {
+                    "const"
+                };
+                Some(member_key(&format!("inherent {kind}"), name))
+            }
+            _ => None,
+        };
+        if let Some(key) = key {
+            *members.entry(key).or_default() += 1;
+        }
+        let tuple_fields = match &item.inner {
+            ItemEnum::Struct(item) => match &item.kind {
+                StructKind::Tuple(fields) => Some(fields),
+                _ => None,
+            },
+            ItemEnum::Variant(item) => match &item.kind {
+                VariantKind::Tuple(fields) => Some(fields),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(fields) = tuple_fields {
+            // Pruning can change tuple positions; validate the positions that
+            // the filtered graph actually reports, preserving private slots.
+            for (index, id) in fields.iter().enumerate() {
+                if let Some(child) = id.and_then(|id| krate.index.get(&id))
+                    && matches!(child.visibility, Visibility::Public | Visibility::Default)
+                {
+                    *members
+                        .entry(member_key(&format!("{prefix} field"), &index.to_string()))
+                        .or_default() += 1;
+                }
+            }
+        } else {
+            for id in lexical_children(&item.inner) {
+                if let Some(child) = krate.index.get(&id) {
+                    collect(krate, child, &prefix, members);
+                }
+            }
+        }
+    }
+
+    let (prefix, impls) = match &item.inner {
+        ItemEnum::Struct(item) => ("struct", item.impls.as_slice()),
+        ItemEnum::Enum(item) => ("enum", item.impls.as_slice()),
+        ItemEnum::Union(item) => ("union", item.impls.as_slice()),
+        ItemEnum::Trait(_) => ("trait", &[][..]),
+        ItemEnum::Variant(_) => ("variant", &[][..]),
+        _ => return None,
+    };
+    let mut members = HashMap::new();
+    collect(krate, item, prefix, &mut members);
+    for id in impls {
+        if let Some(item) = krate.index.get(id)
+            && let ItemEnum::Impl(imp) = &item.inner
+            && imp.trait_.is_none()
+            && !imp.is_negative
+            && !imp.is_synthetic
+        {
+            collect(krate, item, "inherent", &mut members);
+        }
+    }
+    Some(members)
 }
 
 fn expanded_api_shape(
@@ -1138,6 +1227,7 @@ fn expanded_api_shape(
         fields: &Fields,
         prefix: &str,
         shapes: &mut HashSet<String>,
+        members: &mut Vec<(String, String)>,
     ) -> Result<(), String> {
         let kind = match fields {
             Fields::Named(_) => "named",
@@ -1150,11 +1240,15 @@ fn expanded_api_shape(
                 .ident
                 .as_ref()
                 .map_or_else(|| index.to_string(), ToString::to_string);
-            shapes.insert(format!(
+            let shape = format!(
                 "{prefix} field {name}: {} {}",
                 visibility(source, &field.vis)?,
                 text(source, field.ty.span())?
-            ));
+            );
+            shapes.insert(shape.clone());
+            if prefix.starts_with("variant ") || matches!(field.vis, Visibility::Public(_)) {
+                members.push((member_key(&format!("{prefix} field"), &name), shape));
+            }
         }
         Ok(())
     }
@@ -1440,7 +1534,7 @@ fn expanded_api_shape(
                             visibility(source, &item.vis)?,
                             text(source, item.generics.span())?
                         ));
-                        fields(source, &item.fields, "struct", shapes)?;
+                        fields(source, &item.fields, "struct", shapes, &mut api.members)?;
                     }
                     Item::Enum(item) => {
                         shapes.insert(format!(
@@ -1449,9 +1543,10 @@ fn expanded_api_shape(
                             text(source, item.generics.span())?
                         ));
                         for variant in &item.variants {
-                            let prefix = format!("variant {}", variant.ident);
+                            let prefix = member_key("variant", &variant.ident.to_string());
                             shapes.insert(prefix.clone());
-                            fields(source, &variant.fields, &prefix, shapes)?;
+                            api.members.push((prefix.clone(), prefix.clone()));
+                            fields(source, &variant.fields, &prefix, shapes, &mut api.members)?;
                             if let Some((_, discriminant)) = &variant.discriminant {
                                 shapes.insert(format!(
                                     "{prefix} discriminant {}",
@@ -1467,12 +1562,22 @@ fn expanded_api_shape(
                             text(source, item.generics.span())?
                         ));
                         for field in &item.fields.named {
-                            shapes.insert(format!(
+                            let shape = format!(
                                 "union field {}: {} {}",
                                 field.ident.as_ref().expect("union fields are named"),
                                 visibility(source, &field.vis)?,
                                 text(source, field.ty.span())?
-                            ));
+                            );
+                            shapes.insert(shape.clone());
+                            if matches!(field.vis, Visibility::Public(_)) {
+                                api.members.push((
+                                    member_key(
+                                        "union field",
+                                        &field.ident.as_ref().unwrap().to_string(),
+                                    ),
+                                    shape,
+                                ));
+                            }
                         }
                     }
                     Item::Fn(item) => {
@@ -1556,13 +1661,27 @@ fn expanded_api_shape(
                                 _ => continue,
                             };
                             shapes.insert(shape.clone());
-                            api.trait_members.insert(key, shape);
+                            api.members.push((key, shape));
                         }
                     }
                     _ => {
                         shapes.insert(format!("item {}", text(source, item.span())?));
                     }
                 }
+            }
+            if let Item::Enum(item) = item
+                && modules.len() + 2 == wanted.len()
+                && modules == &wanted[..modules.len()]
+                && crate::imports::identifier_key(&item.ident.to_string()) == wanted[modules.len()]
+                && let Some(variant) = item.variants.iter().find(|variant| {
+                    crate::imports::identifier_key(&variant.ident.to_string())
+                        == wanted[modules.len() + 1]
+                })
+            {
+                let prefix = member_key("variant", &variant.ident.to_string());
+                shapes.insert(prefix.clone());
+                api.members.push((prefix.clone(), prefix.clone()));
+                fields(source, &variant.fields, &prefix, shapes, &mut api.members)?;
             }
             if let Item::Use(item) = item
                 && modules == &wanted[..wanted.len() - 1]
@@ -1655,9 +1774,29 @@ fn expanded_api_shape(
                         _ => None,
                     };
                     if let Some(signature) = signature {
-                        shapes.insert(format!(
-                            "impl{generics} {trait_name} for {owner}: {signature}"
-                        ));
+                        let shape = format!("impl{generics} {trait_name} for {owner}: {signature}");
+                        shapes.insert(shape.clone());
+                        if imp.trait_.is_none() {
+                            let key = match member {
+                                ImplItem::Fn(method)
+                                    if matches!(method.vis, Visibility::Public(_)) =>
+                                {
+                                    Some(member_key(
+                                        "inherent method",
+                                        &method.sig.ident.to_string(),
+                                    ))
+                                }
+                                ImplItem::Const(constant)
+                                    if matches!(constant.vis, Visibility::Public(_)) =>
+                                {
+                                    Some(member_key("inherent const", &constant.ident.to_string()))
+                                }
+                                _ => None,
+                            };
+                            if let Some(key) = key {
+                                api.members.push((key, shape));
+                            }
+                        }
                     }
                 }
             }

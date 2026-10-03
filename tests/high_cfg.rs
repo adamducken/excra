@@ -209,7 +209,7 @@ fn procedural_macro_api_changes_report_incomplete_extraction() {
     let macros = fs::read_to_string(&macro_path).unwrap();
     fs::write(
         macro_path,
-        macros + r#"
+        macros + r###"
 #[proc_macro_attribute]
 pub fn identical(mode: TokenStream, _: TokenStream) -> TokenStream {
     let (name, member) = match mode.to_string().as_str() {
@@ -227,6 +227,108 @@ pub fn identical(mode: TokenStream, _: TokenStream) -> TokenStream {
 pub fn stable(_: TokenStream, _: TokenStream) -> TokenStream {
     "pub trait StableContract { fn r#type(&self); fn optional(&self) {} const REQUIRED: u8; const DEFAULT: u8 = 7; type Item; type Default = u8; } pub trait Ambiguous { fn required(&self); } #[macro_export] macro_rules! Ambiguous { () => {} }".parse().unwrap()
 }
+#[proc_macro]
+pub fn members(_: TokenStream) -> TokenStream {
+    r##"
+pub struct IdenticalFields {
+    #[cfg(not(doc))] pub r#type: u8,
+    #[cfg(doc)] pub r#type: u8,
+}
+pub use IdenticalFields as FieldsAlias;
+pub struct IdenticalTuple(
+    #[cfg(not(doc))] pub u8,
+    #[cfg(doc)] pub u8,
+);
+pub struct ShiftedTuple(
+    #[cfg(not(doc))] u8,
+    #[cfg(doc)] u8,
+    pub u16,
+);
+pub union IdenticalUnion {
+    #[cfg(not(doc))] pub byte: u8,
+    #[cfg(doc)] pub byte: u8,
+}
+pub enum IdenticalVariants {
+    Base,
+    #[cfg(not(doc))] Extra(u8),
+    #[cfg(doc)] Extra(u8),
+}
+pub enum IdenticalVariantFields {
+    Named { #[cfg(not(doc))] byte: u8, #[cfg(doc)] byte: u8 },
+    Tuple(#[cfg(not(doc))] u8, #[cfg(doc)] u8),
+}
+pub use IdenticalVariantFields::Named as NamedAlias;
+pub struct IdenticalMethods;
+impl IdenticalMethods {
+    #[cfg(not(doc))] pub fn r#type(&self) {}
+    #[cfg(doc)] pub fn r#type(&self) {}
+}
+pub struct IdenticalConstants;
+impl IdenticalConstants {
+    #[cfg(not(doc))] pub const VALUE: u8 = 7;
+    #[cfg(doc)] pub const VALUE: u8 = 7;
+}
+pub struct IdenticalImpl;
+#[cfg(not(doc))] impl IdenticalImpl { pub fn live(&self) {} }
+#[cfg(doc)] impl IdenticalImpl { pub fn live(&self) {} }
+pub struct Specialized<T>(T);
+impl Specialized<u8> { pub fn live(&self) {} }
+impl Specialized<u16> {
+    #[cfg(not(doc))] pub fn live(&self) {}
+    #[cfg(doc)] pub fn live(&self) {}
+}
+pub struct StableMembers {
+    pub r#type: u8,
+    #[cfg(not(doc))] private: u8,
+    #[cfg(doc)] private: u8,
+    pub(crate) restricted: u8,
+}
+pub struct StableTuple(u8, pub u8);
+pub union StableUnion { pub byte: u8, private: u8 }
+pub enum StableVariants { Base, Named { r#type: u8 }, Tuple(u8), r#type }
+impl StableMembers {
+    pub fn r#type(&self) {}
+    #[cfg(not(doc))] fn private(&self) {}
+    #[cfg(doc)] fn private(&self) {}
+    pub(crate) fn restricted(&self) {}
+    pub const VALUE: u8 = 7;
+    const PRIVATE: u8 = 0;
+    pub(crate) const RESTRICTED: u8 = 0;
+}
+pub struct StableSpecialized<T>(T);
+impl StableSpecialized<u8> { pub fn live(&self) {} }
+impl StableSpecialized<u16> { pub fn live(&self) {} }
+"##.parse().unwrap()
+}
+"###,
+    )
+    .unwrap();
+    let dep_path = workspace.path().join("dep/src/lib.rs");
+    let source = fs::read_to_string(&dep_path).unwrap();
+    fs::write(dep_path, source + "\nshape::members!();\n").unwrap();
+    let app_path = workspace.path().join("app/src/lib.rs");
+    let source = fs::read_to_string(&app_path).unwrap();
+    fs::write(
+        app_path,
+        source
+            + r#"
+pub fn generated_check() {
+    let packet = dep::IdenticalFields { r#type: 1 };
+    let _: u8 = packet.r#type;
+    let _: u8 = dep::IdenticalTuple(1).0;
+    let _ = dep::IdenticalUnion { byte: 1 };
+    let _ = dep::IdenticalVariants::Extra(1);
+    let _ = dep::IdenticalVariantFields::Named { byte: 1 };
+    let _ = dep::IdenticalVariantFields::Tuple(1);
+    dep::IdenticalMethods.r#type();
+    let _: u8 = dep::IdenticalConstants::VALUE;
+    dep::IdenticalImpl.live();
+}
+pub fn specialized_check(a: dep::Specialized<u8>, b: dep::Specialized<u16>) {
+    a.live();
+    b.live();
+}
+pub fn tuple_check(value: dep::ShiftedTuple) -> u16 { value.1 }
 "#,
     )
     .unwrap();
@@ -294,6 +396,20 @@ pub fn stable(_: TokenStream, _: TokenStream) -> TokenStream {
         ),
         ("DefaultConstContract", "provided trait const VALUE", true),
         ("DefaultTypeContract", "provided trait type Item", true),
+        ("IdenticalFields", "field r#type", true),
+        ("FieldsAlias", "field r#type", true),
+        ("IdenticalTuple", "field 0", true),
+        ("ShiftedTuple", "field 1", true),
+        ("IdenticalUnion", "field byte", true),
+        ("IdenticalVariants", "variant Extra", true),
+        ("IdenticalVariantFields", "field", true),
+        ("IdenticalVariantFields::Named", "field byte", true),
+        ("IdenticalVariantFields::Tuple", "field 0", true),
+        ("NamedAlias", "field byte", true),
+        ("IdenticalMethods", "fn r#type", true),
+        ("IdenticalConstants", "const VALUE", true),
+        ("IdenticalImpl", "fn live", true),
+        ("Specialized", "fn live", true),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_excra"))
             .args([
@@ -324,10 +440,7 @@ pub fn stable(_: TokenStream, _: TokenStream) -> TokenStream {
             assert!(stderr.contains(missing), "{name}: {stderr}");
         }
         if filtered {
-            assert!(
-                stderr.contains("filtered Rustdoc JSON trait members"),
-                "{name}: {stderr}"
-            );
+            assert!(stderr.contains("filtered Rustdoc JSON"), "{name}: {stderr}");
         }
     }
     let missing_glob = Command::new(env!("CARGO_BIN_EXE_excra"))
@@ -367,6 +480,52 @@ pub fn stable(_: TokenStream, _: TokenStream) -> TokenStream {
         String::from_utf8_lossy(&unaffected.stderr)
     );
     assert!(String::from_utf8_lossy(&unaffected.stdout).contains("pub struct Plain;"));
+
+    for (name, members) in [
+        (
+            "StableMembers",
+            vec![
+                "pub r#type: u8",
+                "pub fn r#type(",
+                "pub const VALUE: u8 = 7;",
+            ],
+        ),
+        ("StableTuple", vec!["pub u8"]),
+        ("StableUnion", vec!["pub byte: u8"]),
+        (
+            "StableVariants",
+            vec!["Base", "Named { r#type: u8 }", "Tuple(u8)"],
+        ),
+        ("StableVariants::Named", vec!["Named { r#type: u8 }"]),
+        ("StableVariants::Tuple", vec!["Tuple(u8)"]),
+        (
+            "StableSpecialized",
+            vec!["impl StableSpecialized<u8>", "impl StableSpecialized<u16>"],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_excra"))
+            .arg(format!("use dep::{name};"))
+            .arg("--root")
+            .arg(workspace.path())
+            .args(["--package", "app"])
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8(output.stdout).unwrap();
+        for member in members {
+            assert!(report.contains(member), "{name}: {member}: {report}");
+        }
+        assert!(!report.contains("fn private("), "{report}");
+        assert!(!report.contains("const PRIVATE:"), "{report}");
+        assert!(!report.contains("restricted"), "{report}");
+        assert!(!report.contains("const RESTRICTED:"), "{report}");
+    }
 
     for name in ["StableContract", "StableAlias"] {
         let output = Command::new(env!("CARGO_BIN_EXE_excra"))

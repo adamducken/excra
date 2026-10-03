@@ -226,6 +226,10 @@ Consequences:
   field, variant, or associated member present only in the normal expansion
   produces an incomplete-extraction error. This covers API emitted by external
   procedural macros and `include!` even when its cfg is absent from local source.
+  Public fields, variants, inherent methods and constants, and trait members
+  are also checked against the filtered Rustdoc graph. Missing members produce
+  an incomplete-extraction error even when both compiler expansions agree,
+  such as identical generated members behind opposite `cfg(doc)` conditions.
   If Rustdoc omits a queried name entirely, a compiler-accepted import also
   produces an incomplete-extraction error.
   Raw cfg identifiers are matched
