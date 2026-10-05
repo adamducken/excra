@@ -186,7 +186,7 @@ fn procedural_macro_api_changes_report_incomplete_extraction() {
         (
             "dep",
             "[dependencies]\nshape = { path = \"../shape\" }\n",
-            "#![feature(associated_type_defaults)]\nuse shape::{packet, method, missing, variants};\n#[packet] pub struct Packet;\n#[method] pub struct S;\n#[shape::contract] pub trait Contract {}\n#[shape::identical(required)] pub trait IdenticalContract {}\npub use IdenticalContract as ContractAlias;\npub mod contracts { #[shape::identical(required)] pub trait IdenticalContract {} }\n#[shape::identical(constant)] pub trait ConstContract {}\n#[shape::identical(assoc_type)] pub trait TypeContract {}\n#[shape::identical(provided)] pub trait ProvidedContract {}\n#[shape::identical(default_constant)] pub trait DefaultConstContract {}\n#[shape::identical(default_type)] pub trait DefaultTypeContract {}\n#[shape::stable] pub trait StableContract {}\npub use StableContract as StableAlias;\n#[variants] pub enum Choice {}\nmissing!();\npub mod nested { #[shape::packet] pub struct Packet; }\npub mod donor { #[shape::packet] pub struct Packet; shape::missing!(); }\npub mod api { pub use crate::donor::*; }\npub struct Included;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/included.rs\"));\npub struct Plain;\n",
+            "#![feature(associated_type_defaults, negative_impls)]\nuse shape::{packet, method, missing, variants};\n#[packet] pub struct Packet;\n#[method] pub struct S;\n#[shape::contract] pub trait Contract {}\n#[shape::identical(required)] pub trait IdenticalContract {}\npub use IdenticalContract as ContractAlias;\npub mod contracts { #[shape::identical(required)] pub trait IdenticalContract {} }\n#[shape::identical(constant)] pub trait ConstContract {}\n#[shape::identical(assoc_type)] pub trait TypeContract {}\n#[shape::identical(provided)] pub trait ProvidedContract {}\n#[shape::identical(default_constant)] pub trait DefaultConstContract {}\n#[shape::identical(default_type)] pub trait DefaultTypeContract {}\n#[shape::stable] pub trait StableContract {}\npub use StableContract as StableAlias;\n#[variants] pub enum Choice {}\nmissing!();\npub mod nested { #[shape::packet] pub struct Packet; }\npub mod donor { #[shape::packet] pub struct Packet; shape::missing!(); }\npub mod api { pub use crate::donor::*; }\npub struct Included;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/included.rs\"));\npub struct Plain;\n",
         ),
         (
             "shape",
@@ -244,6 +244,34 @@ pub struct ShiftedTuple(
     #[cfg(doc)] u8,
     pub u16,
 );
+pub struct PrivateOnly {
+    #[cfg(not(doc))] secret: u8,
+    #[cfg(doc)] secret: u8,
+}
+pub use PrivateOnly as PrivateAlias;
+pub struct PrivateTuple(#[cfg(not(doc))] u8, #[cfg(doc)] u8);
+pub use PrivateTuple as PrivateTupleAlias;
+pub union PrivateUnion {
+    #[cfg(not(doc))] secret: u8,
+    #[cfg(doc)] secret: u8,
+}
+pub struct TraitImpls;
+pub use TraitImpls as TraitAlias;
+pub trait Marker {}
+pub trait Defaults { fn answer(&self) -> u8 { 7 } }
+#[cfg(not(doc))] impl Marker for TraitImpls {}
+#[cfg(doc)] impl Marker for TraitImpls {}
+#[cfg(not(doc))] impl Defaults for TraitImpls {}
+#[cfg(doc)] impl Defaults for TraitImpls {}
+pub unsafe trait GenericMarker<T> {}
+pub struct Constrained<T>(T);
+pub use Constrained as ConstrainedAlias;
+#[cfg(not(doc))] unsafe impl<T: Copy> GenericMarker<(T, u8)> for Constrained<T> where T: Send {}
+#[cfg(doc)] unsafe impl<T: Copy> GenericMarker<(T, u8)> for Constrained<T> where T: Send {}
+pub trait NegativeMarker {}
+pub struct Negative;
+#[cfg(not(doc))] impl !NegativeMarker for Negative {}
+#[cfg(doc)] impl !NegativeMarker for Negative {}
 pub union IdenticalUnion {
     #[cfg(not(doc))] pub byte: u8,
     #[cfg(doc)] pub byte: u8,
@@ -329,6 +357,15 @@ pub fn specialized_check(a: dep::Specialized<u8>, b: dep::Specialized<u16>) {
     b.live();
 }
 pub fn tuple_check(value: dep::ShiftedTuple) -> u16 { value.1 }
+pub fn trait_impl_check() -> u8 {
+    fn needs<T: dep::Marker>() {}
+    needs::<dep::TraitImpls>();
+    needs::<dep::TraitAlias>();
+    fn constrained<T: dep::GenericMarker<(u8, u8)>>() {}
+    constrained::<dep::Constrained<u8>>();
+    constrained::<dep::ConstrainedAlias<u8>>();
+    <dep::TraitAlias as dep::Defaults>::answer(&dep::TraitImpls)
+}
 "#,
     )
     .unwrap();
@@ -399,7 +436,17 @@ pub fn tuple_check(value: dep::ShiftedTuple) -> u16 { value.1 }
         ("IdenticalFields", "field r#type", true),
         ("FieldsAlias", "field r#type", true),
         ("IdenticalTuple", "field 0", true),
-        ("ShiftedTuple", "field 1", true),
+        ("ShiftedTuple", "private field 0", true),
+        ("PrivateOnly", "private fields", true),
+        ("PrivateAlias", "private fields", true),
+        ("PrivateTuple", "private field 0", true),
+        ("PrivateTupleAlias", "private field 0", true),
+        ("PrivateUnion", "private fields", true),
+        ("TraitImpls", "impl", true),
+        ("TraitAlias", "impl", true),
+        ("Constrained", "unsafe impl<T: Copy>", true),
+        ("ConstrainedAlias", "unsafe impl<T: Copy>", true),
+        ("Negative", "impl !NegativeMarker", true),
         ("IdenticalUnion", "field byte", true),
         ("IdenticalVariants", "variant Extra", true),
         ("IdenticalVariantFields", "field", true),

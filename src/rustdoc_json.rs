@@ -1040,7 +1040,10 @@ fn reject_non_doc_expansion(
                 ));
             }
         }
-        if let Some(mut reported_members) = reported_members.clone() {
+        if let Some(reported) = &reported_members
+            && (normal.has_definition || doc.has_definition)
+        {
+            let mut reported_members = reported.members.clone();
             // Count repeated names across inherent impls: one surviving method
             // must not conceal a missing method on another specialization.
             for (member, shape) in &normal.members {
@@ -1053,6 +1056,66 @@ fn reject_non_doc_expansion(
                 }
                 *count -= 1;
             }
+            if let Some((member, _)) = reported_members.iter().find(|(_, count)| **count != 0) {
+                return Err(format!(
+                    "non-doc API extraction is incomplete: filtered Rustdoc JSON for '{}' reports {member}, which is absent from the normal compiler expansion",
+                    path.full_path()
+                ));
+            }
+            let mut normal_members: HashMap<&str, Vec<&str>> = HashMap::new();
+            let mut doc_members: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (member, shape) in &normal.members {
+                normal_members.entry(member).or_default().push(shape);
+            }
+            for (member, shape) in &doc.members {
+                doc_members.entry(member).or_default().push(shape);
+            }
+            for (member, mut normal_shapes) in normal_members {
+                let mut doc_shapes = doc_members.remove(member).unwrap_or_default();
+                normal_shapes.sort();
+                doc_shapes.sort();
+                let shape = normal_shapes[0];
+                // If candidates were filtered, every possible survivor must
+                // have the same signature and owner. Counts cannot identify
+                // which specialization or trait arguments remain otherwise.
+                if normal_shapes != doc_shapes
+                    && !(normal_shapes.iter().all(|candidate| *candidate == shape)
+                        && doc_shapes.len() >= normal_shapes.len()
+                        && doc_shapes.iter().all(|candidate| *candidate == shape))
+                {
+                    return Err(format!(
+                        "non-doc API extraction is incomplete: cannot verify the signature and owner of {shape} in the filtered Rustdoc JSON for '{}'",
+                        path.full_path()
+                    ));
+                }
+            }
+            for (member, requirements) in &normal.target_features {
+                let mut normal_features = requirements
+                    .iter()
+                    .map(|(_, features)| features.clone())
+                    .collect::<Vec<_>>();
+                let mut reported_features = reported
+                    .target_features
+                    .get(member)
+                    .cloned()
+                    .unwrap_or_default();
+                normal_features.sort();
+                reported_features.sort();
+                let mut doc_requirements =
+                    doc.target_features.get(member).cloned().unwrap_or_default();
+                let mut normal_requirements = requirements.clone();
+                normal_requirements.sort();
+                doc_requirements.sort();
+                if normal_features != reported_features
+                    || (normal_features.windows(2).any(|pair| pair[0] != pair[1])
+                        && normal_requirements != doc_requirements)
+                {
+                    return Err(format!(
+                        "non-doc API extraction is incomplete: compiler expansion for '{}' has target_feature requirements for {member} that cannot be verified in the filtered Rustdoc JSON",
+                        path.full_path()
+                    ));
+                }
+            }
         }
     }
     missing_impls.sort();
@@ -1064,6 +1127,25 @@ fn reject_non_doc_expansion(
 struct ExpandedApi {
     shapes: HashSet<String>,
     members: Vec<(String, String)>,
+    target_features: HashMap<String, Vec<(String, Vec<String>)>>,
+    has_definition: bool,
+}
+
+#[derive(Default)]
+struct ReportedApi {
+    members: HashMap<String, usize>,
+    target_features: HashMap<String, Vec<Vec<String>>>,
+}
+
+fn expanded_function_features(shape: &str, attrs: &[syn::Attribute]) -> (String, Vec<String>) {
+    let features = cfg_attr_target_features(attrs.iter().map(|attr| &attr.meta));
+    (shape.to_string(), normalize_target_features(features))
+}
+
+fn normalize_target_features(mut features: Vec<String>) -> Vec<String> {
+    features.sort();
+    features.dedup();
+    features
 }
 
 fn member_key(prefix: &str, name: &str) -> String {
@@ -1078,18 +1160,10 @@ fn trait_member_key(kind: &str, name: &str, has_default: bool) -> String {
     )
 }
 
-fn reported_api_members(
-    krate: &Crate,
-    item: &rustdoc_types::Item,
-) -> Option<HashMap<String, usize>> {
+fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<ReportedApi> {
     use rustdoc_types::{ItemEnum, StructKind, VariantKind, Visibility};
 
-    fn collect(
-        krate: &Crate,
-        item: &rustdoc_types::Item,
-        prefix: &str,
-        members: &mut HashMap<String, usize>,
-    ) {
+    fn collect(krate: &Crate, item: &rustdoc_types::Item, prefix: &str, api: &mut ReportedApi) {
         let name = item.name.as_deref().unwrap_or_default();
         let mut prefix = prefix.to_string();
         let key = match &item.inner {
@@ -1105,6 +1179,7 @@ fn reported_api_members(
             ItemEnum::Function(method) if prefix == "trait" => {
                 Some(trait_member_key("method", name, method.has_body))
             }
+            ItemEnum::Function(_) if prefix == "function" => Some(member_key(&prefix, name)),
             ItemEnum::AssocConst { value, .. } if prefix == "trait" => {
                 Some(trait_member_key("const", name, value.is_some()))
             }
@@ -1125,7 +1200,23 @@ fn reported_api_members(
             _ => None,
         };
         if let Some(key) = key {
-            *members.entry(key).or_default() += 1;
+            *api.members.entry(key.clone()).or_default() += 1;
+            if matches!(item.inner, ItemEnum::Function(_)) {
+                let features = item
+                    .attrs
+                    .iter()
+                    .filter_map(|attr| match attr {
+                        rustdoc_types::Attribute::TargetFeature { enable } => Some(enable),
+                        _ => None,
+                    })
+                    .flatten()
+                    .cloned()
+                    .collect();
+                api.target_features
+                    .entry(key)
+                    .or_default()
+                    .push(normalize_target_features(features));
+            }
         }
         let tuple_fields = match &item.inner {
             ItemEnum::Struct(item) => match &item.kind {
@@ -1145,15 +1236,43 @@ fn reported_api_members(
                 if let Some(child) = id.and_then(|id| krate.index.get(&id))
                     && matches!(child.visibility, Visibility::Public | Visibility::Default)
                 {
-                    *members
+                    *api.members
                         .entry(member_key(&format!("{prefix} field"), &index.to_string()))
+                        .or_default() += 1;
+                } else {
+                    *api.members
+                        .entry(member_key(
+                            &format!("{prefix} private field"),
+                            &index.to_string(),
+                        ))
                         .or_default() += 1;
                 }
             }
         } else {
+            let stripped = match &item.inner {
+                ItemEnum::Struct(item) => matches!(
+                    item.kind,
+                    StructKind::Plain {
+                        has_stripped_fields: true,
+                        ..
+                    }
+                ),
+                ItemEnum::Union(item) => item.has_stripped_fields,
+                ItemEnum::Variant(item) => matches!(
+                    item.kind,
+                    VariantKind::Struct {
+                        has_stripped_fields: true,
+                        ..
+                    }
+                ),
+                _ => false,
+            };
+            if stripped {
+                api.members.insert(format!("{prefix} private fields"), 1);
+            }
             for id in lexical_children(&item.inner) {
                 if let Some(child) = krate.index.get(&id) {
-                    collect(krate, child, &prefix, members);
+                    collect(krate, child, &prefix, api);
                 }
             }
         }
@@ -1165,21 +1284,35 @@ fn reported_api_members(
         ItemEnum::Union(item) => ("union", item.impls.as_slice()),
         ItemEnum::Trait(_) => ("trait", &[][..]),
         ItemEnum::Variant(_) => ("variant", &[][..]),
+        ItemEnum::Function(_) => ("function", &[][..]),
         _ => return None,
     };
-    let mut members = HashMap::new();
-    collect(krate, item, prefix, &mut members);
+    let mut api = ReportedApi::default();
+    collect(krate, item, prefix, &mut api);
     for id in impls {
         if let Some(item) = krate.index.get(id)
             && let ItemEnum::Impl(imp) = &item.inner
-            && imp.trait_.is_none()
-            && !imp.is_negative
             && !imp.is_synthetic
+            && imp.blanket_impl.is_none()
         {
-            collect(krate, item, "inherent", &mut members);
+            if let Some(trait_) = &imp.trait_ {
+                if !item
+                    .attrs
+                    .contains(&rustdoc_types::Attribute::AutomaticallyDerived)
+                {
+                    *api.members
+                        .entry(member_key(
+                            "trait impl",
+                            trait_.path.rsplit("::").next().unwrap_or_default(),
+                        ))
+                        .or_default() += 1;
+                }
+            } else if !imp.is_negative {
+                collect(krate, item, "inherent", &mut api);
+            }
         }
     }
-    Some(members)
+    Some(api)
 }
 
 fn expanded_api_shape(
@@ -1248,6 +1381,14 @@ fn expanded_api_shape(
             shapes.insert(shape.clone());
             if prefix.starts_with("variant ") || matches!(field.vis, Visibility::Public(_)) {
                 members.push((member_key(&format!("{prefix} field"), &name), shape));
+            } else if matches!(fields, Fields::Unnamed(_)) {
+                let key = member_key(&format!("{prefix} private field"), &name);
+                members.push((key.clone(), key));
+            } else {
+                let key = format!("{prefix} private fields");
+                if !members.iter().any(|(member, _)| member == &key) {
+                    members.push((key.clone(), key));
+                }
             }
         }
         Ok(())
@@ -1318,17 +1459,20 @@ fn expanded_api_shape(
         if ty.qself.is_some() {
             return None;
         }
-        let mut path = Vec::new();
-        if ty.path.leading_colon.is_some() {
+        Some(path_parts(&ty.path, legacy_use_paths))
+    }
+    fn path_parts(path: &syn::Path, legacy_use_paths: bool) -> Vec<String> {
+        let mut parts = Vec::new();
+        if path.leading_colon.is_some() {
             // Modern absolute paths start in the extern prelude, not the crate root.
-            path.push(if legacy_use_paths { "crate" } else { "::" }.to_string());
+            parts.push(if legacy_use_paths { "crate" } else { "::" }.to_string());
         }
-        path.extend(
-            ty.path.segments.iter().map(|segment| {
+        parts.extend(
+            path.segments.iter().map(|segment| {
                 crate::imports::identifier_key(&segment.ident.to_string()).to_string()
             }),
         );
-        Some(path)
+        parts
     }
     fn self_crate_alias(items: &[Item], name: &str) -> bool {
         items.iter().any(|item| {
@@ -1344,6 +1488,7 @@ fn expanded_api_shape(
         module: &[String],
         path: &[String],
         legacy_use_paths: bool,
+        allow_external: bool,
         visiting: &mut HashSet<Vec<String>>,
     ) -> Option<Vec<String>> {
         let mut absolute = module.to_vec();
@@ -1353,7 +1498,7 @@ fn expanded_api_shape(
             Some("::") => {
                 parts.next();
                 if !self_crate_alias(root, parts.next()?) {
-                    return None;
+                    return allow_external.then(|| path.to_vec());
                 }
                 absolute.clear();
             }
@@ -1376,12 +1521,20 @@ fn expanded_api_shape(
             parts.next();
         }
         absolute.extend(parts.cloned());
-        resolve_absolute(root, &absolute, legacy_use_paths, visiting, prelude_index)
+        resolve_absolute(
+            root,
+            &absolute,
+            legacy_use_paths,
+            allow_external,
+            visiting,
+            prelude_index,
+        )
     }
     fn resolve_absolute(
         root: &[Item],
         path: &[String],
         legacy_use_paths: bool,
+        allow_external: bool,
         visiting: &mut HashSet<Vec<String>>,
         prelude_index: Option<usize>,
     ) -> Option<Vec<String>> {
@@ -1395,6 +1548,7 @@ fn expanded_api_shape(
                     Item::Enum(item) => &item.ident,
                     Item::Union(item) => &item.ident,
                     Item::Type(item) => &item.ident,
+                    Item::Trait(item) => &item.ident,
                     Item::ExternCrate(item) => {
                         item.rename.as_ref().map_or(&item.ident, |(_, name)| name)
                     }
@@ -1409,19 +1563,37 @@ fn expanded_api_shape(
                 }
                 Some(Item::Type(item)) => {
                     let target = type_path(&item.ty, legacy_use_paths)?;
-                    let mut resolved =
-                        resolve_path(root, module, &target, legacy_use_paths, visiting)?;
+                    let mut resolved = resolve_path(
+                        root,
+                        module,
+                        &target,
+                        legacy_use_paths,
+                        allow_external,
+                        visiting,
+                    )?;
                     resolved.extend_from_slice(&path[index + 1..]);
-                    return resolve_absolute(root, &resolved, legacy_use_paths, visiting, None);
+                    return resolve_absolute(
+                        root,
+                        &resolved,
+                        legacy_use_paths,
+                        allow_external,
+                        visiting,
+                        None,
+                    );
                 }
                 Some(Item::ExternCrate(item)) => {
                     if item.ident != "self" {
-                        return None;
+                        return allow_external.then(|| {
+                            let mut external = vec!["::".to_string(), item.ident.to_string()];
+                            external.extend_from_slice(&path[index + 1..]);
+                            external
+                        });
                     }
                     return resolve_absolute(
                         root,
                         &path[index + 1..],
                         legacy_use_paths,
+                        allow_external,
                         visiting,
                         None,
                     );
@@ -1451,9 +1623,14 @@ fn expanded_api_shape(
                         } else {
                             module
                         };
-                        if let Some(resolved) =
-                            resolve_path(root, use_module, &target, legacy_use_paths, visiting)
-                        {
+                        if let Some(resolved) = resolve_path(
+                            root,
+                            use_module,
+                            &target,
+                            legacy_use_paths,
+                            allow_external,
+                            visiting,
+                        ) {
                             visiting.remove(&binding);
                             return Some(resolved);
                         }
@@ -1465,7 +1642,20 @@ fn expanded_api_shape(
                 }
             }
             let resolved = if prelude_index == Some(index) && self_crate_alias(root, name) {
-                resolve_absolute(root, &path[index + 1..], legacy_use_paths, visiting, None)
+                resolve_absolute(
+                    root,
+                    &path[index + 1..],
+                    legacy_use_paths,
+                    allow_external,
+                    visiting,
+                    None,
+                )
+            } else if allow_external
+                && (prelude_index == Some(index) || (legacy_use_paths && index == 0))
+            {
+                let mut external = vec!["::".to_string()];
+                external.extend_from_slice(&path[index..]);
+                Some(external)
             } else {
                 None
             };
@@ -1473,6 +1663,90 @@ fn expanded_api_shape(
             return resolved;
         }
         Some(path.to_vec())
+    }
+    fn impl_mentions_type(
+        root: &[Item],
+        module: &[String],
+        imp: &syn::ItemImpl,
+        wanted: &[String],
+        legacy_use_paths: bool,
+    ) -> bool {
+        let Some(wanted) = resolve_path(
+            root,
+            &[],
+            wanted,
+            legacy_use_paths,
+            false,
+            &mut HashSet::new(),
+        ) else {
+            return false;
+        };
+        struct Mentions<'a> {
+            root: &'a [Item],
+            module: &'a [String],
+            wanted: &'a [String],
+            generics: &'a syn::Generics,
+            legacy_use_paths: bool,
+            found: bool,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for Mentions<'_> {
+            fn visit_type(&mut self, ty: &'ast syn::Type) {
+                let inner = match ty {
+                    syn::Type::Reference(ty) => Some(&ty.elem),
+                    syn::Type::Paren(ty) => Some(&ty.elem),
+                    syn::Type::Group(ty) => Some(&ty.elem),
+                    _ => None,
+                };
+                if let Some(inner) = inner {
+                    self.visit_type(inner);
+                    return;
+                }
+                if let Some(path) = type_path(ty, self.legacy_use_paths)
+                    && !self.generics.params.iter().any(|param| {
+                        matches!(param, syn::GenericParam::Type(param)
+                        if path.first().is_some_and(|first| {
+                            first == crate::imports::identifier_key(&param.ident.to_string())
+                        }))
+                    })
+                    && resolve_path(
+                        self.root,
+                        self.module,
+                        &path,
+                        self.legacy_use_paths,
+                        false,
+                        &mut HashSet::new(),
+                    )
+                    .is_some_and(|path| path == self.wanted)
+                {
+                    self.found = true;
+                }
+            }
+        }
+        let mut mentions = Mentions {
+            root,
+            module,
+            wanted: &wanted,
+            generics: &imp.generics,
+            legacy_use_paths,
+            found: false,
+        };
+        if let Some((_, trait_, _)) = &imp.trait_ {
+            // Rustdoc attaches impls to the outer types of the self type
+            // and trait arguments, unwrapping references but not generics.
+            syn::visit::Visit::visit_type(&mut mentions, &imp.self_ty);
+            syn::visit::Visit::visit_path(&mut mentions, trait_);
+        } else if let Some(path) = type_path(&imp.self_ty, legacy_use_paths) {
+            mentions.found = resolve_path(
+                root,
+                module,
+                &path,
+                legacy_use_paths,
+                false,
+                &mut HashSet::new(),
+            )
+            .is_some_and(|path| path == wanted);
+        }
+        mentions.found
     }
     fn walk(
         source: &str,
@@ -1527,6 +1801,7 @@ fn expanded_api_shape(
                     && crate::imports::identifier_key(&name.to_string()) == wanted[modules.len()]
             });
             if matches {
+                api.has_definition = true;
                 match item {
                     Item::Struct(item) => {
                         shapes.insert(format!(
@@ -1577,15 +1852,27 @@ fn expanded_api_shape(
                                     ),
                                     shape,
                                 ));
+                            } else {
+                                let key = "union private fields".to_string();
+                                if !api.members.iter().any(|(member, _)| member == &key) {
+                                    api.members.push((key.clone(), key));
+                                }
                             }
                         }
                     }
                     Item::Fn(item) => {
-                        shapes.insert(format!(
+                        let shape = format!(
                             "fn {} {}",
                             visibility(source, &item.vis)?,
                             text(source, item.sig.span())?
-                        ));
+                        );
+                        shapes.insert(shape.clone());
+                        let key = member_key("function", &item.sig.ident.to_string());
+                        api.members.push((key.clone(), shape.clone()));
+                        api.target_features
+                            .entry(key)
+                            .or_default()
+                            .push(expanded_function_features(&shape, &item.attrs));
                     }
                     Item::Trait(item) => {
                         shapes.insert(format!(
@@ -1661,7 +1948,13 @@ fn expanded_api_shape(
                                 _ => continue,
                             };
                             shapes.insert(shape.clone());
-                            api.members.push((key, shape));
+                            api.members.push((key.clone(), shape.clone()));
+                            if let syn::TraitItem::Fn(method) = member {
+                                api.target_features
+                                    .entry(key)
+                                    .or_default()
+                                    .push(expanded_function_features(&shape, &method.attrs));
+                            }
                         }
                     }
                     _ => {
@@ -1678,6 +1971,7 @@ fn expanded_api_shape(
                         == wanted[modules.len() + 1]
                 })
             {
+                api.has_definition = true;
                 let prefix = member_key("variant", &variant.ident.to_string());
                 shapes.insert(prefix.clone());
                 api.members.push((prefix.clone(), prefix.clone()));
@@ -1694,16 +1988,7 @@ fn expanded_api_shape(
                 ));
             }
             if let Item::Impl(imp) = item
-                && let Some(self_ty) = type_path(&imp.self_ty, legacy_use_paths)
-                && let Some(owner_path) = resolve_path(
-                    root,
-                    modules,
-                    &self_ty,
-                    legacy_use_paths,
-                    &mut HashSet::new(),
-                )
-                && Some(owner_path)
-                    == resolve_path(root, &[], wanted, legacy_use_paths, &mut HashSet::new())
+                && impl_mentions_type(root, modules, imp, wanted, legacy_use_paths)
             {
                 let owner = text(source, imp.self_ty.span())?;
                 let trait_name = imp
@@ -1712,6 +1997,18 @@ fn expanded_api_shape(
                     .map(|(_, path, _)| text(source, path.span()))
                     .transpose()?
                     .unwrap_or_default();
+                let generics = if imp.generics.params.is_empty() {
+                    String::new()
+                } else {
+                    format!("<{}>", text(source, imp.generics.params.span())?)
+                };
+                let where_clause = imp
+                    .generics
+                    .where_clause
+                    .as_ref()
+                    .map(|clause| text(source, clause.span()))
+                    .transpose()?
+                    .map_or_else(String::new, |clause| format!(" {clause}"));
                 if let Some((polarity, trait_path, _)) = &imp.trait_ {
                     let derived = imp
                         .attrs
@@ -1726,18 +2023,6 @@ fn expanded_api_shape(
                     } else {
                         trait_name.to_string()
                     };
-                    let generics = if imp.generics.params.is_empty() {
-                        String::new()
-                    } else {
-                        format!("<{}>", text(source, imp.generics.params.span())?)
-                    };
-                    let where_clause = imp
-                        .generics
-                        .where_clause
-                        .as_ref()
-                        .map(|clause| text(source, clause.span()))
-                        .transpose()?
-                        .map_or_else(String::new, |clause| format!(" {clause}"));
                     let safety = if imp.unsafety.is_some() {
                         "unsafe "
                     } else {
@@ -1745,14 +2030,26 @@ fn expanded_api_shape(
                     };
                     let polarity = if polarity.is_some() { "!" } else { "" };
                     let prefix = if derived { "derived " } else { "" };
-                    shapes.insert(format!(
+                    let shape = format!(
                         "{prefix}{safety}impl{generics} {polarity}{trait_name} for {owner}{where_clause}"
-                    ));
+                    );
+                    shapes.insert(shape.clone());
                     if derived {
                         continue;
                     }
+                    let canonical_trait = resolve_path(
+                        root,
+                        modules,
+                        &path_parts(trait_path, legacy_use_paths),
+                        legacy_use_paths,
+                        true,
+                        &mut HashSet::new(),
+                    )
+                    .and_then(|path| path.last().cloned())
+                    .unwrap_or_else(|| trait_path.segments.last().unwrap().ident.to_string());
+                    api.members
+                        .push((member_key("trait impl", &canonical_trait), shape));
                 }
-                let generics = text(source, imp.generics.span())?;
                 for member in &imp.items {
                     let signature = match member {
                         ImplItem::Fn(method) => Some(format!(
@@ -1774,7 +2071,9 @@ fn expanded_api_shape(
                         _ => None,
                     };
                     if let Some(signature) = signature {
-                        let shape = format!("impl{generics} {trait_name} for {owner}: {signature}");
+                        let shape = format!(
+                            "impl{generics} {trait_name} for {owner}{where_clause}: {signature}"
+                        );
                         shapes.insert(shape.clone());
                         if imp.trait_.is_none() {
                             let key = match member {
@@ -1794,7 +2093,13 @@ fn expanded_api_shape(
                                 _ => None,
                             };
                             if let Some(key) = key {
-                                api.members.push((key, shape));
+                                api.members.push((key.clone(), shape.clone()));
+                                if let ImplItem::Fn(method) = member {
+                                    api.target_features
+                                        .entry(key)
+                                        .or_default()
+                                        .push(expanded_function_features(&shape, &method.attrs));
+                                }
                             }
                         }
                     }
@@ -2219,9 +2524,9 @@ fn semantic_cfg_attr_outputs(outputs: &[syn::Meta]) -> Vec<rustdoc_types::Attrib
         .collect()
 }
 
-fn cfg_attr_target_features(outputs: &[syn::Meta]) -> Vec<String> {
+fn cfg_attr_target_features<'a>(outputs: impl IntoIterator<Item = &'a syn::Meta>) -> Vec<String> {
     outputs
-        .iter()
+        .into_iter()
         .filter_map(|meta| match meta {
             syn::Meta::List(list) if cfg_path(&list.path) == "target_feature" => {
                 syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated
@@ -4038,6 +4343,79 @@ mod qualified_external {
                 "{changed}"
             );
         }
+    }
+
+    #[test]
+    fn expansion_trait_impl_keys_follow_local_and_external_aliases() {
+        let import = crate::imports::parse_use_line("use dep::S;").unwrap();
+        let source = r#"
+pub struct S;
+pub trait Marker {}
+pub use Marker as First;
+mod local {
+    use crate::First as Second;
+    impl Second for crate::S {}
+}
+use std::fmt::Debug as ImportedDebug;
+impl ImportedDebug for S {}
+extern crate core as foreign;
+use foreign::fmt::Display as FirstDisplay;
+mod external {
+    use crate::FirstDisplay as SecondDisplay;
+    impl SecondDisplay for crate::S {}
+}
+use ::std::hash::Hash as ImportedHash;
+impl ImportedHash for S {}
+"#;
+        let api = expanded_api_shape(source, &import, false).unwrap();
+        let keys = api
+            .members
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "trait impl Marker",
+                "trait impl Debug",
+                "trait impl Display",
+                "trait impl Hash",
+            ])
+        );
+    }
+
+    #[test]
+    fn expansion_trait_impls_include_references_and_trait_argument_types() {
+        let import = crate::imports::parse_use_line("use dep::S;").unwrap();
+        let source = r#"
+pub struct S;
+pub struct Other<T>(T);
+pub trait Link<T> {}
+impl Link<S> for u8 {}
+impl Link<Option<S>> for u16 {}
+impl Link<u8> for &S {}
+impl Link<u16> for &mut S {}
+impl Link<u32> for Other<S> {}
+impl Link<u64> for (S, u8) {}
+impl Link<u128> for Other<u8> {}
+impl<S> Link<S> for Other<S> {}
+impl<S> Link<crate::S> for Other<S> {}
+impl Other<S> { pub fn unrelated(&self) {} }
+"#;
+        let api = expanded_api_shape(source, &import, false).unwrap();
+        let impls = api
+            .members
+            .iter()
+            .filter(|(key, _)| key == "trait impl Link")
+            .map(|(_, shape)| shape.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(impls.len(), 4, "{impls:?}");
+        assert!(
+            !impls
+                .iter()
+                .any(|shape| shape.starts_with("impl<S> Link<S>"))
+        );
+        assert!(!api.shapes.iter().any(|shape| shape.contains("unrelated")));
     }
 
     #[test]
