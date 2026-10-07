@@ -1043,10 +1043,16 @@ fn reject_non_doc_expansion(
         if let Some(reported) = &reported_members
             && (normal.has_definition || doc.has_definition)
         {
+            // Normal-only derives are restored separately. Every other header
+            // must survive filtering, including doc-generated derives.
+            let surviving_members = normal
+                .members
+                .iter()
+                .filter(|(_, shape)| !shape.starts_with("derived ") || doc.shapes.contains(shape));
             let mut reported_members = reported.members.clone();
             // Count repeated names across inherent impls: one surviving method
             // must not conceal a missing method on another specialization.
-            for (member, shape) in &normal.members {
+            for (member, shape) in surviving_members.clone() {
                 let count = reported_members.entry(member.clone()).or_default();
                 if *count == 0 {
                     return Err(format!(
@@ -1064,7 +1070,7 @@ fn reject_non_doc_expansion(
             }
             let mut normal_members: HashMap<&str, Vec<&str>> = HashMap::new();
             let mut doc_members: HashMap<&str, Vec<&str>> = HashMap::new();
-            for (member, shape) in &normal.members {
+            for (member, shape) in surviving_members {
                 normal_members.entry(member).or_default().push(shape);
             }
             for (member, shape) in &doc.members {
@@ -1089,29 +1095,55 @@ fn reject_non_doc_expansion(
                     ));
                 }
             }
-            for (member, requirements) in &normal.target_features {
-                let mut normal_features = requirements
+            for (member, requirements) in &normal.attributes {
+                let mut normal_attributes = requirements
                     .iter()
-                    .map(|(_, features)| features.clone())
+                    .map(|(_, attributes)| attributes.clone())
                     .collect::<Vec<_>>();
-                let mut reported_features = reported
-                    .target_features
-                    .get(member)
-                    .cloned()
-                    .unwrap_or_default();
-                normal_features.sort();
-                reported_features.sort();
-                let mut doc_requirements =
-                    doc.target_features.get(member).cloned().unwrap_or_default();
+                let mut reported_attributes =
+                    reported.attributes.get(member).cloned().unwrap_or_default();
+                normal_attributes.sort();
+                reported_attributes.sort();
+                let mut doc_requirements = doc.attributes.get(member).cloned().unwrap_or_default();
                 let mut normal_requirements = requirements.clone();
                 normal_requirements.sort();
                 doc_requirements.sort();
-                if normal_features != reported_features
-                    || (normal_features.windows(2).any(|pair| pair[0] != pair[1])
+                if normal_attributes != reported_attributes
+                    || (normal_attributes.windows(2).any(|pair| pair[0] != pair[1])
                         && normal_requirements != doc_requirements)
                 {
                     return Err(format!(
-                        "non-doc API extraction is incomplete: compiler expansion for '{}' has target_feature requirements for {member} that cannot be verified in the filtered Rustdoc JSON",
+                        "non-doc API extraction is incomplete: compiler expansion for '{}' has semantic attributes for {member} that cannot be verified in the filtered Rustdoc JSON (normal: {normal_attributes:?}; reported: {reported_attributes:?})",
+                        path.full_path(),
+                    ));
+                }
+            }
+            for (shape, dependencies) in &normal.dependencies {
+                if shape.starts_with("derived ") && !doc.shapes.contains(shape) {
+                    continue;
+                }
+                let candidates = |dependencies: &[HashSet<String>]| {
+                    let mut candidates = dependencies
+                        .iter()
+                        .map(|dependencies| {
+                            let mut paths = dependencies.iter().cloned().collect::<Vec<_>>();
+                            paths.sort();
+                            paths
+                        })
+                        .collect::<Vec<_>>();
+                    candidates.sort();
+                    candidates
+                };
+                if !doc.dependencies.get(shape).is_some_and(|doc| {
+                    candidates(dependencies) == candidates(doc)
+                        || doc.iter().all(|candidate| {
+                            dependencies
+                                .iter()
+                                .all(|required| required.is_subset(candidate))
+                        })
+                }) {
+                    return Err(format!(
+                        "non-doc API extraction is incomplete: cannot verify the signature and owner of {shape} in the filtered Rustdoc JSON for '{}': type aliases or resolved paths differ under cfg(doc)",
                         path.full_path()
                     ));
                 }
@@ -1127,19 +1159,82 @@ fn reject_non_doc_expansion(
 struct ExpandedApi {
     shapes: HashSet<String>,
     members: Vec<(String, String)>,
-    target_features: HashMap<String, Vec<(String, Vec<String>)>>,
+    attributes: HashMap<String, Vec<(String, Vec<String>)>>,
+    dependencies: HashMap<String, Vec<HashSet<String>>>,
     has_definition: bool,
 }
 
 #[derive(Default)]
 struct ReportedApi {
     members: HashMap<String, usize>,
-    target_features: HashMap<String, Vec<Vec<String>>>,
+    attributes: HashMap<String, Vec<Vec<String>>>,
 }
 
-fn expanded_function_features(shape: &str, attrs: &[syn::Attribute]) -> (String, Vec<String>) {
-    let features = cfg_attr_target_features(attrs.iter().map(|attr| &attr.meta));
-    (shape.to_string(), normalize_target_features(features))
+fn semantic_attributes(
+    attrs: &[rustdoc_types::Attribute],
+    deprecation: Option<&rustdoc_types::Deprecation>,
+) -> Vec<String> {
+    use rustdoc_types::Attribute;
+
+    let mut attributes = attrs
+        .iter()
+        .filter(|attr| match attr {
+            Attribute::Repr(repr) => *repr != cfg_attr_repr(&[]),
+            Attribute::NonExhaustive | Attribute::MustUse { .. } => true,
+            _ => false,
+        })
+        .map(|attr| serde_json::to_string(attr).expect("attributes serialize"))
+        .collect::<Vec<_>>();
+    let features = normalize_target_features(
+        attrs
+            .iter()
+            .filter_map(|attr| match attr {
+                Attribute::TargetFeature { enable } => Some(enable),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect(),
+    );
+    if !features.is_empty() {
+        attributes.push(format!("target_feature {features:?}"));
+    }
+    if let Some(deprecation) = deprecation {
+        attributes.push(format!(
+            "deprecated {}",
+            serde_json::to_string(deprecation).expect("deprecation serializes")
+        ));
+    }
+    attributes.sort();
+    attributes.dedup();
+    attributes
+}
+
+fn expanded_deprecation(
+    attrs: &[syn::Attribute],
+    inherited: Option<&rustdoc_types::Deprecation>,
+) -> Option<rustdoc_types::Deprecation> {
+    cfg_attr_deprecation(attrs.iter().map(|attr| &attr.meta)).or_else(|| inherited.cloned())
+}
+
+fn expanded_member_attributes(
+    shape: &str,
+    attrs: &[syn::Attribute],
+    inherited_deprecation: Option<&rustdoc_types::Deprecation>,
+) -> (String, Vec<String>) {
+    let outputs = attrs.iter().map(|attr| &attr.meta);
+    let mut attributes = semantic_cfg_attr_outputs(outputs.clone());
+    attributes.push(rustdoc_types::Attribute::Repr(cfg_attr_repr(
+        outputs.clone(),
+    )));
+    attributes.push(rustdoc_types::Attribute::TargetFeature {
+        enable: cfg_attr_target_features(outputs),
+    });
+    let deprecation = expanded_deprecation(attrs, inherited_deprecation);
+    (
+        shape.to_string(),
+        semantic_attributes(&attributes, deprecation.as_ref()),
+    )
 }
 
 fn normalize_target_features(mut features: Vec<String>) -> Vec<String> {
@@ -1201,22 +1296,10 @@ fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<Rep
         };
         if let Some(key) = key {
             *api.members.entry(key.clone()).or_default() += 1;
-            if matches!(item.inner, ItemEnum::Function(_)) {
-                let features = item
-                    .attrs
-                    .iter()
-                    .filter_map(|attr| match attr {
-                        rustdoc_types::Attribute::TargetFeature { enable } => Some(enable),
-                        _ => None,
-                    })
-                    .flatten()
-                    .cloned()
-                    .collect();
-                api.target_features
-                    .entry(key)
-                    .or_default()
-                    .push(normalize_target_features(features));
-            }
+            api.attributes
+                .entry(key)
+                .or_default()
+                .push(semantic_attributes(&item.attrs, item.deprecation.as_ref()));
         }
         let tuple_fields = match &item.inner {
             ItemEnum::Struct(item) => match &item.kind {
@@ -1236,9 +1319,15 @@ fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<Rep
                 if let Some(child) = id.and_then(|id| krate.index.get(&id))
                     && matches!(child.visibility, Visibility::Public | Visibility::Default)
                 {
-                    *api.members
-                        .entry(member_key(&format!("{prefix} field"), &index.to_string()))
-                        .or_default() += 1;
+                    let key = member_key(&format!("{prefix} field"), &index.to_string());
+                    *api.members.entry(key.clone()).or_default() += 1;
+                    api.attributes
+                        .entry(key)
+                        .or_default()
+                        .push(semantic_attributes(
+                            &child.attrs,
+                            child.deprecation.as_ref(),
+                        ));
                 } else {
                     *api.members
                         .entry(member_key(
@@ -1288,6 +1377,10 @@ fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<Rep
         _ => return None,
     };
     let mut api = ReportedApi::default();
+    api.attributes.insert(
+        "item".into(),
+        vec![semantic_attributes(&item.attrs, item.deprecation.as_ref())],
+    );
     collect(krate, item, prefix, &mut api);
     for id in impls {
         if let Some(item) = krate.index.get(id)
@@ -1296,17 +1389,19 @@ fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<Rep
             && imp.blanket_impl.is_none()
         {
             if let Some(trait_) = &imp.trait_ {
-                if !item
+                let derived = item
                     .attrs
-                    .contains(&rustdoc_types::Attribute::AutomaticallyDerived)
-                {
-                    *api.members
-                        .entry(member_key(
-                            "trait impl",
-                            trait_.path.rsplit("::").next().unwrap_or_default(),
-                        ))
-                        .or_default() += 1;
-                }
+                    .contains(&rustdoc_types::Attribute::AutomaticallyDerived);
+                *api.members
+                    .entry(member_key(
+                        if derived {
+                            "derived trait impl"
+                        } else {
+                            "trait impl"
+                        },
+                        trait_.path.rsplit("::").next().unwrap_or_default(),
+                    ))
+                    .or_default() += 1;
             } else if !imp.is_negative {
                 collect(krate, item, "inherent", &mut api);
             }
@@ -1359,15 +1454,15 @@ fn expanded_api_shape(
         source: &str,
         fields: &Fields,
         prefix: &str,
-        shapes: &mut HashSet<String>,
-        members: &mut Vec<(String, String)>,
+        api: &mut ExpandedApi,
+        deprecation: Option<&rustdoc_types::Deprecation>,
     ) -> Result<(), String> {
         let kind = match fields {
             Fields::Named(_) => "named",
             Fields::Unnamed(_) => "tuple",
             Fields::Unit => "unit",
         };
-        shapes.insert(format!("{prefix} {kind} fields"));
+        api.shapes.insert(format!("{prefix} {kind} fields"));
         for (index, field) in fields.iter().enumerate() {
             let name = field
                 .ident
@@ -1378,20 +1473,38 @@ fn expanded_api_shape(
                 visibility(source, &field.vis)?,
                 text(source, field.ty.span())?
             );
-            shapes.insert(shape.clone());
+            api.shapes.insert(shape.clone());
             if prefix.starts_with("variant ") || matches!(field.vis, Visibility::Public(_)) {
-                members.push((member_key(&format!("{prefix} field"), &name), shape));
+                let key = member_key(&format!("{prefix} field"), &name);
+                api.attributes
+                    .entry(key.clone())
+                    .or_default()
+                    .push(expanded_member_attributes(
+                        &shape,
+                        &field.attrs,
+                        deprecation,
+                    ));
+                api.members.push((key, shape));
             } else if matches!(fields, Fields::Unnamed(_)) {
                 let key = member_key(&format!("{prefix} private field"), &name);
-                members.push((key.clone(), key));
+                api.members.push((key.clone(), key));
             } else {
                 let key = format!("{prefix} private fields");
-                if !members.iter().any(|(member, _)| member == &key) {
-                    members.push((key.clone(), key));
+                if !api.members.iter().any(|(member, _)| member == &key) {
+                    api.members.push((key.clone(), key));
                 }
             }
         }
         Ok(())
+    }
+    fn variant_shape(source: &str, variant: &syn::Variant) -> Result<String, String> {
+        let prefix = member_key("variant", &variant.ident.to_string());
+        let discriminant = variant
+            .discriminant
+            .as_ref()
+            .map(|(_, value)| text(source, value.span()))
+            .transpose()?;
+        Ok(format!("{prefix} discriminant {discriminant:?}"))
     }
     fn use_may_bind(tree: &syn::UseTree, wanted: &str) -> bool {
         match tree {
@@ -1483,13 +1596,167 @@ fn expanded_api_shape(
                     ) == name)
         })
     }
-    fn resolve_path(
-        root: &[Item],
+    #[derive(Default)]
+    struct PathTrace<'a> {
+        visiting: HashSet<Vec<String>>,
+        aliases: Vec<Alias<'a>>,
+    }
+    #[derive(Clone)]
+    struct Alias<'a> {
+        name: String,
+        item: &'a syn::ItemType,
+        module: Vec<String>,
+        scopes: Vec<Vec<&'a Item>>,
+    }
+
+    fn resolve_block_path<'a>(
+        root: &'a [Item],
+        module: &[String],
+        scopes: &[Vec<&'a Item>],
+        path: &[String],
+        legacy_use_paths: bool,
+        allow_external: bool,
+        trace: &mut PathTrace<'a>,
+    ) -> Result<Option<Vec<String>>, String> {
+        let Some(name) = path.first() else {
+            return Ok(None);
+        };
+        if !matches!(name.as_str(), "crate" | "self" | "super" | "::") {
+            for (index, scope) in scopes.iter().enumerate().rev() {
+                let binding = vec!["block".into(), index.to_string(), name.clone()];
+                if !trace.visiting.insert(binding.clone()) {
+                    return Ok(None);
+                }
+                let result = (|| {
+                    for item in scope {
+                        let ident = match item {
+                            Item::Struct(item) => &item.ident,
+                            Item::Enum(item) => &item.ident,
+                            Item::Union(item) => &item.ident,
+                            Item::Trait(item) => &item.ident,
+                            Item::Type(item) => &item.ident,
+                            Item::Mod(item) => &item.ident,
+                            Item::ExternCrate(item) => {
+                                item.rename.as_ref().map_or(&item.ident, |(_, name)| name)
+                            }
+                            _ => continue,
+                        };
+                        if crate::imports::identifier_key(&ident.to_string()) != name {
+                            continue;
+                        }
+                        match item {
+                            Item::Type(item) => {
+                                trace.aliases.push(Alias {
+                                    name: format!("block {index} {}::{name}", module.join("::")),
+                                    item,
+                                    module: module.to_vec(),
+                                    scopes: scopes[..=index].to_vec(),
+                                });
+                                let Some(mut target) = type_path(&item.ty, legacy_use_paths) else {
+                                    return Ok(Some(None));
+                                };
+                                target.extend_from_slice(&path[1..]);
+                                return resolve_block_path(
+                                    root,
+                                    module,
+                                    &scopes[..=index],
+                                    &target,
+                                    legacy_use_paths,
+                                    allow_external,
+                                    trace,
+                                )
+                                .map(Some);
+                            }
+                            Item::ExternCrate(item) => {
+                                let mut target = if item.ident == "self" {
+                                    vec!["crate".into()]
+                                } else {
+                                    if !allow_external {
+                                        return Ok(Some(None));
+                                    }
+                                    vec!["::".into(), item.ident.to_string()]
+                                };
+                                target.extend_from_slice(&path[1..]);
+                                return resolve_block_path(
+                                    root,
+                                    module,
+                                    scopes,
+                                    &target,
+                                    legacy_use_paths,
+                                    allow_external,
+                                    trace,
+                                )
+                                .map(Some);
+                            }
+                            Item::Mod(_) => {
+                                return Err(format!(
+                                    "non-doc API extraction is incomplete: cannot verify an implementation path through block-local module '{name}'"
+                                ));
+                            }
+                            // Block-local types cannot be the publicly queried type.
+                            _ => return Ok(Some(None)),
+                        }
+                    }
+                    for globs in [false, true] {
+                        let mut explicit = false;
+                        for item in scope {
+                            let Item::Use(item) = item else { continue };
+                            for mut target in use_targets(&item.tree, &[], name, globs) {
+                                explicit |= !globs;
+                                target.extend_from_slice(&path[1..]);
+                                if item.leading_colon.is_some() && !legacy_use_paths {
+                                    target.insert(0, "::".into());
+                                }
+                                let (use_module, use_scopes) = if legacy_use_paths
+                                    && !matches!(
+                                        target.first().map(String::as_str),
+                                        Some("self" | "super")
+                                    ) {
+                                    (&[][..], &[][..])
+                                } else {
+                                    (module, &scopes[..=index])
+                                };
+                                if let Some(resolved) = resolve_block_path(
+                                    root,
+                                    use_module,
+                                    use_scopes,
+                                    &target,
+                                    legacy_use_paths,
+                                    allow_external,
+                                    trace,
+                                )? {
+                                    return Ok(Some(Some(resolved)));
+                                }
+                            }
+                        }
+                        if explicit {
+                            return Ok(Some(None));
+                        }
+                    }
+                    Ok(None)
+                })();
+                trace.visiting.remove(&binding);
+                if let Some(resolved) = result? {
+                    return Ok(resolved);
+                }
+            }
+        }
+        Ok(resolve_path(
+            root,
+            module,
+            path,
+            legacy_use_paths,
+            allow_external,
+            trace,
+        ))
+    }
+    fn resolve_path<'a>(
+        root: &'a [Item],
         module: &[String],
         path: &[String],
         legacy_use_paths: bool,
         allow_external: bool,
-        visiting: &mut HashSet<Vec<String>>,
+        trace: &mut PathTrace<'a>,
     ) -> Option<Vec<String>> {
         let mut absolute = module.to_vec();
         let mut parts = path.iter().peekable();
@@ -1526,16 +1793,16 @@ fn expanded_api_shape(
             &absolute,
             legacy_use_paths,
             allow_external,
-            visiting,
+            trace,
             prelude_index,
         )
     }
-    fn resolve_absolute(
-        root: &[Item],
+    fn resolve_absolute<'a>(
+        root: &'a [Item],
         path: &[String],
         legacy_use_paths: bool,
         allow_external: bool,
-        visiting: &mut HashSet<Vec<String>>,
+        trace: &mut PathTrace<'a>,
         prelude_index: Option<usize>,
     ) -> Option<Vec<String>> {
         let mut items = root;
@@ -1562,6 +1829,12 @@ fn expanded_api_shape(
                     continue;
                 }
                 Some(Item::Type(item)) => {
+                    trace.aliases.push(Alias {
+                        name: path[..=index].join("::"),
+                        item,
+                        module: module.to_vec(),
+                        scopes: Vec::new(),
+                    });
                     let target = type_path(&item.ty, legacy_use_paths)?;
                     let mut resolved = resolve_path(
                         root,
@@ -1569,7 +1842,7 @@ fn expanded_api_shape(
                         &target,
                         legacy_use_paths,
                         allow_external,
-                        visiting,
+                        trace,
                     )?;
                     resolved.extend_from_slice(&path[index + 1..]);
                     return resolve_absolute(
@@ -1577,7 +1850,7 @@ fn expanded_api_shape(
                         &resolved,
                         legacy_use_paths,
                         allow_external,
-                        visiting,
+                        trace,
                         None,
                     );
                 }
@@ -1594,7 +1867,7 @@ fn expanded_api_shape(
                         &path[index + 1..],
                         legacy_use_paths,
                         allow_external,
-                        visiting,
+                        trace,
                         None,
                     );
                 }
@@ -1602,7 +1875,7 @@ fn expanded_api_shape(
                 None => {}
             }
             let binding = path[..=index].to_vec();
-            if !visiting.insert(binding.clone()) {
+            if !trace.visiting.insert(binding.clone()) {
                 return None;
             }
             // Explicit imports shadow glob bindings regardless of source order.
@@ -1629,15 +1902,15 @@ fn expanded_api_shape(
                             &target,
                             legacy_use_paths,
                             allow_external,
-                            visiting,
+                            trace,
                         ) {
-                            visiting.remove(&binding);
+                            trace.visiting.remove(&binding);
                             return Some(resolved);
                         }
                     }
                 }
                 if explicit_binding {
-                    visiting.remove(&binding);
+                    trace.visiting.remove(&binding);
                     return None;
                 }
             }
@@ -1647,7 +1920,7 @@ fn expanded_api_shape(
                     &path[index + 1..],
                     legacy_use_paths,
                     allow_external,
-                    visiting,
+                    trace,
                     None,
                 )
             } else if allow_external
@@ -1659,7 +1932,7 @@ fn expanded_api_shape(
             } else {
                 None
             };
-            visiting.remove(&binding);
+            trace.visiting.remove(&binding);
             return resolved;
         }
         Some(path.to_vec())
@@ -1670,24 +1943,27 @@ fn expanded_api_shape(
         imp: &syn::ItemImpl,
         wanted: &[String],
         legacy_use_paths: bool,
-    ) -> bool {
+        scopes: &[Vec<&Item>],
+    ) -> Result<bool, String> {
         let Some(wanted) = resolve_path(
             root,
             &[],
             wanted,
             legacy_use_paths,
             false,
-            &mut HashSet::new(),
+            &mut PathTrace::default(),
         ) else {
-            return false;
+            return Ok(false);
         };
         struct Mentions<'a> {
             root: &'a [Item],
             module: &'a [String],
             wanted: &'a [String],
             generics: &'a syn::Generics,
+            scopes: &'a [Vec<&'a Item>],
             legacy_use_paths: bool,
             found: bool,
+            error: Option<String>,
         }
         impl<'ast> syn::visit::Visit<'ast> for Mentions<'_> {
             fn visit_type(&mut self, ty: &'ast syn::Type) {
@@ -1708,17 +1984,20 @@ fn expanded_api_shape(
                             first == crate::imports::identifier_key(&param.ident.to_string())
                         }))
                     })
-                    && resolve_path(
+                {
+                    match resolve_block_path(
                         self.root,
                         self.module,
+                        self.scopes,
                         &path,
                         self.legacy_use_paths,
                         false,
-                        &mut HashSet::new(),
-                    )
-                    .is_some_and(|path| path == self.wanted)
-                {
-                    self.found = true;
+                        &mut PathTrace::default(),
+                    ) {
+                        Ok(Some(path)) if path == self.wanted => self.found = true,
+                        Err(error) => self.error = Some(error),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1727,8 +2006,10 @@ fn expanded_api_shape(
             module,
             wanted: &wanted,
             generics: &imp.generics,
+            scopes,
             legacy_use_paths,
             found: false,
+            error: None,
         };
         if let Some((_, trait_, _)) = &imp.trait_ {
             // Rustdoc attaches impls to the outer types of the self type
@@ -1736,29 +2017,196 @@ fn expanded_api_shape(
             syn::visit::Visit::visit_type(&mut mentions, &imp.self_ty);
             syn::visit::Visit::visit_path(&mut mentions, trait_);
         } else if let Some(path) = type_path(&imp.self_ty, legacy_use_paths) {
-            mentions.found = resolve_path(
+            mentions.found = resolve_block_path(
                 root,
                 module,
+                scopes,
                 &path,
                 legacy_use_paths,
                 false,
-                &mut HashSet::new(),
-            )
+                &mut PathTrace::default(),
+            )?
             .is_some_and(|path| path == wanted);
         }
-        mentions.found
+        if let Some(error) = mentions.error {
+            return Err(error);
+        }
+        Ok(mentions.found)
+    }
+    fn api_dependencies(
+        source: &str,
+        root: &[Item],
+        module: &[String],
+        scopes: &[Vec<&Item>],
+        item: &Item,
+        legacy_use_paths: bool,
+        variant: Option<&syn::Variant>,
+    ) -> Result<HashSet<String>, String> {
+        struct Dependencies<'a> {
+            source: &'a str,
+            root: &'a [Item],
+            module: Vec<String>,
+            scopes: Vec<Vec<&'a Item>>,
+            legacy_use_paths: bool,
+            shadowed: Vec<String>,
+            trace: PathTrace<'a>,
+            shapes: HashSet<String>,
+            error: Option<String>,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for Dependencies<'_> {
+            fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+            fn visit_block(&mut self, _: &'ast syn::Block) {}
+            fn visit_generics(&mut self, generics: &'ast syn::Generics) {
+                self.shadowed.extend(generics.type_params().map(|param| {
+                    crate::imports::identifier_key(&param.ident.to_string()).to_string()
+                }));
+                syn::visit::visit_generics(self, generics);
+            }
+            fn visit_item(&mut self, item: &'ast Item) {
+                let previous = self.shadowed.len();
+                syn::visit::visit_item(self, item);
+                self.shadowed.truncate(previous);
+            }
+            fn visit_signature(&mut self, signature: &'ast syn::Signature) {
+                let previous = self.shadowed.len();
+                syn::visit::visit_signature(self, signature);
+                self.shadowed.truncate(previous);
+            }
+            fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+                let previous = self.shadowed.len();
+                syn::visit::visit_trait_item(self, item);
+                self.shadowed.truncate(previous);
+            }
+            fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+                let previous = self.shadowed.len();
+                syn::visit::visit_impl_item(self, item);
+                self.shadowed.truncate(previous);
+            }
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                let parts = path_parts(path, self.legacy_use_paths);
+                if !parts
+                    .first()
+                    .is_some_and(|name| self.shadowed.contains(name))
+                {
+                    match resolve_block_path(
+                        self.root,
+                        &self.module,
+                        &self.scopes,
+                        &parts,
+                        self.legacy_use_paths,
+                        true,
+                        &mut self.trace,
+                    ) {
+                        Ok(resolved) => match text(self.source, path.span()) {
+                            Ok(path) => {
+                                self.shapes
+                                    .insert(format!("path {path} resolves to {resolved:?}"));
+                            }
+                            Err(error) => self.error = Some(error),
+                        },
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+                syn::visit::visit_path(self, path);
+            }
+        }
+        let mut dependencies = Dependencies {
+            source,
+            root,
+            module: module.to_vec(),
+            scopes: scopes.to_vec(),
+            legacy_use_paths,
+            shadowed: Vec::new(),
+            trace: PathTrace::default(),
+            shapes: HashSet::new(),
+            error: None,
+        };
+        if let Some(variant) = variant {
+            if let Item::Enum(item) = item {
+                syn::visit::Visit::visit_generics(&mut dependencies, &item.generics);
+            }
+            syn::visit::Visit::visit_variant(&mut dependencies, variant);
+        } else {
+            syn::visit::Visit::visit_item(&mut dependencies, item);
+        }
+        let mut seen = HashSet::new();
+        let mut index = 0;
+        // Resolve aliases transitively, including aliases nested in generic
+        // arguments. Rustdoc may normalize these to different concrete types.
+        while let Some(alias) = dependencies.trace.aliases.get(index).cloned() {
+            index += 1;
+            let start = alias.item.ident.span().start();
+            if !seen.insert((start.line, start.column)) {
+                continue;
+            }
+            dependencies.shapes.insert(format!(
+                "type alias {}{} = {}",
+                alias.name,
+                text(source, alias.item.generics.span())?,
+                text(source, alias.item.ty.span())?
+            ));
+            let shadowed = std::mem::take(&mut dependencies.shadowed);
+            dependencies.module = alias.module;
+            dependencies.scopes = alias.scopes;
+            syn::visit::Visit::visit_generics(&mut dependencies, &alias.item.generics);
+            syn::visit::Visit::visit_type(&mut dependencies, &alias.item.ty);
+            dependencies.shadowed = shadowed;
+        }
+        if let Some(error) = dependencies.error {
+            return Err(error);
+        }
+        Ok(dependencies.shapes)
     }
     fn walk(
         source: &str,
         root: &[Item],
-        items: &[Item],
+        items: (&[Item], Option<&rustdoc_types::Deprecation>, &[Vec<&Item>]),
         modules: &mut Vec<String>,
-        wanted: &[String],
+        wanted: (&[String], bool),
         api: &mut ExpandedApi,
         legacy_use_paths: bool,
     ) -> Result<(), String> {
+        let (items, inherited_deprecation, scopes) = items;
+        let (wanted, type_only) = wanted;
         for item in items {
+            if let Item::Const(constant) = item
+                && let syn::Expr::Block(block) = &*constant.expr
+            {
+                let deprecation = expanded_deprecation(&constant.attrs, inherited_deprecation);
+                let mut scopes = scopes.to_vec();
+                scopes.push(
+                    block
+                        .block
+                        .stmts
+                        .iter()
+                        .filter_map(|stmt| match stmt {
+                            syn::Stmt::Item(item) => Some(item),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+                for child in scopes.last().unwrap() {
+                    walk(
+                        source,
+                        root,
+                        (std::slice::from_ref(*child), deprecation.as_ref(), &scopes),
+                        modules,
+                        (wanted, type_only),
+                        api,
+                        legacy_use_paths,
+                    )?;
+                }
+            }
+            if type_only
+                && matches!(
+                    item,
+                    Item::Fn(_) | Item::Const(_) | Item::Static(_) | Item::Macro(_)
+                )
+            {
+                continue;
+            }
             if let Item::Mod(module) = item {
+                let deprecation = expanded_deprecation(&module.attrs, inherited_deprecation);
                 modules.push(crate::imports::identifier_key(&module.ident.to_string()).to_string());
                 if modules == wanted {
                     api.shapes
@@ -1768,9 +2216,9 @@ fn expanded_api_shape(
                     walk(
                         source,
                         root,
-                        children,
+                        (children, deprecation.as_ref(), scopes),
                         modules,
-                        wanted,
+                        (wanted, type_only),
                         api,
                         legacy_use_paths,
                     )?;
@@ -1778,60 +2226,87 @@ fn expanded_api_shape(
                 modules.pop();
                 continue;
             }
-            let shapes = &mut api.shapes;
-            let name = match item {
-                Item::Struct(item) => Some(&item.ident),
-                Item::Enum(item) => Some(&item.ident),
-                Item::Union(item) => Some(&item.ident),
-                Item::Fn(item) => Some(&item.sig.ident),
-                Item::Trait(item) => Some(&item.ident),
-                Item::TraitAlias(item) => Some(&item.ident),
-                Item::Type(item) => Some(&item.ident),
-                Item::Const(item) => Some(&item.ident),
-                Item::Static(item) => Some(&item.ident),
-                Item::ExternCrate(item) => {
-                    Some(item.rename.as_ref().map_or(&item.ident, |(_, name)| name))
-                }
-                Item::Macro(item) => item.ident.as_ref(),
-                _ => None,
+            let (name, attrs) = match item {
+                Item::Struct(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::Enum(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::Union(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::Fn(item) => (Some(&item.sig.ident), item.attrs.as_slice()),
+                Item::Trait(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::TraitAlias(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::Type(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::Const(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::Static(item) => (Some(&item.ident), item.attrs.as_slice()),
+                Item::ExternCrate(item) => (
+                    Some(item.rename.as_ref().map_or(&item.ident, |(_, name)| name)),
+                    item.attrs.as_slice(),
+                ),
+                Item::Macro(item) => (item.ident.as_ref(), item.attrs.as_slice()),
+                _ => (None, &[][..]),
             };
-            let matches = name.is_some_and(|name| {
-                modules.len() + 1 == wanted.len()
-                    && modules == &wanted[..modules.len()]
-                    && crate::imports::identifier_key(&name.to_string()) == wanted[modules.len()]
-            });
+            let matches = scopes.is_empty()
+                && name.is_some_and(|name| {
+                    modules.len() + 1 == wanted.len()
+                        && modules == &wanted[..modules.len()]
+                        && crate::imports::identifier_key(&name.to_string())
+                            == wanted[modules.len()]
+                });
             if matches {
                 api.has_definition = true;
+                api.dependencies
+                    .entry("definition".into())
+                    .or_default()
+                    .push(api_dependencies(
+                        source,
+                        root,
+                        modules,
+                        scopes,
+                        item,
+                        legacy_use_paths,
+                        None,
+                    )?);
+                let deprecation = expanded_deprecation(attrs, inherited_deprecation);
+                api.attributes
+                    .entry("item".into())
+                    .or_default()
+                    .push(expanded_member_attributes(
+                        "item",
+                        attrs,
+                        inherited_deprecation,
+                    ));
                 match item {
                     Item::Struct(item) => {
-                        shapes.insert(format!(
+                        api.shapes.insert(format!(
                             "struct {} {}",
                             visibility(source, &item.vis)?,
                             text(source, item.generics.span())?
                         ));
-                        fields(source, &item.fields, "struct", shapes, &mut api.members)?;
+                        fields(source, &item.fields, "struct", api, deprecation.as_ref())?;
                     }
                     Item::Enum(item) => {
-                        shapes.insert(format!(
+                        api.shapes.insert(format!(
                             "enum {} {}",
                             visibility(source, &item.vis)?,
                             text(source, item.generics.span())?
                         ));
                         for variant in &item.variants {
                             let prefix = member_key("variant", &variant.ident.to_string());
-                            shapes.insert(prefix.clone());
-                            api.members.push((prefix.clone(), prefix.clone()));
-                            fields(source, &variant.fields, &prefix, shapes, &mut api.members)?;
-                            if let Some((_, discriminant)) = &variant.discriminant {
-                                shapes.insert(format!(
-                                    "{prefix} discriminant {}",
-                                    text(source, discriminant.span())?
-                                ));
-                            }
+                            let shape = variant_shape(source, variant)?;
+                            api.shapes.insert(shape.clone());
+                            api.members.push((prefix.clone(), shape.clone()));
+                            api.attributes.entry(prefix.clone()).or_default().push(
+                                expanded_member_attributes(
+                                    &shape,
+                                    &variant.attrs,
+                                    deprecation.as_ref(),
+                                ),
+                            );
+                            let deprecation =
+                                expanded_deprecation(&variant.attrs, deprecation.as_ref());
+                            fields(source, &variant.fields, &prefix, api, deprecation.as_ref())?;
                         }
                     }
                     Item::Union(item) => {
-                        shapes.insert(format!(
+                        api.shapes.insert(format!(
                             "union {} {}",
                             visibility(source, &item.vis)?,
                             text(source, item.generics.span())?
@@ -1843,15 +2318,20 @@ fn expanded_api_shape(
                                 visibility(source, &field.vis)?,
                                 text(source, field.ty.span())?
                             );
-                            shapes.insert(shape.clone());
+                            api.shapes.insert(shape.clone());
                             if matches!(field.vis, Visibility::Public(_)) {
-                                api.members.push((
-                                    member_key(
-                                        "union field",
-                                        &field.ident.as_ref().unwrap().to_string(),
+                                let key = member_key(
+                                    "union field",
+                                    &field.ident.as_ref().unwrap().to_string(),
+                                );
+                                api.attributes.entry(key.clone()).or_default().push(
+                                    expanded_member_attributes(
+                                        &shape,
+                                        &field.attrs,
+                                        deprecation.as_ref(),
                                     ),
-                                    shape,
-                                ));
+                                );
+                                api.members.push((key, shape));
                             } else {
                                 let key = "union private fields".to_string();
                                 if !api.members.iter().any(|(member, _)| member == &key) {
@@ -1866,17 +2346,31 @@ fn expanded_api_shape(
                             visibility(source, &item.vis)?,
                             text(source, item.sig.span())?
                         );
-                        shapes.insert(shape.clone());
+                        api.shapes.insert(shape.clone());
                         let key = member_key("function", &item.sig.ident.to_string());
                         api.members.push((key.clone(), shape.clone()));
-                        api.target_features
+                        api.attributes
                             .entry(key)
                             .or_default()
-                            .push(expanded_function_features(&shape, &item.attrs));
+                            .push(expanded_member_attributes(
+                                &shape,
+                                &item.attrs,
+                                inherited_deprecation,
+                            ));
                     }
                     Item::Trait(item) => {
-                        shapes.insert(format!(
-                            "trait {} {} {}",
+                        api.shapes.insert(format!(
+                            "{}{}trait {} {} {}",
+                            if item.unsafety.is_some() {
+                                "unsafe "
+                            } else {
+                                ""
+                            },
+                            if item.auto_token.is_some() {
+                                "auto "
+                            } else {
+                                ""
+                            },
                             visibility(source, &item.vis)?,
                             text(source, item.generics.span())?,
                             text(source, item.supertraits.span())?
@@ -1947,49 +2441,84 @@ fn expanded_api_shape(
                                 }
                                 _ => continue,
                             };
-                            shapes.insert(shape.clone());
+                            api.shapes.insert(shape.clone());
                             api.members.push((key.clone(), shape.clone()));
-                            if let syn::TraitItem::Fn(method) = member {
-                                api.target_features
-                                    .entry(key)
-                                    .or_default()
-                                    .push(expanded_function_features(&shape, &method.attrs));
-                            }
+                            let attrs = match member {
+                                syn::TraitItem::Fn(member) => &member.attrs,
+                                syn::TraitItem::Const(member) => &member.attrs,
+                                syn::TraitItem::Type(member) => &member.attrs,
+                                _ => unreachable!(),
+                            };
+                            api.attributes.entry(key).or_default().push(
+                                expanded_member_attributes(&shape, attrs, deprecation.as_ref()),
+                            );
                         }
                     }
                     _ => {
-                        shapes.insert(format!("item {}", text(source, item.span())?));
+                        api.shapes
+                            .insert(format!("item {}", text(source, item.span())?));
                     }
                 }
             }
-            if let Item::Enum(item) = item
+            if let Item::Enum(enum_item) = item
+                && scopes.is_empty()
                 && modules.len() + 2 == wanted.len()
                 && modules == &wanted[..modules.len()]
-                && crate::imports::identifier_key(&item.ident.to_string()) == wanted[modules.len()]
-                && let Some(variant) = item.variants.iter().find(|variant| {
+                && crate::imports::identifier_key(&enum_item.ident.to_string())
+                    == wanted[modules.len()]
+                && let Some(variant) = enum_item.variants.iter().find(|variant| {
                     crate::imports::identifier_key(&variant.ident.to_string())
                         == wanted[modules.len() + 1]
                 })
             {
                 api.has_definition = true;
+                api.dependencies
+                    .entry("definition".into())
+                    .or_default()
+                    .push(api_dependencies(
+                        source,
+                        root,
+                        modules,
+                        scopes,
+                        item,
+                        legacy_use_paths,
+                        Some(variant),
+                    )?);
                 let prefix = member_key("variant", &variant.ident.to_string());
-                shapes.insert(prefix.clone());
-                api.members.push((prefix.clone(), prefix.clone()));
-                fields(source, &variant.fields, &prefix, shapes, &mut api.members)?;
+                let shape = variant_shape(source, variant)?;
+                let deprecation = expanded_deprecation(&enum_item.attrs, inherited_deprecation);
+                let attributes =
+                    expanded_member_attributes(&shape, &variant.attrs, deprecation.as_ref());
+                api.attributes
+                    .entry("item".into())
+                    .or_default()
+                    .push(attributes.clone());
+                api.attributes
+                    .entry(prefix.clone())
+                    .or_default()
+                    .push(attributes);
+                api.shapes.insert(shape.clone());
+                api.members.push((prefix.clone(), shape));
+                let deprecation = expanded_deprecation(&variant.attrs, deprecation.as_ref());
+                fields(source, &variant.fields, &prefix, api, deprecation.as_ref())?;
             }
             if let Item::Use(item) = item
+                && scopes.is_empty()
                 && modules == &wanted[..wanted.len() - 1]
                 && use_may_bind(&item.tree, &wanted[wanted.len() - 1])
             {
-                shapes.insert(format!(
+                api.shapes.insert(format!(
                     "use {} {}",
                     visibility(source, &item.vis)?,
                     text(source, item.tree.span())?
                 ));
             }
             if let Item::Impl(imp) = item
-                && impl_mentions_type(root, modules, imp, wanted, legacy_use_paths)
+                && impl_mentions_type(root, modules, imp, wanted, legacy_use_paths, scopes)?
             {
+                let dependencies =
+                    api_dependencies(source, root, modules, scopes, item, legacy_use_paths, None)?;
+                let deprecation = expanded_deprecation(&imp.attrs, inherited_deprecation);
                 let owner = text(source, imp.self_ty.span())?;
                 let trait_name = imp
                     .trait_
@@ -2033,22 +2562,36 @@ fn expanded_api_shape(
                     let shape = format!(
                         "{prefix}{safety}impl{generics} {polarity}{trait_name} for {owner}{where_clause}"
                     );
-                    shapes.insert(shape.clone());
-                    if derived {
-                        continue;
-                    }
-                    let canonical_trait = resolve_path(
+                    api.shapes.insert(shape.clone());
+                    api.dependencies
+                        .entry(shape.clone())
+                        .or_default()
+                        .push(dependencies.clone());
+                    let canonical_trait = resolve_block_path(
                         root,
                         modules,
+                        scopes,
                         &path_parts(trait_path, legacy_use_paths),
                         legacy_use_paths,
                         true,
-                        &mut HashSet::new(),
-                    )
+                        &mut PathTrace::default(),
+                    )?
                     .and_then(|path| path.last().cloned())
                     .unwrap_or_else(|| trait_path.segments.last().unwrap().ident.to_string());
-                    api.members
-                        .push((member_key("trait impl", &canonical_trait), shape));
+                    api.members.push((
+                        member_key(
+                            if derived {
+                                "derived trait impl"
+                            } else {
+                                "trait impl"
+                            },
+                            &canonical_trait,
+                        ),
+                        shape,
+                    ));
+                    if derived {
+                        continue;
+                    }
                 }
                 for member in &imp.items {
                     let signature = match member {
@@ -2074,7 +2617,11 @@ fn expanded_api_shape(
                         let shape = format!(
                             "impl{generics} {trait_name} for {owner}{where_clause}: {signature}"
                         );
-                        shapes.insert(shape.clone());
+                        api.shapes.insert(shape.clone());
+                        api.dependencies
+                            .entry(shape.clone())
+                            .or_default()
+                            .push(dependencies.clone());
                         if imp.trait_.is_none() {
                             let key = match member {
                                 ImplItem::Fn(method)
@@ -2094,12 +2641,14 @@ fn expanded_api_shape(
                             };
                             if let Some(key) = key {
                                 api.members.push((key.clone(), shape.clone()));
-                                if let ImplItem::Fn(method) = member {
-                                    api.target_features
-                                        .entry(key)
-                                        .or_default()
-                                        .push(expanded_function_features(&shape, &method.attrs));
-                                }
+                                let attrs = match member {
+                                    ImplItem::Fn(member) => &member.attrs,
+                                    ImplItem::Const(member) => &member.attrs,
+                                    _ => unreachable!(),
+                                };
+                                api.attributes.entry(key).or_default().push(
+                                    expanded_member_attributes(&shape, attrs, deprecation.as_ref()),
+                                );
                             }
                         }
                     }
@@ -2109,12 +2658,16 @@ fn expanded_api_shape(
         Ok(())
     }
 
+    let deprecation = expanded_deprecation(&file.attrs, None);
     walk(
         source,
         &file.items,
-        &file.items,
+        (&file.items, deprecation.as_ref(), &[]),
         &mut Vec::new(),
-        &wanted,
+        (
+            &wanted,
+            import.namespace == Some(crate::imports::NamespaceConstraint::Type),
+        ),
         &mut api,
         legacy_use_paths,
     )?;
@@ -2344,8 +2897,10 @@ fn reconcile_cfg_attr_deprecation(item: &mut rustdoc_types::Item, cfg: &RustcCfg
     }
 }
 
-fn cfg_attr_deprecation(outputs: &[syn::Meta]) -> Option<rustdoc_types::Deprecation> {
-    outputs.iter().find_map(|meta| match meta {
+fn cfg_attr_deprecation<'a>(
+    outputs: impl IntoIterator<Item = &'a syn::Meta>,
+) -> Option<rustdoc_types::Deprecation> {
+    outputs.into_iter().find_map(|meta| match meta {
         syn::Meta::Path(path) if cfg_path(path) == "deprecated" => {
             Some(rustdoc_types::Deprecation {
                 since: None,
@@ -2498,9 +3053,11 @@ fn reconcile_cfg_attr_semantics(attrs: &mut Vec<rustdoc_types::Attribute>, cfg: 
     }
 }
 
-fn semantic_cfg_attr_outputs(outputs: &[syn::Meta]) -> Vec<rustdoc_types::Attribute> {
+fn semantic_cfg_attr_outputs<'a>(
+    outputs: impl IntoIterator<Item = &'a syn::Meta>,
+) -> Vec<rustdoc_types::Attribute> {
     outputs
-        .iter()
+        .into_iter()
         .filter_map(|meta| match meta {
             syn::Meta::Path(path) if cfg_path(path) == "non_exhaustive" => {
                 Some(rustdoc_types::Attribute::NonExhaustive)
@@ -2550,7 +3107,9 @@ fn cfg_attr_target_features<'a>(outputs: impl IntoIterator<Item = &'a syn::Meta>
         .collect()
 }
 
-fn cfg_attr_repr(outputs: &[syn::Meta]) -> rustdoc_types::AttributeRepr {
+fn cfg_attr_repr<'a>(
+    outputs: impl IntoIterator<Item = &'a syn::Meta>,
+) -> rustdoc_types::AttributeRepr {
     let mut repr = rustdoc_types::AttributeRepr {
         kind: rustdoc_types::ReprKind::Rust,
         align: None,
@@ -4276,6 +4835,61 @@ mod tests {
         {
             ExitStatus::from_raw(code as u32)
         }
+    }
+
+    #[test]
+    fn expansion_impls_in_constant_blocks_preserve_scope_and_headers() {
+        let import = crate::imports::parse_use_line("use dep::S::{self};").unwrap();
+        let source = r#"
+pub struct S;
+pub struct Other;
+pub trait Marker {}
+pub trait Link<T> {}
+const _: () = {
+    extern crate core as _core;
+    extern crate self as local;
+    use crate::S as Selected;
+    use Selected as Imported;
+    use crate::Marker as LocalMarker;
+    type Alias = Selected;
+    #[automatically_derived] impl _core::clone::Clone for Alias { fn clone(&self) -> Self { Self } }
+    impl LocalMarker for Selected {}
+    impl Alias { pub fn through_alias(&self) {} }
+    impl local::S { pub fn through_self(&self) {} }
+    const _: () = {
+        struct S;
+        struct Selected;
+        impl S { pub fn hidden(&self) {} }
+        impl Imported { pub fn through_outer_import(&self) {} }
+        impl crate::Link<crate::S> for S {}
+    };
+};
+const _: () = {
+    use crate::Other as S;
+    impl S { pub fn unrelated(&self) {} }
+};
+"#;
+        let api = expanded_api_shape(source, &import, false).unwrap();
+        assert_eq!(api.members.len(), 6, "{:?}", api.members);
+        for key in [
+            "derived trait impl Clone",
+            "trait impl Marker",
+            "trait impl Link",
+            "inherent method through_alias",
+            "inherent method through_self",
+            "inherent method through_outer_import",
+        ] {
+            assert!(api.members.iter().any(|(member, _)| member == key), "{key}");
+        }
+        assert!(api.has_definition);
+        let unavailable =
+            "pub struct S; const _: () = { mod local { pub use crate::S; } impl local::S {} };";
+        assert!(
+            expanded_api_shape(unavailable, &import, false)
+                .err()
+                .unwrap()
+                .contains("block-local module")
+        );
     }
 
     #[test]
