@@ -1141,6 +1141,37 @@ fn direct_matching_children(
                     .is_ok_and(|item_namespaces| item_namespaces & namespace_mask(namespace) != 0)
             })
         {
+            // Rustdoc may emit an unresolved record for another namespace of
+            // the same use declaration. Its resolved type binding wins when
+            // traversing a type path; bare imports still report ambiguity.
+            if namespace == Some(NamespaceConstraint::Type)
+                && let ItemEnum::Use(use_item) = &child.inner
+                && use_item.id.is_none()
+                && children.iter().any(|id| {
+                    let Some(other) = krate.index.get(id) else {
+                        return false;
+                    };
+                    let ItemEnum::Use(resolved) = &other.inner else {
+                        return false;
+                    };
+                    is_public(other)
+                        && resolved.source == use_item.source
+                        && resolved.name == use_item.name
+                        && child.span.as_ref().zip(other.span.as_ref()).is_some_and(
+                            |(left, right)| {
+                                left.filename == right.filename
+                                    && left.begin == right.begin
+                                    && left.end == right.end
+                            },
+                        )
+                        && resolved.id.is_some_and(|id| {
+                            item_namespaces(krate, id)
+                                .is_ok_and(|namespaces| namespaces & TYPE_NAMESPACE != 0)
+                        })
+                })
+            {
+                continue;
+            }
             matches.push(*child_id);
         }
     }

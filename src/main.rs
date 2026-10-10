@@ -422,9 +422,6 @@ fn resolve_query(
     .map_err(QueryError::Incomplete)?;
     let krate = selected_docs.krate;
     let json_path = selected_docs.json_path;
-    let missing_impls =
-        rustdoc_json::reject_non_doc_only_source(&krate, target, &json_path, import)
-            .map_err(QueryError::Incomplete)?;
     let child_parent = rustdoc_json::CargoParentUnit {
         package_id: package.id.to_string(),
         graph_index: selected_docs.unit.graph_index,
@@ -437,7 +434,10 @@ fn resolve_query(
             return Ok(());
         }
         rustdoc_json::validate_import(&json_path, import).map_err(|error| {
-            if error.contains("error[E0603]") || error.contains("error[E0432]") {
+            if error.contains("error[E0603]")
+                || error.contains("error[E0432]")
+                || error.contains("error[E0433]")
+            {
                 QueryError::Absent(format!(
                     "item '{}' not found in {} {}: compiler rejected import '{}': {error}",
                     import.item,
@@ -476,12 +476,6 @@ fn resolve_query(
         }
     };
     let mut local_result = symbols::find_symbol_report(&krate, import);
-    if let Ok(symbols) = &mut local_result {
-        let doc = symbols.resolved.as_mut().unwrap_or(&mut symbols.imported);
-        doc.impls.extend(missing_impls);
-        doc.impls.sort();
-        doc.impls.dedup();
-    }
     if let Err(SymbolError::Ambiguous(message)) = &local_result {
         return Err(QueryError::Incomplete(format!(
             "ambiguous import '{}' in {} {}: {message}",
@@ -489,6 +483,22 @@ fn resolve_query(
             package.name,
             package.version
         )));
+    }
+    let missing_impls = rustdoc_json::reject_non_doc_only_source(
+        &krate, target, &json_path, import,
+    )
+    .map_err(|error| {
+        // A rejected import is absent; an accepted name with an
+        // unverifiable definition is incomplete.
+        validate_candidate()
+            .err()
+            .unwrap_or(QueryError::Incomplete(error))
+    })?;
+    if let Ok(symbols) = &mut local_result {
+        let doc = symbols.resolved.as_mut().unwrap_or(&mut symbols.imported);
+        doc.impls.extend(missing_impls);
+        doc.impls.sort();
+        doc.impls.dedup();
     }
     let external_candidates = symbols::external_reexports(
         &krate,

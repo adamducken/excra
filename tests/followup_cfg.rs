@@ -777,7 +777,10 @@ pub fn block_derive(_: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 mod expansion_verification {
-    use std::{env, fs, process::Command};
+    use std::{
+        env, fs,
+        process::{Command, Output},
+    };
     use tempfile::TempDir;
 
     fn workspace(packages: &[(&str, &str, &str)]) -> TempDir {
@@ -810,6 +813,504 @@ mod expansion_verification {
         workspace
     }
 
+    fn query(workspace: &TempDir, import: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_excra"))
+            .arg(import)
+            .arg("--root")
+            .arg(workspace.path())
+            .args(["--package", "app"])
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+            .output()
+            .unwrap()
+    }
+
+    fn check_consumer(workspace: &TempDir) {
+        let output = Command::new("cargo")
+            .args(["check", "--locked", "--offline", "-p", "app"])
+            .current_dir(workspace.path())
+            .env("CARGO_TARGET_DIR", workspace.path().join("consumer-target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn constants_statics_and_aliases_verify_normal_type_dependencies() {
+        let workspace = workspace(&[
+            ("app", "[dependencies]\ndep = { path = \"../dep\" }\n", ""),
+            (
+                "dep",
+                "",
+                r#"
+    #[cfg(doc)] type Number = u16;
+    #[cfg(not(doc))] type Number = u8;
+    type Nested = Number;
+    pub const C: Number = 1;
+    pub static S: Number = 2;
+    pub type Public = Number;
+    pub const NestedC: Nested = 1;
+    pub static NestedS: Nested = 2;
+    pub type NestedPublic = Nested;
+    pub use C as ReexportedC;
+    pub use S as ReexportedS;
+    pub use Public as ReexportedPublic;
+    #[cfg(doc)] type Stable = u8;
+    #[cfg(not(doc))] type Stable = u8;
+    pub const StableC: Stable = 1;
+    pub static StableS: Stable = 2;
+    pub type StablePublic = Stable;
+    "#,
+            ),
+        ]);
+        let query_items = |items: &str| query(&workspace, &format!("use dep::{{{items}}};"));
+        let stable = query_items("StableC, StableS, StablePublic");
+        assert!(
+            stable.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stable.stderr)
+        );
+        let stdout = String::from_utf8(stable.stdout).unwrap();
+        for definition in [
+            "pub const StableC: u8 =",
+            "pub static StableS: u8 =",
+            "pub type StablePublic = u8;",
+        ] {
+            assert!(stdout.contains(definition), "{stdout}");
+        }
+        for name in [
+            "C",
+            "S",
+            "Public",
+            "NestedC",
+            "NestedS",
+            "NestedPublic",
+            "ReexportedC",
+            "ReexportedS",
+            "ReexportedPublic",
+        ] {
+            let output = query_items(name);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+            assert!(
+                stderr.contains("type aliases or resolved paths differ under cfg(doc)"),
+                "{name}: {stderr}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn evaluated_constants_must_match_the_normal_compilation() {
+        let source = r#"
+    mod values {
+        #[cfg(not(doc))] pub const BASE: u8 = 1;
+        #[cfg(doc)] pub const BASE: u8 = 2;
+        pub const LEN: usize = BASE as usize;
+    }
+    use values::LEN as SIZE;
+    pub fn buffer(value: [u8; SIZE]) -> [u8; SIZE] { value }
+    pub struct Packet { pub bytes: [u8; SIZE] }
+    pub const VALUE: usize = SIZE;
+    pub type Buffer = [u8; VALUE];
+    pub struct Container<const N: usize>;
+    pub type SizedContainer = Container<SIZE>;
+    pub type StableContainer = Container<STABLE>;
+    #[cfg(not(doc))] const fn length(value: usize) -> usize { value + 1 }
+    #[cfg(doc)] const fn length(value: usize) -> usize { value + 2 }
+    pub struct Computed { pub bytes: [u8; length(0)] }
+    pub struct Scoped { pub bytes: [u8; { use crate::values::BASE as Byte; Byte as usize }] }
+    pub const STABLE: usize = { let value = 1; value };
+    pub type StableBuffer = [u8; STABLE];
+    const fn stable_length(value: usize) -> usize { let (left, right) = (value, 0); left + right }
+    pub struct StableComputed { pub bytes: [u8; stable_length(1)] }
+    pub fn stable_body(value: [u8; STABLE]) -> [u8; STABLE] { let _ = values::BASE; value }
+    struct Limits;
+    impl Limits {
+        #[cfg(not(doc))] const LEN: usize = 1;
+        #[cfg(doc)] const LEN: usize = 2;
+    }
+    pub struct Associated { pub bytes: [u8; Limits::LEN] }
+    "#;
+        let workspace = workspace(&[
+            ("app", "[dependencies]\ndep = { path = \"../dep\" }\n", ""),
+            ("dep", "", source),
+        ]);
+        for (name, succeeds) in [
+            ("buffer", false),
+            ("Packet", false),
+            ("VALUE", false),
+            ("Buffer", false),
+            ("SizedContainer", false),
+            ("Computed", false),
+            ("Scoped", false),
+            ("Associated", false),
+            ("STABLE", true),
+            ("StableBuffer", true),
+            ("StableContainer", true),
+            ("StableComputed", true),
+            ("stable_body", true),
+        ] {
+            let output = query(&workspace, &format!("use dep::{name};"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), succeeds, "{name}: {stderr}");
+            if !succeeds {
+                assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+                assert!(
+                    stderr.contains("non-doc API extraction is incomplete"),
+                    "{name}: {stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn doc_changed_module_alias_cannot_report_another_existing_definition() {
+        let workspace = workspace(&[
+            (
+                "app",
+                "[dependencies]\ndep = { path = \"../dep\" }\n",
+                "pub fn proof() { let _ = dep::facade::Thing { actual: 1_u8 }; }",
+            ),
+            (
+                "dep",
+                "[dependencies]\nmaker = { path = \"../maker\" }\n",
+                r#"
+    pub mod a { pub mod api { pub struct Thing { pub actual: u8 } } }
+    pub mod b { pub mod api { pub struct Thing { pub doc_only: u16 } } }
+    #[cfg_attr(doc, maker::swap)] pub use a::api as facade;
+    pub use a::api as stable;
+    pub fn stable() {}
+    pub mod stable_glob { pub use crate::stable::*; }
+    "#,
+            ),
+            (
+                "maker",
+                "[lib]\nproc-macro = true\n",
+                r#"
+    extern crate proc_macro;
+    use proc_macro::TokenStream;
+    #[proc_macro_attribute]
+    pub fn swap(_: TokenStream, _: TokenStream) -> TokenStream {
+        "pub use b::api as facade;".parse().unwrap()
+    }
+    "#,
+            ),
+        ]);
+        check_consumer(&workspace);
+        for (import, succeeds) in [
+            ("use dep::{stable::Thing, stable_glob::Thing};", true),
+            ("use dep::facade::Thing;", false),
+        ] {
+            let output = query(&workspace, import);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.success(), succeeds, "{stdout}\n{stderr}");
+            if succeeds {
+                assert!(
+                    stdout.contains("pub struct Thing { pub actual: u8 }"),
+                    "{stdout}"
+                );
+                assert!(!stdout.contains("doc_only"), "{stdout}");
+            } else {
+                assert_eq!(output.status.code(), Some(2));
+                assert!(
+                    stderr.contains("resolves to different definitions under cfg(doc)"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_declarations_match_the_selected_artifact() {
+        let workspace = workspace(&[
+            ("app", "[dependencies]\ndep = { path = \"../dep\" }\n", ""),
+            (
+                "dep",
+                "",
+                r#"
+    #![feature(extern_types)]
+    type StableNumber = u8;
+    #[cfg(doc)] type Number = u16;
+    #[cfg(not(doc))] type Number = u8;
+    pub mod stable {
+        use crate::StableNumber;
+        unsafe extern "C" {
+            #[must_use = "inspect"] pub fn foreign(value: StableNumber) -> StableNumber;
+            pub safe fn safe_foreign(value: StableNumber) -> StableNumber;
+            pub fn variadic(value: StableNumber, ...) -> StableNumber;
+            pub static DATA: StableNumber;
+            pub safe static SAFE_DATA: StableNumber;
+            pub unsafe static UNSAFE_DATA: StableNumber;
+            pub static mut MUT_DATA: StableNumber;
+            pub type Opaque;
+            pub fn opaque(value: *mut Opaque) -> *mut Opaque;
+        }
+    }
+    pub use stable::foreign as ForeignAlias;
+    pub use stable as facade;
+    unsafe extern "C" {
+        pub fn changed_alias(value: Number) -> Number;
+        pub static CHANGED_ALIAS: Number;
+    }
+    macro_rules! abi_declaration {
+        ($abi:literal) => { unsafe extern $abi { pub fn changed_abi(value: u8) -> u8; } };
+    }
+    #[cfg(not(doc))] abi_declaration!("C");
+    #[cfg(doc)] abi_declaration!("C-unwind");
+    macro_rules! safety_declaration {
+        ($($safety:ident)?) => { unsafe extern "C" { pub $($safety)? fn changed_safety(value: u8) -> u8; } };
+    }
+    #[cfg(not(doc))] safety_declaration!();
+    #[cfg(doc)] safety_declaration!(safe);
+    macro_rules! static_safety_declaration {
+        ($($safety:ident)?) => { unsafe extern "C" { pub $($safety)? static CHANGED_SAFETY: u8; } };
+    }
+    #[cfg(not(doc))] static_safety_declaration!();
+    #[cfg(doc)] static_safety_declaration!(safe);
+    pub mod first { unsafe extern "C" { pub type Opaque; } }
+    pub mod second { unsafe extern "C" { pub type Opaque; } }
+    #[cfg(not(doc))] use first::Opaque as Selected;
+    #[cfg(doc)] use second::Opaque as Selected;
+    unsafe extern "C" { pub fn changed_opaque(value: *mut Selected) -> *mut Selected; }
+    "#,
+            ),
+        ]);
+        let query_import = |import: &str| query(&workspace, import);
+        let output = query_import(
+            "use dep::{stable::{foreign, safe_foreign, variadic, DATA, SAFE_DATA, UNSAFE_DATA, MUT_DATA, Opaque, opaque}, ForeignAlias, facade::foreign, facade::SAFE_DATA, facade::Opaque};",
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "pub unsafe extern \"C\" fn foreign(value: u8) -> u8",
+            "pub extern \"C\" fn safe_foreign(value: u8) -> u8",
+            "unsafe extern static",
+            "safe extern static",
+            "extern type",
+            "#[must_use = \"inspect\"]",
+        ] {
+            assert!(stdout.contains(expected), "{expected}: {stdout}");
+        }
+        for name in [
+            "changed_alias",
+            "CHANGED_ALIAS",
+            "changed_abi",
+            "changed_safety",
+            "CHANGED_SAFETY",
+            "changed_opaque",
+        ] {
+            let output = query_import(&format!("use dep::{name};"));
+            assert_eq!(output.status.code(), Some(2), "{name}: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains("non-doc API extraction is incomplete"),
+                "{name}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_function_body_impls_are_verified_with_local_shadowing() {
+        let workspace = workspace(&[
+            (
+                "app",
+                "[dependencies]\ndep = { path = \"../dep\" }\n",
+                "pub fn proof() { let _: u8 = dep::Missing.generated(); let _: u8 = dep::Stable.stable(); }",
+            ),
+            (
+                "dep",
+                "[dependencies]\nmaker = { path = \"../maker\" }\n",
+                r#"
+    #![allow(dead_code, non_local_definitions)]
+    #[maker::missing] pub struct Missing;
+    #[maker::stable] pub struct Stable;
+    #[maker::shadowed] pub struct Shadowed;
+    pub struct Other;
+    "#,
+            ),
+            (
+                "maker",
+                "[lib]\nproc-macro = true\n",
+                r#"
+    extern crate proc_macro;
+    use proc_macro::TokenStream;
+    fn append(input: TokenStream, extra: &str) -> TokenStream {
+        let mut output = input;
+        output.extend(extra.parse::<TokenStream>().unwrap());
+        output
+    }
+    #[proc_macro_attribute]
+    pub fn missing(_: TokenStream, input: TokenStream) -> TokenStream {
+        append(input, "fn private_uncalled() { #[cfg(not(doc))] impl Missing { pub fn generated(&self) -> u8 { 7 } } }")
+    }
+    #[proc_macro_attribute]
+    pub fn stable(_: TokenStream, input: TokenStream) -> TokenStream {
+        append(input, "fn stable_uncalled() { use crate::Stable as Selected; let _ = || { impl Selected { pub fn stable(&self) -> u8 { 9 } } }; }")
+    }
+    #[proc_macro_attribute]
+    pub fn shadowed(_: TokenStream, input: TokenStream) -> TokenStream {
+        append(input, "fn shadowed_uncalled() { struct Shadowed; #[cfg(not(doc))] impl Shadowed { pub fn ghost(&self) {} } { use crate::Other as Shadowed; #[cfg(not(doc))] impl Shadowed { pub fn unrelated(&self) {} } } }")
+    }
+    "#,
+            ),
+        ]);
+        check_consumer(&workspace);
+
+        for (item, expected) in [
+            ("Missing", Some("generated")),
+            ("Shadowed", None),
+            ("Stable", None),
+        ] {
+            let output = query(&workspace, &format!("use dep::{item};"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(method) = expected {
+                assert_eq!(output.status.code(), Some(2), "{stdout}\n{stderr}");
+                assert!(
+                    stderr.contains("non-doc API extraction is incomplete"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains(method), "{stderr}");
+                assert!(stderr.contains("absent under cfg(doc)"), "{stderr}");
+            } else {
+                assert!(output.status.success(), "{stderr}");
+                assert!(stdout.contains(&format!("pub struct {item};")), "{stdout}");
+                if item == "Stable" {
+                    assert!(
+                        stdout.contains("pub fn stable(self: &Self) -> u8"),
+                        "{stdout}"
+                    );
+                }
+                assert!(!stdout.contains("ghost"), "{stdout}");
+                assert!(!stdout.contains("unrelated"), "{stdout}");
+            }
+        }
+    }
+
+    #[test]
+    fn constant_pattern_values_match_the_normal_artifact() {
+        let workspace = workspace(&[
+            (
+                "app",
+                "[dependencies]\ndep = { path = \"../dep\" }\n",
+                "pub fn proof() { let _: [u8; 1] = [0; dep::SIZE]; let _: dep::Buffer = [0; 1]; let _: fn([u8; 1]) -> [u8; 1] = dep::buffer; }",
+            ),
+            (
+                "dep",
+                "",
+                r#"
+#[cfg(not(doc))] const BASE: u8 = 1;
+#[cfg(doc)] const BASE: u8 = 2;
+pub const SIZE: usize = match 1_u8 { BASE => 1, _ => 2 };
+pub type Buffer = [u8; SIZE];
+pub fn buffer(value: Buffer) -> Buffer { value }
+const fn length(value: u8) -> usize { match value { BASE => 1, other => other as usize + 1 } }
+pub struct Computed { pub bytes: [u8; length(1)] }
+const STABLE: u8 = 1;
+pub const StableSize: usize = match 1_u8 { STABLE => 1, value => value as usize + 1 };
+"#,
+            ),
+        ]);
+        check_consumer(&workspace);
+        for name in ["SIZE", "Buffer", "buffer", "Computed"] {
+            let output = query(&workspace, &format!("use dep::{name};"));
+            assert_eq!(output.status.code(), Some(2), "{name}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("non-doc API extraction is incomplete")
+            );
+            assert!(output.stdout.is_empty());
+        }
+        let output = query(&workspace, "use dep::StableSize;");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("pub const StableSize: usize = 1usize;")
+        );
+    }
+
+    #[test]
+    fn generated_impls_in_local_modules_are_verified() {
+        let workspace = workspace(&[
+            (
+                "app",
+                "[dependencies]\ndep = { path = \"../dep\" }\n",
+                "pub fn proof() { let _: u8 = dep::Missing.generated(); let _: u8 = dep::Stable.generated(); }",
+            ),
+            (
+                "dep",
+                "[dependencies]\nmaker = { path = \"../maker\" }\n",
+                r#"
+#![allow(dead_code, non_local_definitions)]
+#[maker::local_module] pub struct Missing;
+#[maker::stable_module] pub struct Stable;
+#[maker::omitted_module] pub struct Omitted;
+#[maker::shadowed_module] pub struct Shadowed;
+"#,
+            ),
+            (
+                "maker",
+                "[lib]\nproc-macro = true\n",
+                r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+fn append(input: TokenStream, extra: &str) -> TokenStream {
+    format!("{input} {extra}").parse().unwrap()
+}
+#[proc_macro_attribute]
+pub fn local_module(_: TokenStream, input: TokenStream) -> TokenStream {
+    append(input, "fn helper() { mod local { use crate::Missing as Selected; type Alias = self::Selected; mod inner { use super::Alias; #[cfg(not(doc))] impl Alias { pub fn generated(&self) -> u8 { 7 } } } } }")
+}
+#[proc_macro_attribute]
+pub fn stable_module(_: TokenStream, input: TokenStream) -> TokenStream {
+    append(input, "fn stable() { mod local { pub use crate::Stable as Selected; } impl local::Selected { pub fn generated(&self) -> u8 { 7 } } }")
+}
+#[proc_macro_attribute]
+pub fn omitted_module(_: TokenStream, input: TokenStream) -> TokenStream {
+    append(input, "trait Defaults { fn helper() { mod local { use crate::Omitted as Selected; impl Selected { pub fn generated(&self) -> u8 { 7 } } } } }")
+}
+#[proc_macro_attribute]
+pub fn shadowed_module(_: TokenStream, input: TokenStream) -> TokenStream {
+    append(input, "fn shadowed() { mod local { struct Shadowed; #[cfg(not(doc))] impl Shadowed { pub fn ghost(&self) {} } } }")
+}
+"#,
+            ),
+        ]);
+        check_consumer(&workspace);
+        let output = query(&workspace, "use dep::Missing;");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("generated"));
+        assert!(output.stdout.is_empty());
+        let output = query(&workspace, "use dep::Omitted;");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("absent from the filtered Rustdoc JSON members")
+        );
+        assert!(output.stdout.is_empty());
+        let output = query(&workspace, "use dep::{Stable, Shadowed};");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("pub fn generated(self: &Self) -> u8"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("ghost"), "{stdout}");
+    }
 
     #[test]
     fn version_gated_api_matches_the_selected_compiler_including_its_release_boundary() {

@@ -406,7 +406,11 @@ pub fn trait_impl_check() -> u8 {
         ),
         ("Included", "generated", false),
         ("Choice", "variant Extra", false),
-        ("Missing", "struct", false),
+        (
+            "Missing",
+            "requested path 'dep::Missing' resolves to different definitions under cfg(doc)",
+            false,
+        ),
         ("nested::Packet", "field byte", false),
         ("api::Packet", "field byte", false),
         (
@@ -483,7 +487,9 @@ pub fn trait_impl_check() -> u8 {
         if name == "Included" {
             assert!(stderr.contains("included.rs"), "{name}: {stderr}");
         } else {
-            assert!(stderr.contains("compiler expansion"), "{name}: {stderr}");
+            if name != "Missing" {
+                assert!(stderr.contains("compiler expansion"), "{name}: {stderr}");
+            }
             assert!(stderr.contains(missing), "{name}: {stderr}");
         }
         if filtered {
@@ -505,7 +511,7 @@ pub fn trait_impl_check() -> u8 {
     assert!(!missing_glob.status.success());
     assert!(
         String::from_utf8_lossy(&missing_glob.stderr)
-            .contains("non-doc API extraction is incomplete: compiler accepted import 'dep::api::Missing' but Rustdoc JSON omitted it"),
+            .contains("non-doc API extraction is incomplete: requested path 'dep::api::Missing' resolves to different definitions under cfg(doc)"),
         "{}",
         String::from_utf8_lossy(&missing_glob.stderr)
     );

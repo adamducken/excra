@@ -770,6 +770,7 @@ pub(crate) fn reject_non_doc_only_source(
                     | syn::Item::Struct(_)
                     | syn::Item::Union(_)
                     | syn::Item::Impl(_)
+                    | syn::Item::ForeignMod(_)
             );
             self.owner = match item {
                 syn::Item::Struct(item) => {
@@ -832,6 +833,31 @@ pub(crate) fn reject_non_doc_only_source(
                             .cloned()
                     }),
                 syn::Item::Impl(item) => impl_type_path(&self.module_path, &item.self_ty),
+                syn::Item::ForeignMod(block) => self
+                    .wanted
+                    .iter()
+                    .find(|wanted| {
+                        wanted.starts_with(&self.module_path)
+                            && wanted.len() == self.module_path.len() + 1
+                            && block.items.iter().any(|foreign| {
+                                let normalized = match foreign {
+                                    syn::ForeignItem::Verbatim(tokens) => {
+                                        foreign_verbatim_declaration(tokens)
+                                    }
+                                    _ => None,
+                                };
+                                let foreign = normalized.as_ref().map_or(foreign, |(item, _)| item);
+                                let name = match foreign {
+                                    syn::ForeignItem::Fn(item) => &item.sig.ident,
+                                    syn::ForeignItem::Static(item) => &item.ident,
+                                    syn::ForeignItem::Type(item) => &item.ident,
+                                    _ => return false,
+                                };
+                                crate::imports::identifier_key(&name.to_string())
+                                    == wanted.last().unwrap()
+                            })
+                    })
+                    .cloned(),
                 _ => previous.clone(),
             };
             if let syn::Item::Macro(item_macro) = item
@@ -856,6 +882,27 @@ pub(crate) fn reject_non_doc_only_source(
             }
             syn::visit::visit_item(self, item);
             self.module_path.truncate(module_len);
+            self.owner = previous;
+            self.owner_is_container = previous_is_container;
+        }
+
+        fn visit_foreign_item(&mut self, foreign: &'ast syn::ForeignItem) {
+            let normalized = match foreign {
+                syn::ForeignItem::Verbatim(tokens) => foreign_verbatim_declaration(tokens),
+                _ => None,
+            };
+            let foreign = normalized.as_ref().map_or(foreign, |(item, _)| item);
+            let name = match foreign {
+                syn::ForeignItem::Fn(item) => Some(&item.sig.ident),
+                syn::ForeignItem::Static(item) => Some(&item.ident),
+                syn::ForeignItem::Type(item) => Some(&item.ident),
+                _ => None,
+            };
+            let previous = self.owner.clone();
+            let previous_is_container = self.owner_is_container;
+            self.owner = name.map(|name| item_path(&self.module_path, &name.to_string()));
+            self.owner_is_container = false;
+            syn::visit::visit_foreign_item(self, foreign);
             self.owner = previous;
             self.owner_is_container = previous_is_container;
         }
@@ -1055,10 +1102,34 @@ fn reject_non_doc_expansion(
     let reported_members = resolved_id
         .and_then(|id| krate.index.get(&id))
         .and_then(|item| reported_api_members(krate, item));
+    let foreign_declaration = resolved_id
+        .and_then(|id| krate.index.get(&id))
+        .is_some_and(|item| match &item.inner {
+            rustdoc_types::ItemEnum::Function(function) => !function.has_body,
+            rustdoc_types::ItemEnum::Static(static_) => static_.expr.is_empty(),
+            rustdoc_types::ItemEnum::ExternType => true,
+            _ => false,
+        });
+    let mut verified_foreign = false;
     let mut missing_impls = Vec::new();
     for path in paths {
         let normal = expanded_api_shape(&normal, &path, legacy_use_paths)?;
         let doc = expanded_api_shape(&doc, &path, legacy_use_paths)?;
+        if normal.resolved_path != doc.resolved_path {
+            return Err(format!(
+                "non-doc API extraction is incomplete: requested path '{}' resolves to different definitions under cfg(doc) (normal: {:?}; doc: {:?})",
+                path.full_path(),
+                normal.resolved_path,
+                doc.resolved_path,
+            ));
+        }
+        if normal.resolved_path.is_none() && resolved_id.is_some() {
+            return Err(format!(
+                "non-doc API extraction is incomplete: cannot resolve requested path '{}' in the compiler expansions",
+                path.full_path(),
+            ));
+        }
+        verified_foreign |= normal.has_definition && doc.has_definition;
         for missing in normal.shapes.difference(&doc.shapes) {
             if let Some(impl_header) = missing.strip_prefix("derived ") {
                 missing_impls.push(impl_header.to_string());
@@ -1147,37 +1218,45 @@ fn reject_non_doc_expansion(
                     ));
                 }
             }
-            for (shape, dependencies) in &normal.dependencies {
-                if shape.starts_with("derived ") && !doc.shapes.contains(shape) {
-                    continue;
-                }
-                let candidates = |dependencies: &[HashSet<String>]| {
-                    let mut candidates = dependencies
-                        .iter()
-                        .map(|dependencies| {
-                            let mut paths = dependencies.iter().cloned().collect::<Vec<_>>();
-                            paths.sort();
-                            paths
-                        })
-                        .collect::<Vec<_>>();
-                    candidates.sort();
-                    candidates
-                };
-                if !doc.dependencies.get(shape).is_some_and(|doc| {
-                    candidates(dependencies) == candidates(doc)
-                        || doc.iter().all(|candidate| {
-                            dependencies
-                                .iter()
-                                .all(|required| required.is_subset(candidate))
-                        })
-                }) {
-                    return Err(format!(
-                        "non-doc API extraction is incomplete: cannot verify the signature and owner of {shape} in the filtered Rustdoc JSON for '{}': type aliases or resolved paths differ under cfg(doc)",
-                        path.full_path()
-                    ));
-                }
+        }
+        // Declaration dependencies must be verified even for item kinds without
+        // a reported member collector, such as constants, statics, and aliases.
+        for (shape, dependencies) in &normal.dependencies {
+            if shape.starts_with("derived ") && !doc.shapes.contains(shape) {
+                continue;
+            }
+            let candidates = |dependencies: &[HashSet<String>]| {
+                let mut candidates = dependencies
+                    .iter()
+                    .map(|dependencies| {
+                        let mut paths = dependencies.iter().cloned().collect::<Vec<_>>();
+                        paths.sort();
+                        paths
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort();
+                candidates
+            };
+            if !doc.dependencies.get(shape).is_some_and(|doc| {
+                candidates(dependencies) == candidates(doc)
+                    || doc.iter().all(|candidate| {
+                        dependencies
+                            .iter()
+                            .all(|required| required.is_subset(candidate))
+                    })
+            }) {
+                return Err(format!(
+                    "non-doc API extraction is incomplete: cannot verify the signature and owner of {shape} in the filtered Rustdoc JSON for '{}': type aliases or resolved paths differ under cfg(doc)",
+                    path.full_path()
+                ));
             }
         }
+    }
+    if foreign_declaration && !verified_foreign {
+        return Err(format!(
+            "non-doc API extraction is incomplete: cannot verify foreign declaration '{}' in the normal and doc compiler expansions",
+            import.full_path()
+        ));
     }
     missing_impls.sort();
     missing_impls.dedup();
@@ -1191,6 +1270,7 @@ struct ExpandedApi {
     attributes: HashMap<String, Vec<(String, Vec<String>)>>,
     dependencies: HashMap<String, Vec<HashSet<String>>>,
     has_definition: bool,
+    resolved_path: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -1403,6 +1483,7 @@ fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<Rep
         ItemEnum::Trait(_) => ("trait", &[][..]),
         ItemEnum::Variant(_) => ("variant", &[][..]),
         ItemEnum::Function(_) => ("function", &[][..]),
+        ItemEnum::Static(_) | ItemEnum::ExternType => ("item", &[][..]),
         _ => return None,
     };
     let mut api = ReportedApi::default();
@@ -1439,6 +1520,23 @@ fn reported_api_members(krate: &Crate, item: &rustdoc_types::Item) -> Option<Rep
     Some(api)
 }
 
+// Syn represents explicit safety on some foreign declarations as raw tokens.
+// Remove only that marker for traversal; callers retain its declaration semantics.
+fn foreign_verbatim_declaration(
+    tokens: &proc_macro2::TokenStream,
+) -> Option<(syn::ForeignItem, bool)> {
+    let mut tokens = tokens.clone().into_iter().collect::<Vec<_>>();
+    let index = tokens.windows(2).position(|pair| {
+        matches!(&pair[0], proc_macro2::TokenTree::Ident(safety)
+            if (safety == "safe" && matches!(&pair[1], proc_macro2::TokenTree::Ident(kind) if kind == "fn" || kind == "static"))
+                || (safety == "unsafe" && matches!(&pair[1], proc_macro2::TokenTree::Ident(kind) if kind == "static")))
+    })?;
+    let safe = matches!(&tokens[index], proc_macro2::TokenTree::Ident(safety) if safety == "safe");
+    tokens.remove(index);
+    let item = syn::parse2(tokens.into_iter().collect()).ok()?;
+    matches!(item, syn::ForeignItem::Fn(_) | syn::ForeignItem::Static(_)).then_some((item, safe))
+}
+
 fn expanded_api_shape(
     source: &str,
     import: &crate::imports::ImportPath,
@@ -1456,21 +1554,8 @@ fn expanded_api_shape(
     let mut api = ExpandedApi::default();
 
     fn text(source: &str, span: proc_macro2::Span) -> Result<&str, String> {
-        let starts = std::iter::once(0)
-            .chain(source.match_indices('\n').map(|(index, _)| index + 1))
-            .collect::<Vec<_>>();
-        let start = span.start();
-        let end = span.end();
-        let start = starts
-            .get(start.line.saturating_sub(1))
-            .and_then(|line| line.checked_add(start.column))
-            .ok_or("compiler expansion has an invalid start span")?;
-        let end = starts
-            .get(end.line.saturating_sub(1))
-            .and_then(|line| line.checked_add(end.column))
-            .ok_or("compiler expansion has an invalid end span")?;
         source
-            .get(start..end)
+            .get(span.byte_range())
             .ok_or_else(|| "compiler expansion has an invalid UTF-8 span".to_string())
     }
     fn visibility(source: &str, vis: &Visibility) -> Result<String, String> {
@@ -1629,35 +1714,89 @@ fn expanded_api_shape(
     struct PathTrace<'a> {
         visiting: HashSet<Vec<String>>,
         aliases: Vec<Alias<'a>>,
+        query: bool,
+        type_only: bool,
+        values: Vec<ValueDependency<'a>>,
+        value_path: bool,
+        evaluation: bool,
+        pattern: bool,
     }
+    #[derive(Clone)]
+    struct LocalScope<'a> {
+        module: Vec<String>,
+        items: Vec<&'a Item>,
+        module_scope: bool,
+    }
+
     #[derive(Clone)]
     struct Alias<'a> {
         name: String,
         item: &'a syn::ItemType,
         module: Vec<String>,
-        scopes: Vec<Vec<&'a Item>>,
+        scopes: Vec<LocalScope<'a>>,
+    }
+
+    #[derive(Clone)]
+    struct ValueDependency<'a> {
+        name: String,
+        item: &'a Item,
+        module: Vec<String>,
+        scopes: Vec<LocalScope<'a>>,
     }
 
     fn resolve_block_path<'a>(
         root: &'a [Item],
         module: &[String],
-        scopes: &[Vec<&'a Item>],
+        scopes: &[LocalScope<'a>],
         path: &[String],
         legacy_use_paths: bool,
         allow_external: bool,
         trace: &mut PathTrace<'a>,
     ) -> Result<Option<Vec<String>>, String> {
+        let mut lookup_module = module.to_vec();
+        let mut lookup_path = path;
+        let qualified = matches!(path.first().map(String::as_str), Some("self" | "super"));
+        if lookup_path.first().is_some_and(|part| part == "self") {
+            lookup_path = &lookup_path[1..];
+        }
+        while lookup_path.first().is_some_and(|part| part == "super") {
+            if lookup_module.pop().is_none() {
+                return Ok(None);
+            }
+            lookup_path = &lookup_path[1..];
+        }
+        let path = lookup_path;
         let Some(name) = path.first() else {
             return Ok(None);
         };
         if !matches!(name.as_str(), "crate" | "self" | "super" | "::") {
             for (index, scope) in scopes.iter().enumerate().rev() {
-                let binding = vec!["block".into(), index.to_string(), name.clone()];
+                if scope.module != lookup_module || (qualified && !scope.module_scope) {
+                    continue;
+                }
+                let module = &scope.module;
+                let mut binding = vec!["block".into(), index.to_string()];
+                binding.extend(module.iter().cloned());
+                binding.push(name.clone());
                 if !trace.visiting.insert(binding.clone()) {
                     return Ok(None);
                 }
                 let result = (|| {
-                    for item in scope {
+                    // Value bindings take precedence over same-named types.
+                    let value = (trace.value_path && path.len() == 1)
+                        .then(|| {
+                            scope.items.iter().find(|item| {
+                                let ident = match item {
+                                    Item::Const(item) => &item.ident,
+                                    Item::Static(item) => &item.ident,
+                                    Item::Fn(item) => &item.sig.ident,
+                                    _ => return false,
+                                };
+                                crate::imports::identifier_key(&ident.to_string()) == name
+                            })
+                        })
+                        .flatten();
+                    for item in value.into_iter().chain(scope.items.iter()) {
                         let ident = match item {
                             Item::Struct(item) => &item.ident,
                             Item::Enum(item) => &item.ident,
@@ -1665,6 +1804,13 @@ fn expanded_api_shape(
                             Item::Trait(item) => &item.ident,
                             Item::Type(item) => &item.ident,
                             Item::Mod(item) => &item.ident,
+                            Item::Const(item) if trace.value_path && path.len() == 1 => &item.ident,
+                            Item::Static(item) if trace.value_path && path.len() == 1 => {
+                                &item.ident
+                            }
+                            Item::Fn(item) if trace.value_path && path.len() == 1 => {
+                                &item.sig.ident
+                            }
                             Item::ExternCrate(item) => {
                                 item.rename.as_ref().map_or(&item.ident, |(_, name)| name)
                             }
@@ -1674,6 +1820,31 @@ fn expanded_api_shape(
                             continue;
                         }
                         match item {
+                            Item::Struct(_) | Item::Enum(_) | Item::Union(_)
+                                if trace.evaluation && path.len() == 1 =>
+                            {
+                                let name = format!("block {index} {}::{name}", module.join("::"));
+                                trace.values.push(ValueDependency {
+                                    name: name.clone(),
+                                    item,
+                                    module: module.to_vec(),
+                                    scopes: scopes[..=index].to_vec(),
+                                });
+                                return Ok(Some(Some(vec![name])));
+                            }
+                            Item::Const(_) | Item::Static(_) | Item::Fn(_) => {
+                                if path.len() != 1 {
+                                    return Ok(Some(None));
+                                }
+                                let name = format!("block {index} {}::{name}", module.join("::"));
+                                trace.values.push(ValueDependency {
+                                    name: name.clone(),
+                                    item,
+                                    module: module.to_vec(),
+                                    scopes: scopes[..=index].to_vec(),
+                                });
+                                return Ok(Some(Some(vec![name])));
+                            }
                             Item::Type(item) => {
                                 trace.aliases.push(Alias {
                                     name: format!("block {index} {}::{name}", module.join("::")),
@@ -1717,10 +1888,28 @@ fn expanded_api_shape(
                                 )
                                 .map(Some);
                             }
-                            Item::Mod(_) => {
-                                return Err(format!(
-                                    "non-doc API extraction is incomplete: cannot verify an implementation path through block-local module '{name}'"
-                                ));
+                            Item::Mod(item) => {
+                                let Some((_, children)) = &item.content else {
+                                    return Ok(Some(None));
+                                };
+                                let mut child_module = module.clone();
+                                child_module.push(name.clone());
+                                let mut child_scopes = scopes[..=index].to_vec();
+                                child_scopes.push(LocalScope {
+                                    module: child_module.clone(),
+                                    items: children.iter().collect(),
+                                    module_scope: true,
+                                });
+                                return resolve_block_path(
+                                    root,
+                                    &child_module,
+                                    &child_scopes,
+                                    &path[1..],
+                                    legacy_use_paths,
+                                    allow_external,
+                                    trace,
+                                )
+                                .map(Some);
                             }
                             // Block-local types cannot be the publicly queried type.
                             _ => return Ok(Some(None)),
@@ -1728,7 +1917,7 @@ fn expanded_api_shape(
                     }
                     for globs in [false, true] {
                         let mut explicit = false;
-                        for item in scope {
+                        for item in &scope.items {
                             let Item::Use(item) = item else { continue };
                             for mut target in use_targets(&item.tree, &[], name, globs) {
                                 explicit |= !globs;
@@ -1743,7 +1932,7 @@ fn expanded_api_shape(
                                     ) {
                                     (&[][..], &[][..])
                                 } else {
-                                    (module, &scopes[..=index])
+                                    (module.as_slice(), &scopes[..=index])
                                 };
                                 if let Some(resolved) = resolve_block_path(
                                     root,
@@ -1770,6 +1959,16 @@ fn expanded_api_shape(
                 }
             }
         }
+        let absolute;
+        let path = if qualified {
+            absolute = std::iter::once("crate".to_string())
+                .chain(lookup_module.iter().cloned())
+                .chain(path.iter().cloned())
+                .collect::<Vec<_>>();
+            &absolute
+        } else {
+            path
+        };
         Ok(resolve_path(
             root,
             module,
@@ -1837,27 +2036,105 @@ fn expanded_api_shape(
         let mut items = root;
         for (index, name) in path.iter().enumerate() {
             let module = &path[..index];
-            let named = items.iter().find(|item| {
-                let ident = match item {
-                    Item::Mod(item) => &item.ident,
-                    Item::Struct(item) => &item.ident,
-                    Item::Enum(item) => &item.ident,
-                    Item::Union(item) => &item.ident,
-                    Item::Type(item) => &item.ident,
-                    Item::Trait(item) => &item.ident,
-                    Item::ExternCrate(item) => {
-                        item.rename.as_ref().map_or(&item.ident, |(_, name)| name)
-                    }
-                    _ => return false,
-                };
-                crate::imports::identifier_key(&ident.to_string()) == name
+            if items.iter().any(|item| {
+                matches!(item, Item::ForeignMod(block) if block.items.iter().any(|foreign| {
+                    matches!(foreign, syn::ForeignItem::Type(ty)
+                        if crate::imports::identifier_key(&ty.ident.to_string()) == name)
+                }))
+            }) {
+                return (index + 1 == path.len()).then(|| path.to_vec());
+            }
+            let value = (trace.value_path && index + 1 == path.len())
+                .then(|| {
+                    items.iter().find(|item| {
+                        let ident = match item {
+                            Item::Const(item) => &item.ident,
+                            Item::Static(item) => &item.ident,
+                            Item::Fn(item) => &item.sig.ident,
+                            _ => return false,
+                        };
+                        crate::imports::identifier_key(&ident.to_string()) == name
+                    })
+                })
+                .flatten();
+            let named = value.or_else(|| {
+                items.iter().find(|item| {
+                    let ident = match item {
+                        Item::Mod(item) => &item.ident,
+                        Item::Struct(item) => &item.ident,
+                        Item::Enum(item) => &item.ident,
+                        Item::Union(item) => &item.ident,
+                        Item::Type(item) => &item.ident,
+                        Item::Trait(item) => &item.ident,
+                        Item::TraitAlias(item) if trace.query => &item.ident,
+                        Item::Fn(item)
+                            if index + 1 == path.len()
+                                && (trace.value_path || (trace.query && !trace.type_only)) =>
+                        {
+                            &item.sig.ident
+                        }
+                        Item::Const(item)
+                            if index + 1 == path.len()
+                                && (trace.value_path || (trace.query && !trace.type_only)) =>
+                        {
+                            &item.ident
+                        }
+                        Item::Static(item)
+                            if index + 1 == path.len()
+                                && (trace.value_path || (trace.query && !trace.type_only)) =>
+                        {
+                            &item.ident
+                        }
+                        Item::Macro(item)
+                            if trace.query && !trace.type_only && index + 1 == path.len() =>
+                        {
+                            let Some(ident) = &item.ident else {
+                                return false;
+                            };
+                            ident
+                        }
+                        Item::ExternCrate(item) => {
+                            item.rename.as_ref().map_or(&item.ident, |(_, name)| name)
+                        }
+                        _ => return false,
+                    };
+                    crate::imports::identifier_key(&ident.to_string()) == name
+                })
             });
             match named {
+                Some(item @ (Item::Struct(_) | Item::Enum(_) | Item::Union(_)))
+                    if trace.evaluation && index + 1 == path.len() =>
+                {
+                    trace.values.push(ValueDependency {
+                        name: path.join("::"),
+                        item,
+                        module: module.to_vec(),
+                        scopes: Vec::new(),
+                    });
+                    return Some(path.to_vec());
+                }
+                Some(item @ (Item::Const(_) | Item::Static(_) | Item::Fn(_))) => {
+                    if index + 1 != path.len() {
+                        return None;
+                    }
+                    trace.values.push(ValueDependency {
+                        name: path.join("::"),
+                        item,
+                        module: module.to_vec(),
+                        scopes: Vec::new(),
+                    });
+                    return Some(path.to_vec());
+                }
                 Some(Item::Mod(item)) => {
                     items = &item.content.as_ref()?.1;
                     continue;
                 }
                 Some(Item::Type(item)) => {
+                    // A queried alias is its own declaration. Dependency and
+                    // implementation paths still follow its underlying type.
+                    if trace.query && index + 1 == path.len() {
+                        return Some(path.to_vec());
+                    }
                     trace.aliases.push(Alias {
                         name: path[..=index].join("::"),
                         item,
@@ -1900,8 +2177,56 @@ fn expanded_api_shape(
                         None,
                     );
                 }
+                Some(item @ Item::Enum(_))
+                    if (trace.query || trace.pattern) && index + 2 == path.len() =>
+                {
+                    let Item::Enum(enum_) = item else {
+                        unreachable!()
+                    };
+                    if trace.pattern {
+                        trace.values.push(ValueDependency {
+                            name: path[..=index].join("::"),
+                            item,
+                            module: module.to_vec(),
+                            scopes: Vec::new(),
+                        });
+                    }
+                    return enum_
+                        .variants
+                        .iter()
+                        .any(|variant| {
+                            crate::imports::identifier_key(&variant.ident.to_string())
+                                == path[index + 1]
+                        })
+                        .then(|| path.to_vec());
+                }
                 Some(_) => return (index + 1 == path.len()).then(|| path.to_vec()),
                 None => {}
+            }
+            if trace.query && index + 1 == path.len() {
+                for item in items {
+                    let Item::ForeignMod(item) = item else {
+                        continue;
+                    };
+                    if item.items.iter().any(|item| {
+                        let normalized = match item {
+                            syn::ForeignItem::Verbatim(tokens) => {
+                                foreign_verbatim_declaration(tokens).map(|(item, _)| item)
+                            }
+                            _ => None,
+                        };
+                        let item = normalized.as_ref().unwrap_or(item);
+                        let ident = match item {
+                            syn::ForeignItem::Fn(item) if !trace.type_only => &item.sig.ident,
+                            syn::ForeignItem::Static(item) if !trace.type_only => &item.ident,
+                            syn::ForeignItem::Type(item) => &item.ident,
+                            _ => return false,
+                        };
+                        crate::imports::identifier_key(&ident.to_string()) == name
+                    }) {
+                        return Some(path.to_vec());
+                    }
+                }
             }
             let binding = path[..=index].to_vec();
             if !trace.visiting.insert(binding.clone()) {
@@ -1913,7 +2238,9 @@ fn expanded_api_shape(
                 for item in items {
                     let Item::Use(item) = item else { continue };
                     for mut target in use_targets(&item.tree, &[], name, globs) {
-                        explicit_binding |= !globs;
+                        // Query lookup filters candidates by namespace. A value
+                        // import cannot shadow a type supplied by a glob.
+                        explicit_binding |= !globs && !trace.query;
                         target.extend_from_slice(&path[index + 1..]);
                         if item.leading_colon.is_some() && !legacy_use_paths {
                             target.insert(0, "::".to_string());
@@ -1953,6 +2280,25 @@ fn expanded_api_shape(
                     None,
                 )
             } else if allow_external
+                && (!trace.pattern || index + 1 < path.len())
+                && !(trace.query
+                    && trace.type_only
+                    && index + 1 == path.len()
+                    && items.iter().any(|item| {
+                        let ident = match item {
+                            Item::Fn(item) => &item.sig.ident,
+                            Item::Const(item) => &item.ident,
+                            Item::Static(item) => &item.ident,
+                            Item::Macro(item) => {
+                                let Some(ident) = &item.ident else {
+                                    return false;
+                                };
+                                ident
+                            }
+                            _ => return false,
+                        };
+                        crate::imports::identifier_key(&ident.to_string()) == name
+                    }))
                 && (prelude_index == Some(index) || (legacy_use_paths && index == 0))
             {
                 let mut external = vec!["::".to_string()];
@@ -1972,7 +2318,7 @@ fn expanded_api_shape(
         imp: &syn::ItemImpl,
         wanted: &[String],
         legacy_use_paths: bool,
-        scopes: &[Vec<&Item>],
+        scopes: &[LocalScope<'_>],
     ) -> Result<bool, String> {
         let Some(wanted) = resolve_path(
             root,
@@ -1989,7 +2335,7 @@ fn expanded_api_shape(
             module: &'a [String],
             wanted: &'a [String],
             generics: &'a syn::Generics,
-            scopes: &'a [Vec<&'a Item>],
+            scopes: &'a [LocalScope<'a>],
             legacy_use_paths: bool,
             found: bool,
             error: Option<String>,
@@ -2066,29 +2412,220 @@ fn expanded_api_shape(
         source: &str,
         root: &[Item],
         module: &[String],
-        scopes: &[Vec<&Item>],
+        scopes: &[LocalScope<'_>],
         item: &Item,
         legacy_use_paths: bool,
-        variant: Option<&syn::Variant>,
+        selection: (Option<&syn::Variant>, Option<&syn::ForeignItem>),
     ) -> Result<HashSet<String>, String> {
+        let (variant, foreign) = selection;
         struct Dependencies<'a> {
             source: &'a str,
             root: &'a [Item],
             module: Vec<String>,
-            scopes: Vec<Vec<&'a Item>>,
+            scopes: Vec<LocalScope<'a>>,
             legacy_use_paths: bool,
             shadowed: Vec<String>,
+            bindings: Vec<String>,
             trace: PathTrace<'a>,
             shapes: HashSet<String>,
             error: Option<String>,
         }
-        impl<'ast> syn::visit::Visit<'ast> for Dependencies<'_> {
+        impl<'ast> syn::visit::Visit<'ast> for Dependencies<'ast> {
             fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
-            fn visit_block(&mut self, _: &'ast syn::Block) {}
+            fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+                let evaluation = self.trace.evaluation;
+                self.trace.evaluation = true;
+                syn::visit::visit_expr(self, expression);
+                self.trace.evaluation = evaluation;
+            }
+            fn visit_generic_argument(&mut self, argument: &'ast syn::GenericArgument) {
+                // Syn cannot distinguish `Container<LEN>` from a type argument.
+                if let syn::GenericArgument::Type(syn::Type::Path(path)) = argument
+                    && path.qself.is_none()
+                    && path.path.segments.len() == 1
+                {
+                    let parts = path_parts(&path.path, self.legacy_use_paths);
+                    if !parts
+                        .first()
+                        .is_some_and(|name| self.shadowed.contains(name))
+                    {
+                        let mut trace = PathTrace {
+                            value_path: true,
+                            ..PathTrace::default()
+                        };
+                        let resolved = resolve_block_path(
+                            self.root,
+                            &self.module,
+                            &self.scopes,
+                            &parts,
+                            self.legacy_use_paths,
+                            true,
+                            &mut trace,
+                        );
+                        if trace
+                            .values
+                            .iter()
+                            .any(|value| matches!(value.item, Item::Const(_)))
+                        {
+                            self.trace.aliases.extend(trace.aliases);
+                            self.trace.values.extend(trace.values);
+                            match resolved {
+                                Ok(resolved) => match text(self.source, path.path.span()) {
+                                    Ok(path) => {
+                                        self.shapes.insert(format!(
+                                            "path {path} resolves to {resolved:?}"
+                                        ));
+                                    }
+                                    Err(error) => self.error = Some(error),
+                                },
+                                Err(error) => self.error = Some(error),
+                            }
+                            for segment in &path.path.segments {
+                                self.visit_path_arguments(&segment.arguments);
+                            }
+                            return;
+                        }
+                    }
+                }
+                syn::visit::visit_generic_argument(self, argument);
+            }
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                self.visit_signature(&item.sig);
+            }
+            fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+                self.visit_signature(&item.sig);
+            }
+            fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+                self.visit_signature(&item.sig);
+            }
+            fn visit_block(&mut self, block: &'ast syn::Block) {
+                let shadowed = self.shadowed.clone();
+                let bindings = self.bindings.clone();
+                self.scopes.push(LocalScope {
+                    module: self.module.clone(),
+                    module_scope: false,
+                    items: block
+                        .stmts
+                        .iter()
+                        .filter_map(|stmt| match stmt {
+                            syn::Stmt::Item(item) => Some(item),
+                            _ => None,
+                        })
+                        .collect(),
+                });
+                // Inner item declarations shadow bindings from outer blocks.
+                for item in &self.scopes.last().unwrap().items {
+                    let ident = match item {
+                        Item::Const(item) => &item.ident,
+                        Item::Static(item) => &item.ident,
+                        Item::Fn(item) => &item.sig.ident,
+                        _ => continue,
+                    };
+                    let name = crate::imports::identifier_key(&ident.to_string()).to_string();
+                    self.shadowed.retain(|binding| binding != &name);
+                    self.bindings.retain(|binding| binding != &name);
+                }
+                for stmt in &block.stmts {
+                    // Item definitions affect evaluation only when referenced.
+                    if !matches!(stmt, syn::Stmt::Item(_)) {
+                        self.visit_stmt(stmt);
+                    }
+                }
+                self.scopes.pop();
+                self.shadowed = shadowed;
+                self.bindings = bindings;
+            }
+            fn visit_local(&mut self, local: &'ast syn::Local) {
+                // The initializer and let-else branch precede the new bindings.
+                if let Some(initializer) = &local.init {
+                    self.visit_expr(&initializer.expr);
+                    if let Some((_, diverge)) = &initializer.diverge {
+                        self.visit_expr(diverge);
+                    }
+                }
+                self.visit_pat(&local.pat);
+            }
+            fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                let name = crate::imports::identifier_key(&pattern.ident.to_string()).to_string();
+                let mut trace = PathTrace {
+                    value_path: true,
+                    evaluation: true,
+                    pattern: true,
+                    ..PathTrace::default()
+                };
+                let resolved = resolve_block_path(
+                    self.root,
+                    &self.module,
+                    &self.scopes,
+                    std::slice::from_ref(&name),
+                    self.legacy_use_paths,
+                    true,
+                    &mut trace,
+                );
+                match resolved {
+                    Ok(Some(path))
+                        if trace.values.iter().any(|value| match value.item {
+                            Item::Const(_) => true,
+                            Item::Struct(item) => matches!(item.fields, syn::Fields::Unit),
+                            Item::Enum(_) => value.name != path.join("::"),
+                            _ => false,
+                        }) || path.first().is_some_and(|part| part == "::") =>
+                    {
+                        self.shapes
+                            .insert(format!("pattern {name} resolves to {path:?}"));
+                        self.trace.aliases.extend(trace.aliases);
+                        self.trace.values.extend(trace.values);
+                    }
+                    Err(error) => self.error = Some(error),
+                    _ => self.bindings.push(name),
+                }
+                syn::visit::visit_pat_ident(self, pattern);
+            }
+            fn visit_expr_let(&mut self, expression: &'ast syn::ExprLet) {
+                self.visit_expr(&expression.expr);
+                self.visit_pat(&expression.pat);
+            }
+            fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+                let previous = self.bindings.len();
+                self.visit_expr(&expression.cond);
+                self.visit_block(&expression.then_branch);
+                self.bindings.truncate(previous);
+                if let Some((_, branch)) = &expression.else_branch {
+                    self.visit_expr(branch);
+                }
+            }
+            fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+                let previous = self.bindings.len();
+                self.visit_expr(&expression.cond);
+                self.visit_block(&expression.body);
+                self.bindings.truncate(previous);
+            }
+            fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+                self.visit_expr(&expression.expr);
+                let previous = self.bindings.len();
+                self.visit_pat(&expression.pat);
+                self.visit_block(&expression.body);
+                self.bindings.truncate(previous);
+            }
+            fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+                let previous = self.bindings.len();
+                self.visit_pat(&arm.pat);
+                if let Some((_, guard)) = &arm.guard {
+                    self.visit_expr(guard);
+                }
+                self.visit_expr(&arm.body);
+                self.bindings.truncate(previous);
+            }
             fn visit_generics(&mut self, generics: &'ast syn::Generics) {
-                self.shadowed.extend(generics.type_params().map(|param| {
-                    crate::imports::identifier_key(&param.ident.to_string()).to_string()
-                }));
+                self.shadowed
+                    .extend(generics.params.iter().filter_map(|param| {
+                        let ident = match param {
+                            syn::GenericParam::Type(param) => &param.ident,
+                            syn::GenericParam::Const(param) => &param.ident,
+                            syn::GenericParam::Lifetime(_) => return None,
+                        };
+                        Some(crate::imports::identifier_key(&ident.to_string()).to_string())
+                    }));
                 syn::visit::visit_generics(self, generics);
             }
             fn visit_item(&mut self, item: &'ast Item) {
@@ -2098,8 +2635,10 @@ fn expanded_api_shape(
             }
             fn visit_signature(&mut self, signature: &'ast syn::Signature) {
                 let previous = self.shadowed.len();
+                let bindings = self.bindings.len();
                 syn::visit::visit_signature(self, signature);
                 self.shadowed.truncate(previous);
+                self.bindings.truncate(bindings);
             }
             fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
                 let previous = self.shadowed.len();
@@ -2110,6 +2649,55 @@ fn expanded_api_shape(
                 let previous = self.shadowed.len();
                 syn::visit::visit_impl_item(self, item);
                 self.shadowed.truncate(previous);
+            }
+            fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+                let parts = path_parts(&expression.path, self.legacy_use_paths);
+                if parts.first().is_some_and(|name| {
+                    self.shadowed.contains(name) || self.bindings.contains(name)
+                }) {
+                    for segment in &expression.path.segments {
+                        self.visit_path_arguments(&segment.arguments);
+                    }
+                    return;
+                }
+                if expression.qself.is_some() {
+                    self.error = Some("non-doc API extraction is incomplete: cannot verify an associated constant evaluation dependency".into());
+                    return;
+                }
+                self.trace.value_path = true;
+                let resolved = resolve_block_path(
+                    self.root,
+                    &self.module,
+                    &self.scopes,
+                    &parts,
+                    self.legacy_use_paths,
+                    true,
+                    &mut self.trace,
+                );
+                self.trace.value_path = false;
+                match resolved {
+                    Ok(Some(resolved)) => match text(self.source, expression.path.span()) {
+                        Ok(path) => {
+                            self.shapes
+                                .insert(format!("path {path} resolves to {:?}", Some(resolved)));
+                        }
+                        Err(error) => self.error = Some(error),
+                    },
+                    Ok(None) => {
+                        self.error = Some(format!(
+                            "non-doc API extraction is incomplete: cannot verify constant evaluation dependency '{}'",
+                            parts.join("::")
+                        ))
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                // Generic arguments contain their own type/value dependencies.
+                for segment in &expression.path.segments {
+                    self.visit_path_arguments(&segment.arguments);
+                }
+            }
+            fn visit_expr_method_call(&mut self, _: &'ast syn::ExprMethodCall) {
+                self.error = Some("non-doc API extraction is incomplete: cannot verify a method used in constant evaluation".into());
             }
             fn visit_path(&mut self, path: &'ast syn::Path) {
                 let parts = path_parts(path, self.legacy_use_paths);
@@ -2139,6 +2727,18 @@ fn expanded_api_shape(
                 syn::visit::visit_path(self, path);
             }
         }
+        fn pattern_bindings(pattern: &syn::Pat, bindings: &mut Vec<String>) {
+            struct Bindings<'a>(&'a mut Vec<String>);
+            impl<'ast> syn::visit::Visit<'ast> for Bindings<'_> {
+                fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                    self.0.push(
+                        crate::imports::identifier_key(&pattern.ident.to_string()).to_string(),
+                    );
+                    syn::visit::visit_pat_ident(self, pattern);
+                }
+            }
+            syn::visit::Visit::visit_pat(&mut Bindings(bindings), pattern);
+        }
         let mut dependencies = Dependencies {
             source,
             root,
@@ -2146,11 +2746,14 @@ fn expanded_api_shape(
             scopes: scopes.to_vec(),
             legacy_use_paths,
             shadowed: Vec::new(),
+            bindings: Vec::new(),
             trace: PathTrace::default(),
             shapes: HashSet::new(),
             error: None,
         };
-        if let Some(variant) = variant {
+        if let Some(foreign) = foreign {
+            syn::visit::Visit::visit_foreign_item(&mut dependencies, foreign);
+        } else if let Some(variant) = variant {
             if let Item::Enum(item) = item {
                 syn::visit::Visit::visit_generics(&mut dependencies, &item.generics);
             }
@@ -2159,37 +2762,153 @@ fn expanded_api_shape(
             syn::visit::Visit::visit_item(&mut dependencies, item);
         }
         let mut seen = HashSet::new();
-        let mut index = 0;
-        // Resolve aliases transitively, including aliases nested in generic
-        // arguments. Rustdoc may normalize these to different concrete types.
-        while let Some(alias) = dependencies.trace.aliases.get(index).cloned() {
-            index += 1;
-            let start = alias.item.ident.span().start();
-            if !seen.insert((start.line, start.column)) {
-                continue;
+        let mut alias_index = 0;
+        let mut value_index = 0;
+        // Aliases and evaluated values can refer to each other. Compare their
+        // complete closure rather than trusting unchanged path spellings.
+        loop {
+            if let Some(alias) = dependencies.trace.aliases.get(alias_index).cloned() {
+                alias_index += 1;
+                let start = alias.item.ident.span().start();
+                if !seen.insert((start.line, start.column)) {
+                    continue;
+                }
+                dependencies.shapes.insert(format!(
+                    "type alias {}{} = {}",
+                    alias.name,
+                    text(source, alias.item.generics.span())?,
+                    text(source, alias.item.ty.span())?
+                ));
+                dependencies.shadowed.clear();
+                dependencies.bindings.clear();
+                dependencies.module = alias.module;
+                dependencies.scopes = alias.scopes;
+                syn::visit::Visit::visit_generics(&mut dependencies, &alias.item.generics);
+                syn::visit::Visit::visit_type(&mut dependencies, &alias.item.ty);
+            } else if let Some(value) = dependencies.trace.values.get(value_index).cloned() {
+                value_index += 1;
+                let start = value.item.span().start();
+                if !seen.insert((start.line, start.column)) {
+                    continue;
+                }
+                dependencies.shadowed.clear();
+                dependencies.bindings.clear();
+                dependencies.module = value.module;
+                dependencies.scopes = value.scopes;
+                let definition = match value.item {
+                    Item::Const(item) => format!(
+                        "const {}{}: {} = {}",
+                        value.name,
+                        text(source, item.generics.span())?,
+                        text(source, item.ty.span())?,
+                        text(source, item.expr.span())?
+                    ),
+                    Item::Static(item) => format!(
+                        "static {}: {} = {}",
+                        value.name,
+                        text(source, item.ty.span())?,
+                        text(source, item.expr.span())?
+                    ),
+                    Item::Fn(item) => {
+                        let body = if item.sig.constness.is_some() {
+                            text(source, item.block.span())?
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "function {}: {} {body}",
+                            value.name,
+                            text(source, item.sig.span())?
+                        )
+                    }
+                    Item::Struct(_) | Item::Enum(_) | Item::Union(_) => format!(
+                        "evaluation type {}: {}",
+                        value.name,
+                        text(source, value.item.span())?
+                    ),
+                    _ => unreachable!(),
+                };
+                dependencies.shapes.insert(definition);
+                syn::visit::Visit::visit_item(&mut dependencies, value.item);
+                if let Item::Fn(item) = value.item
+                    && item.sig.constness.is_some()
+                {
+                    syn::visit::Visit::visit_generics(&mut dependencies, &item.sig.generics);
+                    for argument in &item.sig.inputs {
+                        if let syn::FnArg::Typed(argument) = argument {
+                            pattern_bindings(&argument.pat, &mut dependencies.bindings);
+                        }
+                    }
+                    syn::visit::Visit::visit_block(&mut dependencies, &item.block);
+                }
+            } else {
+                break;
             }
-            dependencies.shapes.insert(format!(
-                "type alias {}{} = {}",
-                alias.name,
-                text(source, alias.item.generics.span())?,
-                text(source, alias.item.ty.span())?
-            ));
-            let shadowed = std::mem::take(&mut dependencies.shadowed);
-            dependencies.module = alias.module;
-            dependencies.scopes = alias.scopes;
-            syn::visit::Visit::visit_generics(&mut dependencies, &alias.item.generics);
-            syn::visit::Visit::visit_type(&mut dependencies, &alias.item.ty);
-            dependencies.shadowed = shadowed;
         }
         if let Some(error) = dependencies.error {
             return Err(error);
         }
         Ok(dependencies.shapes)
     }
+    // Items in any expression block can add implementations to module-level
+    // types, even inside private functions that are never called.
+    struct BlockItems<'ast, 'walk> {
+        source: &'ast str,
+        root: &'ast [Item],
+        scopes: Vec<LocalScope<'ast>>,
+        modules: &'walk mut Vec<String>,
+        wanted: (&'walk [String], bool),
+        api: &'walk mut ExpandedApi,
+        deprecation: Option<&'walk rustdoc_types::Deprecation>,
+        legacy_use_paths: bool,
+        error: Option<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for BlockItems<'ast, '_> {
+        fn visit_item(&mut self, item: &'ast Item) {
+            if self.error.is_none() {
+                self.error = walk(
+                    self.source,
+                    self.root,
+                    (std::slice::from_ref(item), self.deprecation, &self.scopes),
+                    self.modules,
+                    self.wanted,
+                    self.api,
+                    self.legacy_use_paths,
+                )
+                .err();
+            }
+        }
+        // Modules are traversed by walk, with their own module path.
+        fn visit_item_mod(&mut self, _: &'ast syn::ItemMod) {}
+        fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            if self.error.is_some() {
+                return;
+            }
+            self.scopes.push(LocalScope {
+                module: self.modules.clone(),
+                module_scope: false,
+                items: block
+                    .stmts
+                    .iter()
+                    .filter_map(|stmt| match stmt {
+                        syn::Stmt::Item(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect(),
+            });
+            syn::visit::visit_block(self, block);
+            self.scopes.pop();
+        }
+    }
     fn walk(
         source: &str,
         root: &[Item],
-        items: (&[Item], Option<&rustdoc_types::Deprecation>, &[Vec<&Item>]),
+        items: (
+            &[Item],
+            Option<&rustdoc_types::Deprecation>,
+            &[LocalScope<'_>],
+        ),
         modules: &mut Vec<String>,
         wanted: (&[String], bool),
         api: &mut ExpandedApi,
@@ -2198,33 +2917,29 @@ fn expanded_api_shape(
         let (items, inherited_deprecation, scopes) = items;
         let (wanted, type_only) = wanted;
         for item in items {
-            if let Item::Const(constant) = item
-                && let syn::Expr::Block(block) = &*constant.expr
-            {
-                let deprecation = expanded_deprecation(&constant.attrs, inherited_deprecation);
-                let mut scopes = scopes.to_vec();
-                scopes.push(
-                    block
-                        .block
-                        .stmts
-                        .iter()
-                        .filter_map(|stmt| match stmt {
-                            syn::Stmt::Item(item) => Some(item),
-                            _ => None,
-                        })
-                        .collect(),
-                );
-                for child in scopes.last().unwrap() {
-                    walk(
-                        source,
-                        root,
-                        (std::slice::from_ref(*child), deprecation.as_ref(), &scopes),
-                        modules,
-                        (wanted, type_only),
-                        api,
-                        legacy_use_paths,
-                    )?;
-                }
+            let attrs = match item {
+                Item::Fn(item) => &item.attrs,
+                Item::Const(item) => &item.attrs,
+                Item::Static(item) => &item.attrs,
+                Item::Impl(item) => &item.attrs,
+                Item::Trait(item) => &item.attrs,
+                _ => &[][..],
+            };
+            let deprecation = expanded_deprecation(attrs, inherited_deprecation);
+            let mut blocks = BlockItems {
+                source,
+                root,
+                scopes: scopes.to_vec(),
+                modules,
+                wanted: (wanted, type_only),
+                api,
+                deprecation: deprecation.as_ref(),
+                legacy_use_paths,
+                error: None,
+            };
+            syn::visit::visit_item(&mut blocks, item);
+            if let Some(error) = blocks.error {
+                return Err(error);
             }
             if type_only
                 && matches!(
@@ -2242,10 +2957,18 @@ fn expanded_api_shape(
                         .insert(format!("module {}", visibility(source, &module.vis)?));
                 }
                 if let Some((_, children)) = &module.content {
+                    let mut module_scopes = scopes.to_vec();
+                    if !scopes.is_empty() {
+                        module_scopes.push(LocalScope {
+                            module: modules.clone(),
+                            items: children.iter().collect(),
+                            module_scope: true,
+                        });
+                    }
                     walk(
                         source,
                         root,
-                        (children, deprecation.as_ref(), scopes),
+                        (children, deprecation.as_ref(), &module_scopes),
                         modules,
                         (wanted, type_only),
                         api,
@@ -2253,6 +2976,108 @@ fn expanded_api_shape(
                     )?;
                 }
                 modules.pop();
+                continue;
+            }
+            if let Item::ForeignMod(block) = item {
+                let deprecation = expanded_deprecation(&block.attrs, inherited_deprecation);
+                for foreign in &block.items {
+                    let normalized = match foreign {
+                        syn::ForeignItem::Verbatim(tokens) => foreign_verbatim_declaration(tokens),
+                        _ => None,
+                    };
+                    let safe = normalized.as_ref().is_some_and(|(_, safe)| *safe);
+                    let foreign = normalized.as_ref().map_or(foreign, |(item, _)| item);
+                    let (name, attrs, vis, declaration) = match foreign {
+                        syn::ForeignItem::Fn(function) if !type_only => (
+                            &function.sig.ident,
+                            function.attrs.as_slice(),
+                            &function.vis,
+                            format!("{};", text(source, function.sig.span())?),
+                        ),
+                        syn::ForeignItem::Static(static_) if !type_only => (
+                            &static_.ident,
+                            static_.attrs.as_slice(),
+                            &static_.vis,
+                            format!(
+                                "static {}{}: {};",
+                                if matches!(static_.mutability, syn::StaticMutability::Mut(_)) {
+                                    "mut "
+                                } else {
+                                    ""
+                                },
+                                static_.ident,
+                                text(source, static_.ty.span())?
+                            ),
+                        ),
+                        syn::ForeignItem::Type(ty) => (
+                            &ty.ident,
+                            ty.attrs.as_slice(),
+                            &ty.vis,
+                            format!("type {}{};", ty.ident, text(source, ty.generics.span())?),
+                        ),
+                        _ => continue,
+                    };
+                    if !scopes.is_empty()
+                        || modules.len() + 1 != wanted.len()
+                        || modules != &wanted[..modules.len()]
+                        || crate::imports::identifier_key(&name.to_string())
+                            != wanted[modules.len()]
+                    {
+                        continue;
+                    }
+                    let link_attributes = block
+                        .attrs
+                        .iter()
+                        .chain(attrs)
+                        .filter(|attr| {
+                            ["link", "link_name", "link_ordinal"]
+                                .iter()
+                                .any(|name| attr.path().is_ident(name))
+                        })
+                        .map(|attr| text(source, attr.span()).map(str::to_string))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let shape = format!(
+                        "foreign {}{}: {} {} {} {link_attributes:?}",
+                        if block.unsafety.is_some() {
+                            "unsafe "
+                        } else {
+                            ""
+                        },
+                        text(source, block.abi.span())?,
+                        visibility(source, vis)?,
+                        if safe { "safe" } else { "unsafe" },
+                        declaration,
+                    );
+                    api.has_definition = true;
+                    api.shapes.insert(shape.clone());
+                    api.dependencies
+                        .entry("definition".into())
+                        .or_default()
+                        .push(api_dependencies(
+                            source,
+                            root,
+                            modules,
+                            scopes,
+                            item,
+                            legacy_use_paths,
+                            (None, Some(foreign)),
+                        )?);
+                    api.attributes.entry("item".into()).or_default().push(
+                        expanded_member_attributes("item", attrs, deprecation.as_ref()),
+                    );
+                    if let syn::ForeignItem::Fn(function) = foreign {
+                        let key = member_key("function", &function.sig.ident.to_string());
+                        api.members.push((key.clone(), shape.clone()));
+                        api.attributes
+                            .entry(key)
+                            .or_default()
+                            .push(expanded_member_attributes(
+                                &shape,
+                                attrs,
+                                deprecation.as_ref(),
+                            ));
+                    }
+                }
                 continue;
             }
             let (name, attrs) = match item {
@@ -2291,7 +3116,7 @@ fn expanded_api_shape(
                         scopes,
                         item,
                         legacy_use_paths,
-                        None,
+                        (None, None),
                     )?);
                 let deprecation = expanded_deprecation(attrs, inherited_deprecation);
                 api.attributes
@@ -2511,7 +3336,7 @@ fn expanded_api_shape(
                         scopes,
                         item,
                         legacy_use_paths,
-                        Some(variant),
+                        (Some(variant), None),
                     )?);
                 let prefix = member_key("variant", &variant.ident.to_string());
                 let shape = variant_shape(source, variant)?;
@@ -2545,8 +3370,15 @@ fn expanded_api_shape(
             if let Item::Impl(imp) = item
                 && impl_mentions_type(root, modules, imp, wanted, legacy_use_paths, scopes)?
             {
-                let dependencies =
-                    api_dependencies(source, root, modules, scopes, item, legacy_use_paths, None)?;
+                let dependencies = api_dependencies(
+                    source,
+                    root,
+                    modules,
+                    scopes,
+                    item,
+                    legacy_use_paths,
+                    (None, None),
+                )?;
                 let deprecation = expanded_deprecation(&imp.attrs, inherited_deprecation);
                 let owner = text(source, imp.self_ty.span())?;
                 let trait_name = imp
@@ -2688,15 +3520,32 @@ fn expanded_api_shape(
     }
 
     let deprecation = expanded_deprecation(&file.attrs, None);
+    let type_only = import.namespace == Some(crate::imports::NamespaceConstraint::Type);
+    api.resolved_path = resolve_path(
+        &file.items,
+        &[],
+        &wanted,
+        legacy_use_paths,
+        true,
+        &mut PathTrace {
+            query: true,
+            type_only,
+            ..PathTrace::default()
+        },
+    );
+    // Resolve independently of Rustdoc's canonical path: intermediate aliases
+    // can select another declaration while both declarations stay unchanged.
+    let resolved = api.resolved_path.clone();
+    let wanted = resolved
+        .as_ref()
+        .filter(|path| path.first().is_some_and(|part| part != "::"))
+        .unwrap_or(&wanted);
     walk(
         source,
         &file.items,
         (&file.items, deprecation.as_ref(), &[]),
         &mut Vec::new(),
-        (
-            &wanted,
-            import.namespace == Some(crate::imports::NamespaceConstraint::Type),
-        ),
+        (wanted, type_only),
         &mut api,
         legacy_use_paths,
     )?;
@@ -5105,6 +5954,654 @@ mod tests {
         }
     }
 
+    fn foreign_crate(inner: ItemEnum) -> Crate {
+        let mut krate = minimal_crate(None, rustdoc_types::FORMAT_VERSION);
+        let mut foreign = krate.index[&krate.root].clone();
+        foreign.id = Id(2);
+        foreign.name = Some("foreign".into());
+        foreign.inner = inner;
+        krate.index.insert(foreign.id, foreign);
+        let ItemEnum::Module(root) = &mut krate.index.get_mut(&krate.root).unwrap().inner else {
+            unreachable!();
+        };
+        root.items.push(Id(2));
+        krate
+    }
+
+    fn foreign_function() -> ItemEnum {
+        ItemEnum::Function(rustdoc_types::Function {
+            sig: rustdoc_types::FunctionSignature {
+                inputs: Vec::new(),
+                output: None,
+                is_c_variadic: false,
+            },
+            generics: rustdoc_types::Generics {
+                params: Vec::new(),
+                where_predicates: Vec::new(),
+            },
+            header: rustdoc_types::FunctionHeader {
+                is_const: false,
+                is_unsafe: true,
+                is_async: false,
+                abi: rustdoc_types::Abi::C { unwind: false },
+            },
+            has_body: false,
+        })
+    }
+
+    #[test]
+    fn foreign_declarations_collect_selected_dependencies_and_semantics() {
+        let source = r#"
+type Scalar = u8;
+type Unrelated = u16;
+#[deprecated(note = "old block")]
+unsafe extern "C" {
+    #[must_use = "inspect"] pub fn foreign(value: Scalar) -> Scalar;
+    pub safe fn safe_foreign(value: Scalar) -> Scalar;
+    pub static DATA: Scalar;
+    pub safe static SAFE_DATA: Scalar;
+    pub unsafe static UNSAFE_DATA: Scalar;
+    pub static mut MUT_DATA: Scalar;
+    pub type Opaque;
+    pub fn unrelated(value: Unrelated);
+}
+"#;
+        for name in [
+            "foreign",
+            "safe_foreign",
+            "DATA",
+            "SAFE_DATA",
+            "UNSAFE_DATA",
+            "MUT_DATA",
+            "Opaque",
+        ] {
+            let import = crate::imports::parse_use_line(&format!("use dep::{name};")).unwrap();
+            let api = expanded_api_shape(source, &import, false).unwrap();
+            assert!(api.has_definition, "{name}");
+            assert_eq!(api.shapes.len(), 1, "{name}: {:?}", api.shapes);
+            let shape = api.shapes.iter().next().unwrap();
+            assert!(shape.starts_with("foreign unsafe extern \"C\":"), "{shape}");
+            assert!(
+                shape.contains(if name.starts_with("safe_") || name == "SAFE_DATA" {
+                    "pub safe "
+                } else {
+                    "pub unsafe "
+                }),
+                "{shape}"
+            );
+            assert!(
+                api.attributes["item"][0]
+                    .1
+                    .iter()
+                    .any(|attr| attr.contains("old block")),
+                "{name}"
+            );
+            let dependencies = &api.dependencies["definition"][0];
+            assert!(
+                !dependencies
+                    .iter()
+                    .any(|dependency| dependency.contains("Unrelated")),
+                "{name}: {dependencies:?}"
+            );
+            if name != "Opaque" {
+                assert!(
+                    dependencies.contains("type alias Scalar = u8"),
+                    "{name}: {dependencies:?}"
+                );
+            }
+        }
+        let import = crate::imports::parse_use_line("use dep::foreign;").unwrap();
+        let api = expanded_api_shape(source, &import, false).unwrap();
+        assert_eq!(api.members[0].0, "function foreign");
+        assert!(
+            api.attributes["function foreign"][0]
+                .1
+                .iter()
+                .any(|attr| attr.contains("inspect"))
+        );
+        let import = crate::imports::parse_use_line("use dep::Opaque::{self};").unwrap();
+        assert!(
+            expanded_api_shape(source, &import, false)
+                .unwrap()
+                .has_definition
+        );
+    }
+
+    #[test]
+    fn foreign_verification_rejects_changed_aliases_abi_safety_and_attributes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dep.json");
+        let import = crate::imports::parse_use_line("use dep::foreign;").unwrap();
+        let normal =
+            "type Scalar = u8; unsafe extern \"C\" { pub fn foreign(value: Scalar) -> Scalar; }";
+        fs::write(path.with_extension("normal.rs"), normal).unwrap();
+        let krate = foreign_crate(foreign_function());
+        for doc in [
+            normal.replace("Scalar = u8", "Scalar = u16"),
+            normal.replace("extern \"C\"", "extern \"C-unwind\""),
+            normal.replace("pub fn", "pub safe fn"),
+            normal.replace("pub fn", "#[must_use] pub fn"),
+            normal.replace("pub fn", "#[link_name = \"different\"] pub fn"),
+        ] {
+            fs::write(path.with_extension("doc.rs"), &doc).unwrap();
+            let mut reported = krate.clone();
+            if doc.contains("#[must_use]") {
+                reported
+                    .index
+                    .get_mut(&Id(2))
+                    .unwrap()
+                    .attrs
+                    .push(rustdoc_types::Attribute::MustUse { reason: None });
+            }
+            let error = reject_non_doc_expansion(&reported, &path, &import, false).unwrap_err();
+            assert!(
+                error.contains("non-doc API extraction is incomplete"),
+                "{doc}: {error}"
+            );
+        }
+        fs::write(path.with_extension("doc.rs"), normal).unwrap();
+        assert!(reject_non_doc_expansion(&krate, &path, &import, false).is_ok());
+
+        let normal = "type Scalar = u8; unsafe extern \"C\" { pub static foreign: Scalar; }";
+        let krate = foreign_crate(ItemEnum::Static(rustdoc_types::Static {
+            type_: rustdoc_types::Type::Primitive("u8".into()),
+            is_mutable: false,
+            expr: String::new(),
+            is_unsafe: true,
+        }));
+        fs::write(path.with_extension("normal.rs"), normal).unwrap();
+        for doc in [
+            normal.replace("Scalar = u8", "Scalar = u16"),
+            normal.replace("pub static", "pub safe static"),
+            normal.replace("pub static", "pub static mut"),
+            normal.replace("pub static", "#[deprecated(note = \"changed\")] pub static"),
+        ] {
+            fs::write(path.with_extension("doc.rs"), &doc).unwrap();
+            let mut reported = krate.clone();
+            if doc.contains("#[deprecated") {
+                reported.index.get_mut(&Id(2)).unwrap().deprecation =
+                    Some(rustdoc_types::Deprecation {
+                        since: None,
+                        note: Some("changed".into()),
+                    });
+            }
+            assert!(
+                reject_non_doc_expansion(&reported, &path, &import, false).is_err(),
+                "{doc}"
+            );
+        }
+        fs::write(path.with_extension("doc.rs"), normal).unwrap();
+        assert!(reject_non_doc_expansion(&krate, &path, &import, false).is_ok());
+    }
+
+    #[test]
+    fn unexamined_foreign_declarations_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dep.json");
+        let import = crate::imports::parse_use_line("use dep::foreign;").unwrap();
+        fs::write(path.with_extension("normal.rs"), "").unwrap();
+        fs::write(path.with_extension("doc.rs"), "").unwrap();
+        for inner in [
+            foreign_function(),
+            ItemEnum::Static(rustdoc_types::Static {
+                type_: rustdoc_types::Type::Primitive("u8".into()),
+                is_mutable: false,
+                expr: String::new(),
+                is_unsafe: true,
+            }),
+            ItemEnum::ExternType,
+        ] {
+            let error =
+                reject_non_doc_expansion(&foreign_crate(inner), &path, &import, false).unwrap_err();
+            assert!(
+                error.contains("cannot verify foreign declaration")
+                    || error.contains("cannot resolve requested path"),
+                "{error}"
+            );
+        }
+        let normal = "unsafe extern \"C\" { pub type foreign; }";
+        fs::write(path.with_extension("normal.rs"), normal).unwrap();
+        fs::write(path.with_extension("doc.rs"), normal).unwrap();
+        assert!(
+            reject_non_doc_expansion(&foreign_crate(ItemEnum::ExternType), &path, &import, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn expansion_declaration_dependencies_do_not_require_reported_members() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let json_path = directory.path().join("dep.json");
+        let krate = minimal_crate(None, FORMAT_VERSION);
+        let normal = "type Number = u8; type Alias = Number; pub const C: Alias = 1; pub static S: Alias = 2; pub type Public = Alias;";
+        fs::write(json_path.with_extension("normal.rs"), normal).unwrap();
+        fs::write(json_path.with_extension("doc.rs"), normal).unwrap();
+        for name in ["C", "S", "Public"] {
+            let import = crate::imports::parse_use_line(&format!("use dep::{name};")).unwrap();
+            assert!(reject_non_doc_expansion(&krate, &json_path, &import, false).is_ok());
+        }
+        fs::write(
+            json_path.with_extension("doc.rs"),
+            normal.replace("u8", "u16"),
+        )
+        .unwrap();
+        for name in ["C", "S", "Public"] {
+            let import = crate::imports::parse_use_line(&format!("use dep::{name};")).unwrap();
+            let error = reject_non_doc_expansion(&krate, &json_path, &import, false).unwrap_err();
+            assert!(
+                error.contains("type aliases or resolved paths differ"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expansion_unicode_apis_preserve_complete_source_text() {
+        for (source, query, shape) in [
+            (
+                "pub fn caféééé() -> [u8; 1] { [0; 1] }",
+                "use dep::caféééé;",
+                "fn pub fn caféééé() -> [u8; 1]",
+            ),
+            (
+                "pub struct S { pub 字字字: u8 }",
+                "use dep::S;",
+                "struct field 字字字: pub u8",
+            ),
+            (
+                "pub type 字字字 = u8; pub struct S { pub 字字字: 字字字 }",
+                "use dep::S;",
+                "struct field 字字字: pub 字字字",
+            ),
+            (
+                "pub trait S { fn caféééé() -> [u8; 1]; }",
+                "use dep::S;",
+                "required trait method fn caféééé() -> [u8; 1]",
+            ),
+        ] {
+            let import = crate::imports::parse_use_line(query).unwrap();
+            for source in [source.to_string(), format!("// 字é\r\n{source}\r\n")] {
+                let normal = expanded_api_shape(&source, &import, false).unwrap();
+                let doc = expanded_api_shape(&source, &import, false).unwrap();
+                assert!(normal.has_definition, "{query}");
+                assert!(normal.shapes.contains(shape), "{:?}", normal.shapes);
+                assert_eq!(normal.shapes, doc.shapes, "{query}");
+                assert_eq!(normal.members, doc.members, "{query}");
+                assert_eq!(normal.dependencies, doc.dependencies, "{query}");
+            }
+        }
+    }
+
+    #[test]
+    fn expansion_unicode_signature_changes_are_detected() {
+        for (source, query) in [
+            (
+                "pub fn caféééé() -> [u8; 1] { [0; 1] }",
+                "use dep::caféééé;",
+            ),
+            ("pub trait S { fn caféééé() -> [u8; 1]; }", "use dep::S;"),
+            (
+                "pub struct S; impl S { pub fn caféééé() -> [u8; 1] { [0; 1] } }",
+                "use dep::S;",
+            ),
+        ] {
+            let import = crate::imports::parse_use_line(query).unwrap();
+            let normal = expanded_api_shape(source, &import, false).unwrap();
+            let changed = source.replace("[u8; 1]", "[u8; 2]");
+            let doc = expanded_api_shape(&changed, &import, false).unwrap();
+            assert!(
+                normal.shapes.iter().any(|shape| shape.ends_with("[u8; 1]")),
+                "{:?}",
+                normal.shapes
+            );
+            assert_ne!(normal.shapes, doc.shapes, "{query}");
+            assert_ne!(normal.members, doc.members, "{query}");
+        }
+    }
+
+    #[test]
+    fn expansion_rejects_changed_intermediate_routes() {
+        let source = r#"
+pub mod a { pub mod api { pub struct Thing { pub actual: u8 } } }
+pub mod b { pub mod api { pub struct Thing { pub doc_only: u16 } } }
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let json_path = dir.path().join("dep.json");
+        let krate = minimal_crate(None, rustdoc_types::FORMAT_VERSION);
+        for (normal_route, doc_route) in [
+            ("pub use a::api as facade;", "pub use b::api as facade;"),
+            (
+                "use a::api as first; pub use first as facade;",
+                "use b::api as first; pub use first as facade;",
+            ),
+            (
+                "pub mod facade { pub use crate::a::api::*; }",
+                "pub mod facade { pub use crate::b::api::*; }",
+            ),
+            (
+                "pub use external_a::api as facade;",
+                "pub use external_b::api as facade;",
+            ),
+        ] {
+            fs::write(
+                json_path.with_extension("normal.rs"),
+                format!("{source}{normal_route}"),
+            )
+            .unwrap();
+            fs::write(
+                json_path.with_extension("doc.rs"),
+                format!("{source}{doc_route}"),
+            )
+            .unwrap();
+            let import = crate::imports::parse_use_line("use dep::facade::Thing;").unwrap();
+            let error = reject_non_doc_expansion(&krate, &json_path, &import, false).unwrap_err();
+            assert!(
+                error.contains("resolves to different definitions under cfg(doc)"),
+                "{normal_route}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expansion_routes_preserve_aliases_namespaces_variants_and_external_paths() {
+        let source = r#"
+pub mod a { pub mod api {
+    pub struct Thing { pub actual: u8 }
+    pub type Alias = [u8; 1];
+    pub fn value() {}
+    pub const C: u8 = 1;
+    pub static S: u8 = 1;
+    pub enum E { Variant(u8) }
+    unsafe extern "C" { pub fn foreign(); }
+} }
+pub fn facade() {}
+pub use a::api as facade;
+pub mod globbed { pub use crate::facade::*; }
+pub mod typed {
+    pub use crate::a::api::value as Thing;
+    pub use crate::a::api::*;
+}
+pub use facade::E::Variant as Renamed;
+pub extern crate self as me;
+pub extern crate foreign as dependency;
+pub use dependency::api as external;
+"#;
+        for (query, expected, has_definition) in [
+            ("dep::facade::Thing", "a::api::Thing", true),
+            ("dep::facade::{self}", "a::api", false),
+            ("dep::globbed::Alias", "a::api::Alias", true),
+            ("dep::globbed::value", "a::api::value", true),
+            ("dep::globbed::C", "a::api::C", true),
+            ("dep::globbed::S", "a::api::S", true),
+            ("dep::Renamed", "a::api::E::Variant", true),
+            ("dep::typed::Thing::{self}", "a::api::Thing", true),
+            ("dep::me::facade::Thing", "a::api::Thing", true),
+            ("dep::external::Thing", "::::foreign::api::Thing", false),
+        ] {
+            let import = crate::imports::parse_use_line(query).unwrap();
+            let api = expanded_api_shape(source, &import, false).unwrap();
+            assert_eq!(
+                api.resolved_path.as_ref().map(|path| path.join("::")),
+                Some(expected.to_string()),
+                "{query}"
+            );
+            assert_eq!(api.has_definition, has_definition, "{query}");
+        }
+        let import = crate::imports::parse_use_line("dep::facade::foreign").unwrap();
+        assert_eq!(
+            expanded_api_shape(source, &import, false)
+                .unwrap()
+                .resolved_path,
+            Some(vec!["a".into(), "api".into(), "foreign".into()])
+        );
+        let import = crate::imports::parse_use_line("dep::me::{self}").unwrap();
+        assert_eq!(
+            expanded_api_shape(source, &import, false)
+                .unwrap()
+                .resolved_path,
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn expansion_constant_dependencies_follow_imports_aliases_and_transitive_values() {
+        let source = r#"
+mod origin {
+    pub const BASE: u8 = 1;
+    pub const LEN: usize = BASE as usize;
+}
+use origin::LEN as SIZE;
+pub type Buffer = [u8; SIZE];
+pub const VALUE: usize = SIZE;
+pub fn buffer(value: Buffer) -> [u8; SIZE] { value }
+pub struct Packet { pub bytes: [u8; SIZE] }
+pub struct Container<const N: usize>;
+pub type SizedContainer = Container<SIZE>;
+"#;
+        for name in ["buffer", "Packet", "Buffer", "VALUE", "SizedContainer"] {
+            let import = crate::imports::parse_use_line(&format!("use dep::{name};")).unwrap();
+            let normal = expanded_api_shape(source, &import, false).unwrap();
+            let changed = source.replace("BASE: u8 = 1", "BASE: u8 = 2");
+            let doc = expanded_api_shape(&changed, &import, false).unwrap();
+            assert_eq!(normal.shapes, doc.shapes, "{name}");
+            assert_ne!(normal.dependencies, doc.dependencies, "{name}");
+            let definitions = &normal.dependencies["definition"][0];
+            assert!(
+                definitions.contains("const origin::BASE: u8 = 1"),
+                "{definitions:?}"
+            );
+            assert!(
+                definitions.contains("const origin::LEN: usize = BASE as usize"),
+                "{definitions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expansion_constant_evaluation_tracks_function_bodies_and_block_scope() {
+        let source = r#"
+const BASE: usize = 1;
+const fn length(value: usize) -> usize {
+    let (left, right) = (value, 0);
+    const INCREMENT: usize = BASE;
+    left + right + INCREMENT
+}
+const LEN: usize = {
+    use crate::length as compute;
+    let value = 0;
+    compute(value)
+};
+pub fn buffer<const N: usize>(value: [u8; LEN]) -> [u8; N] { loop {} }
+"#;
+        let import = crate::imports::parse_use_line("use dep::buffer;").unwrap();
+        let normal = expanded_api_shape(source, &import, false).unwrap();
+        let definitions = &normal.dependencies["definition"][0];
+        assert!(
+            definitions.contains("const BASE: usize = 1"),
+            "{definitions:?}"
+        );
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.starts_with("function length:")),
+            "{definitions:?}"
+        );
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.contains("INCREMENT: usize = BASE")),
+            "{definitions:?}"
+        );
+        for changed in [
+            source.replace("BASE: usize = 1", "BASE: usize = 2"),
+            source.replace("left + right + INCREMENT", "left + right + INCREMENT + 1"),
+        ] {
+            let doc = expanded_api_shape(&changed, &import, false).unwrap();
+            assert_eq!(normal.shapes, doc.shapes);
+            assert_ne!(normal.dependencies, doc.dependencies);
+        }
+    }
+
+    #[test]
+    fn constant_patterns_track_values_without_hiding_bindings() {
+        let source = r#"
+const BASE: u8 = 1;
+pub const SIZE: usize = match 1_u8 { BASE => 1, value => value as usize + 1 };
+pub type Buffer = [u8; SIZE];
+pub fn buffer(value: Buffer) -> Buffer { value }
+const fn length(value: u8) -> usize { match value { BASE => 1, other => other as usize + 1 } }
+pub struct Computed { pub bytes: [u8; length(1)] }
+"#;
+        let changed = source.replace("BASE: u8 = 1", "BASE: u8 = 2");
+        for name in ["SIZE", "Buffer", "buffer", "Computed"] {
+            let import = crate::imports::parse_use_line(&format!("use dep::{name};")).unwrap();
+            let normal = expanded_api_shape(source, &import, false).unwrap();
+            let doc = expanded_api_shape(&changed, &import, false).unwrap();
+            assert_ne!(normal.dependencies, doc.dependencies, "{name}");
+            assert!(normal.dependencies["definition"][0].contains("const BASE: u8 = 1"));
+        }
+        let source = "const VALUE: u8 = 1; pub const SIZE: usize = { struct BASE { byte: u8 } const BASE: u8 = VALUE; match 1_u8 { BASE => 1, value => value as usize + 1 } };";
+        let import = crate::imports::parse_use_line("use dep::SIZE;").unwrap();
+        let normal = expanded_api_shape(source, &import, false).unwrap();
+        let doc = expanded_api_shape(
+            &source.replace("VALUE: u8 = 1", "VALUE: u8 = 2"),
+            &import,
+            false,
+        )
+        .unwrap();
+        assert_ne!(normal.dependencies, doc.dependencies);
+        assert!(normal.dependencies["definition"][0].contains("const VALUE: u8 = 1"));
+
+        let source = "struct value { byte: u8 } const fn length(input: u8) -> usize { let value = input; if let 0 = value { 1 } else { match value { value => value as usize } } } pub const SIZE: usize = length(1);";
+        let normal = expanded_api_shape(source, &import, false).unwrap();
+        let doc =
+            expanded_api_shape(&source.replace("byte: u8", "byte: u16"), &import, false).unwrap();
+        assert_eq!(normal.dependencies, doc.dependencies);
+    }
+
+    #[test]
+    fn block_modules_preserve_imports_aliases_and_shadowing() {
+        let source = r#"
+pub struct S;
+pub struct Other;
+fn helper() {
+    use crate::Other as S;
+    mod local {
+        use crate::S as Selected;
+        type Alias = self::Selected;
+        impl Selected { pub fn imported(&self) {} }
+        impl Alias { pub fn aliased(&self) {} }
+        mod inner {
+            use super::Alias;
+            impl Alias { pub fn nested(&self) {} }
+            struct Selected;
+            impl Selected { pub fn hidden(&self) {} }
+        }
+    }
+    impl local::Selected { pub fn qualified(&self) {} }
+}
+trait Defaults {
+    fn helper() { mod local { use crate::S as Selected; impl Selected { pub fn default_body(&self) {} } } }
+}
+"#;
+        let import = crate::imports::parse_use_line("use dep::S;").unwrap();
+        let api = expanded_api_shape(source, &import, false).unwrap();
+        let keys = api
+            .members
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "inherent method imported",
+                "inherent method aliased",
+                "inherent method nested",
+                "inherent method qualified",
+                "inherent method default_body",
+            ])
+        );
+    }
+
+    #[test]
+    fn expansion_signature_dependencies_ignore_ordinary_function_bodies() {
+        let source = r#"
+const BASE: usize = 1;
+pub fn buffer<const BASE: usize>() -> [u8; BASE] { [0; BASE] }
+pub struct Packet;
+impl Packet { pub fn value(&self) -> usize { BASE } }
+pub trait Contract { fn value(&self) -> usize { BASE } }
+pub struct Container<const N: usize>;
+pub fn generic<const BASE: usize>() -> Container<BASE> { Container }
+mod aliases { pub type Byte = u8; }
+pub struct Typed<T>(T);
+pub fn typed(value: Typed<aliases::Byte>) -> Typed<aliases::Byte> { value }
+"#;
+        let changed = source.replace("BASE: usize = 1", "BASE: usize = 2");
+        for name in ["buffer", "Packet", "Contract", "generic", "typed"] {
+            let import = crate::imports::parse_use_line(&format!("use dep::{name};")).unwrap();
+            let normal = expanded_api_shape(source, &import, false).unwrap();
+            let doc = expanded_api_shape(&changed, &import, false).unwrap();
+            assert_eq!(normal.dependencies, doc.dependencies, "{name}");
+            assert!(
+                normal
+                    .dependencies
+                    .values()
+                    .flatten()
+                    .flatten()
+                    .all(|definition| !definition.starts_with("const BASE:"))
+            );
+        }
+    }
+
+    #[test]
+    fn expansion_constant_function_parameters_and_locals_shadow_value_paths() {
+        let source = r#"
+const fn value() -> usize { 1 }
+const fn helper() -> usize { 1 }
+const fn length(value: usize) -> usize {
+    let helper = value;
+    { let (value, offset) = (helper, 0); value + offset }
+}
+pub struct Packet { pub bytes: [u8; length(1)] }
+"#;
+        let import = crate::imports::parse_use_line("use dep::Packet;").unwrap();
+        let normal = expanded_api_shape(source, &import, false).unwrap();
+        let changed = source.replace("-> usize { 1 }", "-> usize { 2 }");
+        let doc = expanded_api_shape(&changed, &import, false).unwrap();
+        assert_eq!(normal.dependencies, doc.dependencies);
+        let definitions = &normal.dependencies["definition"][0];
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.starts_with("function length:"))
+        );
+        assert!(
+            definitions
+                .iter()
+                .all(|definition| !definition.starts_with("function value:")
+                    && !definition.starts_with("function helper:"))
+        );
+    }
+
+    #[test]
+    fn expansion_unverified_associated_evaluation_is_rejected() {
+        let import = crate::imports::parse_use_line("use dep::Packet;").unwrap();
+        for source in [
+            "struct Limits; impl Limits { const LEN: usize = 1; } pub struct Packet { pub bytes: [u8; Limits::LEN] }",
+            "struct Limits; impl Limits { const LEN: usize = 1; } pub struct Container<const N: usize>; pub type Packet = Container<{ Limits::LEN }>;",
+            "struct Limits; trait Size { const LEN: usize; } impl Size for Limits { const LEN: usize = 1; } pub struct Packet { pub bytes: [u8; <Limits as Size>::LEN] }",
+            "struct Limits; impl Limits { const fn length(&self) -> usize { 1 } } const LEN: usize = Limits.length(); pub struct Packet { pub bytes: [u8; LEN] }",
+        ] {
+            let error = expanded_api_shape(source, &import, false).err().unwrap();
+            assert!(
+                error.contains("non-doc API extraction is incomplete"),
+                "{error}"
+            );
+            assert!(error.contains("constant evaluation"), "{error}");
+        }
+    }
+
     #[test]
     fn expansion_impls_in_constant_blocks_preserve_scope_and_headers() {
         let import = crate::imports::parse_use_line("use dep::S::{self};").unwrap();
@@ -5150,13 +6647,91 @@ const _: () = {
             assert!(api.members.iter().any(|(member, _)| member == key), "{key}");
         }
         assert!(api.has_definition);
-        let unavailable =
-            "pub struct S; const _: () = { mod local { pub use crate::S; } impl local::S {} };";
+        let local_module = "pub struct S; const _: () = { mod local { pub use crate::S; } impl local::S { pub fn through_module(&self) {} } };";
+        let api = expanded_api_shape(local_module, &import, false).unwrap();
         assert!(
-            expanded_api_shape(unavailable, &import, false)
-                .err()
-                .unwrap()
-                .contains("block-local module")
+            api.members
+                .iter()
+                .any(|(key, _)| key == "inherent method through_module")
+        );
+    }
+
+    #[test]
+    fn expansion_impls_in_all_blocks_preserve_lexical_scope() {
+        let import = crate::imports::parse_use_line("use dep::S::{self};").unwrap();
+        let source = r#"
+pub struct S;
+pub struct Other;
+pub trait Marker {}
+fn private_uncalled() {
+    use crate::S as Outer;
+    impl Outer { pub fn function(&self) {} }
+    let _ = || {
+        struct S;
+        impl S { pub fn hidden_local(&self) {} }
+        impl Outer { pub fn closure(&self) {} }
+        { use crate::Other as Outer; impl Outer { pub fn hidden_import(&self) {} } }
+    };
+    if true {
+        type Alias = Outer;
+        impl Alias { pub const NESTED: u8 = 1; }
+    }
+    let _ = [const { impl crate::S { pub fn inline_const(&self) {} } 0 }];
+    { impl S { pub fn shadowed_later(&self) {} } struct S; }
+}
+impl Other {
+    fn private_method() {
+        impl crate::Marker for crate::S {}
+        impl crate::S { pub fn method_body(&self) {} }
+    }
+    const ASSOCIATED: () = { impl crate::S { pub fn associated_const(&self) {} } };
+}
+trait Defaults {
+    fn default_method() { impl crate::S { pub fn trait_default(&self) {} } }
+    const VALUE: () = { impl crate::S { pub fn trait_const(&self) {} } };
+}
+static INITIALIZER: () = if true {
+    impl crate::S { pub fn static_body(&self) {} }
+};
+const NESTED: () = ((), { impl crate::S { pub fn const_expression(&self) {} } }).1;
+mod nested {
+    fn private_uncalled() {
+        use super::S as Imported;
+        { impl Imported { pub fn nested_module(&self) {} } }
+    }
+}
+"#;
+        let api = expanded_api_shape(source, &import, false).unwrap();
+        let keys = api
+            .members
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            keys,
+            HashSet::from([
+                "inherent method function",
+                "inherent method closure",
+                "inherent const NESTED",
+                "inherent method inline_const",
+                "trait impl Marker",
+                "inherent method method_body",
+                "inherent method associated_const",
+                "inherent method trait_default",
+                "inherent method trait_const",
+                "inherent method static_body",
+                "inherent method const_expression",
+                "inherent method nested_module",
+            ])
+        );
+        assert_eq!(api.members.len(), keys.len(), "{:?}", api.members);
+        assert!(api.has_definition);
+        let doc =
+            expanded_api_shape("pub struct S; fn private_uncalled() {}", &import, false).unwrap();
+        assert!(
+            api.shapes
+                .difference(&doc.shapes)
+                .any(|shape| shape.contains("fn function(&self)"))
         );
     }
 
