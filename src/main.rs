@@ -838,6 +838,7 @@ fn load_docs_cached(
             target_selection: request.target_selection,
             feature_selection: request.feature_selection,
             unit: &unit.identity,
+            root_prerequisites: &unit.root_prerequisites,
         },
     )?;
     let loaded = (Arc::new(krate), json_path);

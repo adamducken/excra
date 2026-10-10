@@ -42,6 +42,7 @@ pub(crate) struct CargoUnitIdentity {
 pub(crate) struct CargoUnitSelection {
     pub(crate) identity: CargoUnitIdentity,
     pub(crate) graph_index: usize,
+    pub(crate) root_prerequisites: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,7 @@ pub(crate) struct RustdocRequest<'a> {
     pub(crate) target_selection: &'a CargoTargetSelection,
     pub(crate) feature_selection: &'a FeatureSelection,
     pub(crate) unit: &'a CargoUnitIdentity,
+    pub(crate) root_prerequisites: &'a [PathBuf],
 }
 
 pub(crate) struct CargoUnitRequest<'a> {
@@ -4277,6 +4279,34 @@ fn generate_json_with_toolchain(
     command.arg(format!("+{toolchain}"));
     if context_kind == DependencyKind::Development {
         command.args(["test", "--no-run"]);
+        // Keep Cargo's test feature/profile graph, but compile placeholders for
+        // consumer targets whose real source is not needed by the selected unit.
+        // Cargo still receives artifacts for downstream consumer test targets.
+        fs::create_dir_all(doc_dir).map_err(|error| error.to_string())?;
+        let consumer_source = doc_dir.join("excra_consumer.rs");
+        fs::write(
+            &consumer_source,
+            "//! Excra consumer placeholder.\n/// Unused consumer entry point.\n#[allow(dead_code)] fn main() {}\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let sources = request
+            .root_package
+            .targets
+            .iter()
+            .filter(|target| !target.kind.iter().any(|kind| kind == "custom-build"))
+            .map(|target| target.src_path.as_std_path())
+            .collect::<Vec<_>>();
+        command
+            .env("EXCRA_WRAPPER_CONSUMER_SOURCE", consumer_source)
+            .env(
+                "EXCRA_WRAPPER_ROOT_SOURCES",
+                serde_json::to_string(&sources).expect("consumer sources serialize"),
+            )
+            .env(
+                "EXCRA_WRAPPER_ROOT_PREREQUISITES",
+                serde_json::to_string(request.root_prerequisites)
+                    .expect("consumer prerequisites serialize"),
+            );
     } else {
         command
             .arg("rustdoc")
@@ -4686,7 +4716,29 @@ pub(crate) fn validate_import(
 }
 
 pub(crate) fn run_rustc_wrapper() -> ! {
-    let command_arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    let mut command_arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(source) = env::var_os("EXCRA_WRAPPER_CONSUMER_SOURCE")
+        && !command_arguments.is_empty()
+    {
+        let invocation = rustc_invocation(&command_arguments);
+        let root_sources: Vec<PathBuf> = env::var("EXCRA_WRAPPER_ROOT_SOURCES")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        let prerequisites: Vec<PathBuf> = env::var("EXCRA_WRAPPER_ROOT_PREREQUISITES")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        if let Some(index) = consumer_source_to_replace(
+            invocation.arguments,
+            &env::current_dir().unwrap_or_default(),
+            &root_sources,
+            &prerequisites,
+        ) {
+            let offset = command_arguments.len() - invocation.arguments.len();
+            command_arguments[offset + index] = source;
+        }
+    }
     let Some(compiler) = command_arguments.first() else {
         eprintln!("excra Rust compiler wrapper was not given a compiler executable");
         std::process::exit(1);
@@ -4889,6 +4941,27 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         }
     }
     std::process::exit(status.code().unwrap_or(1));
+}
+
+fn consumer_source_to_replace(
+    arguments: &[OsString],
+    directory: &Path,
+    root_sources: &[PathBuf],
+    prerequisites: &[PathBuf],
+) -> Option<usize> {
+    let strings = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>();
+    if argument_value(&strings, "--crate-name") == Some("build_script_build") {
+        return None;
+    }
+    let test_or_binary = strings.iter().any(|argument| argument == "--test")
+        || argument_value(&strings, "--crate-type") == Some("bin");
+    arguments.iter().position(|argument| {
+        let path = directory.join(argument);
+        root_sources.contains(&path) && (test_or_binary || !prerequisites.contains(&path))
+    })
 }
 
 struct RustcInvocation<'a> {
@@ -5669,6 +5742,22 @@ pub(crate) fn resolved_unit(
             .map(|(graph_index, unit)| CargoUnitSelection {
                 identity: unit_identity(unit),
                 graph_index,
+                // Cargo also compiles the graph's other dependencies. A dev
+                // cycle through any of them can require the real root library.
+                root_prerequisites: graph
+                    .units
+                    .iter()
+                    .filter(|unit| unit.pkg_id != root_package.id.to_string())
+                    .flat_map(|unit| &unit.dependencies)
+                    .filter_map(|dependency| graph.units.get(dependency.index))
+                    .filter(|unit| unit.pkg_id == root_package.id.to_string())
+                    .flat_map(|unit| {
+                        root_package.targets.iter().filter(move |target| {
+                            target.name == unit.target.name && target.kind == unit.target.kind
+                        })
+                    })
+                    .map(|target| target.src_path.as_std_path().to_path_buf())
+                    .collect(),
             })
             .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -7079,6 +7168,7 @@ impl Other<S> { pub fn unrelated(&self) {} }
             target_selection: &target_selection,
             feature_selection: &feature_selection,
             unit: &unit,
+            root_prerequisites: &[],
         };
         let err = generate_json_with_toolchain(
             &request,
@@ -7088,6 +7178,61 @@ impl Other<S> { pub fn unrelated(&self) {} }
         )
         .unwrap_err();
         assert!(err.contains("definitely_missing_excra_toolchain"), "{err}");
+    }
+
+    #[test]
+    fn consumer_placeholders_preserve_required_libraries_and_build_scripts() {
+        let directory = Path::new("/workspace");
+        let sources = vec![
+            directory.join("app/src/lib.rs"),
+            directory.join("app/src/main.rs"),
+        ];
+        let required = vec![sources[0].clone()];
+        let arguments = |source: &str, kind: &str, test: bool| {
+            let mut arguments = vec![
+                "--crate-name".into(),
+                "app".into(),
+                source.into(),
+                "--crate-type".into(),
+                kind.into(),
+            ];
+            if test {
+                arguments.push("--test".into());
+            }
+            arguments
+        };
+        for (source, kind, test, expected) in [
+            ("app/src/lib.rs", "lib", false, None),
+            ("app/src/lib.rs", "lib", true, Some(2)),
+            ("app/src/main.rs", "bin", false, Some(2)),
+            ("app/build.rs", "bin", false, None),
+            ("other/src/lib.rs", "lib", false, None),
+        ] {
+            assert_eq!(
+                consumer_source_to_replace(
+                    &arguments(source, kind, test),
+                    directory,
+                    &sources,
+                    &required,
+                ),
+                expected,
+            );
+        }
+        assert_eq!(
+            consumer_source_to_replace(
+                &arguments("app/src/lib.rs", "lib", false),
+                directory,
+                &sources,
+                &[],
+            ),
+            Some(2),
+        );
+        let mut build_script = arguments("app/src/lib.rs", "bin", false);
+        build_script[1] = "build_script_build".into();
+        assert_eq!(
+            consumer_source_to_replace(&build_script, directory, &sources, &[]),
+            None,
+        );
     }
 
     #[test]

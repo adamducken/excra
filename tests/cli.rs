@@ -2538,22 +2538,18 @@ fn binary_fails_when_one_selected_context_cannot_be_verified() {
     .unwrap();
     fs::write(
         workspace.path().join("app/Cargo.toml"),
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n[dev-dependencies]\ndep = { path = \"../dep\" }\n",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ndep = { path = \"../dep\" }\n[dev-dependencies]\ndep = { path = \"../dep\", features = [\"broken\"] }\n",
     )
     .unwrap();
-    fs::write(
-        workspace.path().join("app/src/lib.rs"),
-        "#[cfg(test)]\ncompile_error!(\"dev graph intentionally fails\");\n",
-    )
-    .unwrap();
+    fs::write(workspace.path().join("app/src/lib.rs"), "").unwrap();
     fs::write(
         workspace.path().join("dep/Cargo.toml"),
-        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\nbroken = []\n",
     )
     .unwrap();
     fs::write(
         workspace.path().join("dep/src/lib.rs"),
-        "pub struct Thing;\n",
+        "#[cfg(feature = \"broken\")] compile_error!(\"dev graph intentionally fails\");\npub struct Thing;\n",
     )
     .unwrap();
     lock_workspace(&workspace);

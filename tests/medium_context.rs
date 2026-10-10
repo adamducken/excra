@@ -707,4 +707,226 @@ pub struct Selected {{ pub actual: u8 }}
             assert!(!stderr.contains("No such file or directory"), "{stderr}");
         }
     }
+
+    mod dev_queries {
+        use std::fs;
+        use std::process::{Command, Output};
+        use tempfile::TempDir;
+
+        use super::write_package;
+
+        fn dev_workspace(cycle: bool) -> TempDir {
+            let workspace = TempDir::new().unwrap();
+            fs::write(
+                workspace.path().join("Cargo.toml"),
+                "[workspace]\nmembers = [\"app\", \"facade\", \"unified\"]\nresolver = \"3\"\n",
+            )
+            .unwrap();
+            write_package(
+                &workspace,
+                "app",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nunified = { path = \"../unified\", features = [\"normal\"] }\n[dev-dependencies]\nfacade = { path = \"../facade\" }\n",
+                "pub struct Parent;\n",
+            );
+            let cycle_dependency = if cycle {
+                "app = { path = \"../app\" }\n"
+            } else {
+                ""
+            };
+            write_package(
+                &workspace,
+                "facade",
+                &format!(
+                    "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nunified = {{ path = \"../unified\", features = [\"dev\"] }}\n{cycle_dependency}"
+                ),
+                if cycle {
+                    "pub use unified::Unified; pub struct Thing; pub fn parent() -> app::Parent { app::Parent }\n"
+                } else {
+                    "pub use unified::Unified; pub struct Thing;\n"
+                },
+            );
+            write_package(
+                &workspace,
+                "unified",
+                "[package]\nname = \"unified\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\nnormal = []\ndev = []\n",
+                "pub struct Unified { #[cfg(feature = \"normal\")] pub normal: u8, #[cfg(feature = \"dev\")] pub dev: u16 }\n",
+            );
+            let output = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            workspace
+        }
+
+        fn query(workspace: &TempDir, import: &str) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_excra"))
+                .arg(import)
+                .arg("--root")
+                .arg(workspace.path())
+                .args(["--package", "app", "--include-dev"])
+                .env("CARGO_NET_OFFLINE", "true")
+                .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                .output()
+                .unwrap()
+        }
+
+        #[test]
+        fn dev_queries_skip_broken_consumer_sources_and_keep_test_feature_unification() {
+            let workspace = dev_workspace(false);
+            fs::create_dir_all(workspace.path().join("app/tests")).unwrap();
+            fs::write(
+                workspace.path().join("app/tests/broken.rs"),
+                "use facade::Missing; #[test] fn unrelated() {}\n",
+            )
+            .unwrap();
+            for (library, binary) in [
+                ("", "fn main() {}"),
+                ("compile_error!(\"unfinished library\");", "fn main() {}"),
+                ("", "compile_error!(\"unfinished binary\");"),
+            ] {
+                fs::write(workspace.path().join("app/src/lib.rs"), library).unwrap();
+                fs::write(workspace.path().join("app/src/main.rs"), binary).unwrap();
+                let output = query(&workspace, "use facade::{Thing, Unified};");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(stdout.contains("definition: pub struct Thing;"), "{stdout}");
+                assert!(
+                    stdout.contains("pub normal: u8") && stdout.contains("pub dev: u16"),
+                    "{stdout}"
+                );
+            }
+            let manifest = workspace.path().join("app/Cargo.toml");
+            let contents = fs::read_to_string(&manifest).unwrap();
+            fs::write(manifest, format!("{contents}\n[lib]\nproc-macro = true\n")).unwrap();
+            fs::write(
+                workspace.path().join("app/src/lib.rs"),
+                "compile_error!(\"unfinished proc macro consumer\");",
+            )
+            .unwrap();
+            let output = query(&workspace, "use facade::Thing;");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[test]
+        fn dev_queries_propagate_dependency_and_build_script_failures() {
+            let workspace = dev_workspace(false);
+            for (filename, source, diagnostic) in [
+                (
+                    "facade/src/lib.rs",
+                    "compile_error!(\"selected dependency fails\"); pub struct Thing;\n",
+                    "selected dependency fails",
+                ),
+                (
+                    "unified/src/lib.rs",
+                    "compile_error!(\"required dependency fails\"); pub struct Unified;\n",
+                    "required dependency fails",
+                ),
+                (
+                    "facade/build.rs",
+                    "fn main() { panic!(\"dependency build script fails\"); }\n",
+                    "dependency build script fails",
+                ),
+                (
+                    "app/build.rs",
+                    "fn main() { panic!(\"consumer build script fails\"); }\n",
+                    "consumer build script fails",
+                ),
+            ] {
+                let path = workspace.path().join(filename);
+                let previous = fs::read(&path).ok();
+                fs::write(&path, source).unwrap();
+                let output = query(&workspace, "use facade::Thing;");
+                assert_eq!(output.status.code(), Some(2));
+                assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
+                if let Some(previous) = previous {
+                    fs::write(path, previous).unwrap();
+                } else {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn dev_cycles_keep_required_root_library_and_skip_same_named_binary_and_tests() {
+            let workspace = dev_workspace(true);
+            fs::write(
+                workspace.path().join("app/src/main.rs"),
+                "compile_error!(\"unrelated same named binary\");\n",
+            )
+            .unwrap();
+            fs::write(
+                workspace.path().join("app/src/lib.rs"),
+                "pub struct Parent; #[cfg(test)] compile_error!(\"unrelated root library test\");\n",
+            )
+            .unwrap();
+            let output = query(&workspace, "use facade::Thing;");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Another dependency still needs app's real library when the queried
+            // dependency itself does not participate in the dev cycle.
+            write_package(
+                &workspace,
+                "separate",
+                "[package]\nname = \"separate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                "pub struct Separate;\n",
+            );
+            let manifest = workspace.path().join("Cargo.toml");
+            let contents = fs::read_to_string(&manifest).unwrap();
+            fs::write(
+                manifest,
+                contents.replace("\"unified\"]", "\"unified\", \"separate\"]"),
+            )
+            .unwrap();
+            let manifest = workspace.path().join("app/Cargo.toml");
+            let contents = fs::read_to_string(&manifest).unwrap();
+            fs::write(
+                manifest,
+                format!("{contents}separate = {{ path = \"../separate\" }}\n"),
+            )
+            .unwrap();
+            let lock = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(
+                lock.status.success(),
+                "{}",
+                String::from_utf8_lossy(&lock.stderr)
+            );
+            let output = query(&workspace, "use separate::Separate;");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::write(
+                workspace.path().join("app/src/lib.rs"),
+                "compile_error!(\"required root library fails\"); pub struct Parent;\n",
+            )
+            .unwrap();
+            let output = query(&workspace, "use facade::Thing;");
+            assert_eq!(output.status.code(), Some(2));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("required root library fails")
+            );
+        }
+    }
 }
