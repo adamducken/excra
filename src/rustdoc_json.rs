@@ -573,6 +573,7 @@ fn load_valid_json(path: &PathBuf, package: &Package) -> Result<Crate, String> {
 struct RustcCfg {
     flags: HashSet<String>,
     values: HashSet<(String, String)>,
+    version_matches: HashMap<String, bool>,
 }
 
 impl RustcCfg {
@@ -588,6 +589,19 @@ impl RustcCfg {
             }
         }
         cfg
+    }
+
+    fn version_matches(&self, tokens: &proc_macro2::TokenStream) -> Result<bool, String> {
+        let versions = syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+            .parse2(tokens.clone())
+            .map_err(|error| format!("cannot evaluate cfg(version({tokens})): {error}"))?;
+        if versions.len() != 1 {
+            return Err("cfg(version(...)) requires exactly one version string".into());
+        }
+        let key = versions[0].value();
+        self.version_matches.get(&key).copied().ok_or_else(|| {
+            format!("cfg(version({tokens})) was not captured from the selected wrapped compiler")
+        })
     }
 
     fn contains_flag(&self, name: &str) -> bool {
@@ -606,7 +620,12 @@ fn load_rustc_cfg(path: &Path) -> Result<RustcCfg, String> {
             path.display()
         )
     })?;
-    Ok(RustcCfg::parse(&output))
+    let mut cfg = RustcCfg::parse(&output);
+    cfg.version_matches = serde_json::from_slice(
+        &fs::read(path.with_extension("versions")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(cfg)
 }
 
 pub(crate) fn reject_non_doc_only_source(
@@ -628,23 +647,22 @@ pub(crate) fn reject_non_doc_only_source(
     let mut doc_cfg = cfg.clone();
     doc_cfg.flags.insert("doc".to_string());
 
-    fn attribute_matches(meta: &syn::Meta, cfg: &RustcCfg) -> bool {
-        let syn::Meta::List(list) = meta else {
-            return true;
-        };
-        match cfg_path(&list.path).as_str() {
-            "cfg" => syn::parse2::<syn::Meta>(list.tokens.clone())
-                .is_ok_and(|predicate| cfg_meta_matches(&predicate, cfg)),
-            "cfg_attr" => cfg_attr_expression_matches(&list.tokens.to_string(), cfg),
-            _ => true,
-        }
+    fn attribute_is_non_doc_only(
+        meta: &syn::Meta,
+        normal: &RustcCfg,
+        documentation: &RustcCfg,
+    ) -> Result<bool, String> {
+        Ok(
+            cfg_attr_output_matches(meta, normal)?
+                && !cfg_attr_output_matches(meta, documentation)?,
+        )
     }
 
     fn non_doc_only_attribute(
         stream: proc_macro2::TokenStream,
         normal: &RustcCfg,
         documentation: &RustcCfg,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, String> {
         use proc_macro2::{Delimiter, TokenTree};
         let mut tokens = stream.into_iter().peekable();
         while let Some(token) = tokens.next() {
@@ -657,23 +675,22 @@ pub(crate) fn reject_non_doc_only_source(
                     if matches!(tokens.peek(), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket)
                         && let Some(TokenTree::Group(group)) = tokens.next()
                         && let Ok(meta) = syn::parse2::<syn::Meta>(group.stream())
-                        && attribute_matches(&meta, normal)
-                        && !attribute_matches(&meta, documentation)
+                        && attribute_is_non_doc_only(&meta, normal, documentation)?
                     {
-                        return Some(pound.span().start().line);
+                        return Ok(Some(pound.span().start().line));
                     }
                 }
                 TokenTree::Group(group) => {
                     if let Some(line) =
-                        non_doc_only_attribute(group.stream(), normal, documentation)
+                        non_doc_only_attribute(group.stream(), normal, documentation)?
                     {
-                        return Some(line);
+                        return Ok(Some(line));
                     }
                 }
                 _ => {}
             }
         }
-        None
+        Ok(None)
     }
 
     struct Affected<'a> {
@@ -684,6 +701,7 @@ pub(crate) fn reject_non_doc_only_source(
         owner: Option<Vec<String>>,
         owner_is_container: bool,
         line: Option<usize>,
+        error: Option<String>,
     }
     fn item_path(module: &[String], name: &str) -> Vec<String> {
         let mut path = module.to_vec();
@@ -821,13 +839,16 @@ pub(crate) fn reject_non_doc_only_source(
                     wanted.starts_with(&self.module_path)
                         && macro_contains_name(&item_macro.mac.tokens, &wanted[wanted.len() - 1..])
                 })
-                && let Some(line) = non_doc_only_attribute(
+            {
+                match non_doc_only_attribute(
                     item_macro.mac.tokens.clone(),
                     self.normal,
                     self.documentation,
-                )
-            {
-                self.line = Some(line);
+                ) {
+                    Ok(Some(line)) => self.line = Some(line),
+                    Err(error) => self.error = Some(error),
+                    Ok(None) => {}
+                }
             }
             if let syn::Item::Mod(item) = item {
                 self.module_path
@@ -845,11 +866,12 @@ pub(crate) fn reject_non_doc_only_source(
                     owner == wanted || (self.owner_is_container && wanted.starts_with(owner))
                 })
             });
-            if matches_query
-                && attribute_matches(&attribute.meta, self.normal)
-                && !attribute_matches(&attribute.meta, self.documentation)
-            {
-                self.line = Some(attribute.pound_token.span.start().line);
+            if matches_query {
+                match attribute_is_non_doc_only(&attribute.meta, self.normal, self.documentation) {
+                    Ok(true) => self.line = Some(attribute.pound_token.span.start().line),
+                    Err(error) => self.error = Some(error),
+                    Ok(false) => {}
+                }
             }
         }
     }
@@ -967,8 +989,15 @@ pub(crate) fn reject_non_doc_only_source(
             module_path,
             owner_is_container: true,
             line: None,
+            error: None,
         };
         syn::visit::Visit::visit_file(&mut affected, &file);
+        if let Some(error) = affected.error {
+            return Err(format!(
+                "cannot verify non-doc API source {}: {error}",
+                path.display()
+            ));
+        }
         if let Some(line) = affected.line {
             return Err(format!(
                 "non-doc API extraction is incomplete: {}:{line} enables source in the selected compilation but excludes it from Rustdoc JSON under cfg(doc)",
@@ -2675,13 +2704,14 @@ fn expanded_api_shape(
 }
 
 fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) -> Result<(), String> {
-    let mut unavailable = krate
-        .index
-        .iter()
-        .filter_map(|(id, item)| (!item_matches_cfg(item, cfg)).then_some(*id))
-        .collect::<HashSet<_>>();
+    let mut unavailable = HashSet::new();
+    for (id, item) in &krate.index {
+        if !item_matches_cfg(item, cfg)? {
+            unavailable.insert(*id);
+        }
+    }
     for item in krate.index.values() {
-        let mut disabled_derives = cfg_attr_derive_difference(&item.attrs, cfg);
+        let mut disabled_derives = cfg_attr_derive_difference(&item.attrs, cfg)?;
         if disabled_derives.contains("PartialEq") {
             disabled_derives.insert("StructuralPartialEq".into());
         }
@@ -2738,8 +2768,8 @@ fn apply_non_doc_cfg(krate: &mut Crate, cfg: &RustcCfg) -> Result<(), String> {
         }
     }
     for item in krate.index.values_mut() {
-        reconcile_cfg_attr_deprecation(item, cfg);
-        reconcile_cfg_attr_semantics(&mut item.attrs, cfg);
+        reconcile_cfg_attr_deprecation(item, cfg)?;
+        reconcile_cfg_attr_semantics(&mut item.attrs, cfg)?;
     }
     for id in &unavailable {
         if let Some(item) = krate.index.get_mut(id) {
@@ -2822,40 +2852,47 @@ fn module_body_span(item: &rustdoc_types::Item) -> Result<rustdoc_types::Span, S
     Ok(span)
 }
 
-fn cfg_attr_outputs(attrs: &[rustdoc_types::Attribute], cfg: &RustcCfg) -> Vec<syn::Meta> {
+fn cfg_attr_outputs(
+    attrs: &[rustdoc_types::Attribute],
+    cfg: &RustcCfg,
+) -> Result<Vec<syn::Meta>, String> {
     let mut outputs = Vec::new();
     for attr in attrs {
         let rustdoc_types::Attribute::Other(attribute) = attr else {
             continue;
         };
         if let Some(expression) = retained_attribute_expression(attribute, "cfg_attr") {
-            collect_cfg_attr_outputs(expression, cfg, &mut outputs);
+            collect_cfg_attr_outputs(expression, cfg, &mut outputs)?;
         }
     }
-    outputs
+    Ok(outputs)
 }
 
-fn collect_cfg_attr_outputs(expression: &str, cfg: &RustcCfg, outputs: &mut Vec<syn::Meta>) {
-    let Ok(nested) = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+fn collect_cfg_attr_outputs(
+    expression: &str,
+    cfg: &RustcCfg,
+    outputs: &mut Vec<syn::Meta>,
+) -> Result<(), String> {
+    let nested = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
         .parse_str(expression)
-    else {
-        return;
-    };
-    let Some(predicate) = nested.first() else {
-        return;
-    };
-    if !cfg_meta_matches(predicate, cfg) {
-        return;
+        .map_err(|error| format!("cannot parse cfg_attr '{expression}': {error}"))?;
+    if nested.len() < 2 {
+        return Err("cfg_attr requires a predicate and at least one output attribute".into());
+    }
+    let predicate = &nested[0];
+    if !cfg_meta_matches(predicate, cfg)? {
+        return Ok(());
     }
     for attribute in nested.into_iter().skip(1) {
         if let syn::Meta::List(list) = &attribute
             && cfg_path(&list.path) == "cfg_attr"
         {
-            collect_cfg_attr_outputs(&list.tokens.to_string(), cfg, outputs);
+            collect_cfg_attr_outputs(&list.tokens.to_string(), cfg, outputs)?;
         } else {
             outputs.push(attribute);
         }
     }
+    Ok(())
 }
 
 fn derived_names(outputs: &[syn::Meta]) -> HashSet<String> {
@@ -2877,24 +2914,28 @@ fn derived_names(outputs: &[syn::Meta]) -> HashSet<String> {
 fn cfg_attr_derive_difference(
     attrs: &[rustdoc_types::Attribute],
     cfg: &RustcCfg,
-) -> HashSet<String> {
+) -> Result<HashSet<String>, String> {
     let mut doc_cfg = cfg.clone();
     doc_cfg.flags.insert("doc".into());
-    let normal = derived_names(&cfg_attr_outputs(attrs, cfg));
-    derived_names(&cfg_attr_outputs(attrs, &doc_cfg))
+    let normal = derived_names(&cfg_attr_outputs(attrs, cfg)?);
+    Ok(derived_names(&cfg_attr_outputs(attrs, &doc_cfg)?)
         .difference(&normal)
         .map(|name| name.rsplit("::").next().unwrap_or(name).to_string())
-        .collect()
+        .collect())
 }
 
-fn reconcile_cfg_attr_deprecation(item: &mut rustdoc_types::Item, cfg: &RustcCfg) {
+fn reconcile_cfg_attr_deprecation(
+    item: &mut rustdoc_types::Item,
+    cfg: &RustcCfg,
+) -> Result<(), String> {
     let mut doc_cfg = cfg.clone();
     doc_cfg.flags.insert("doc".into());
-    let doc = cfg_attr_deprecation(&cfg_attr_outputs(&item.attrs, &doc_cfg));
-    let normal = cfg_attr_deprecation(&cfg_attr_outputs(&item.attrs, cfg));
+    let doc = cfg_attr_deprecation(&cfg_attr_outputs(&item.attrs, &doc_cfg)?);
+    let normal = cfg_attr_deprecation(&cfg_attr_outputs(&item.attrs, cfg)?);
     if doc != normal && item.deprecation == doc {
         item.deprecation = normal;
     }
+    Ok(())
 }
 
 fn cfg_attr_deprecation<'a>(
@@ -2949,11 +2990,14 @@ fn cfg_attr_deprecation<'a>(
     })
 }
 
-fn reconcile_cfg_attr_semantics(attrs: &mut Vec<rustdoc_types::Attribute>, cfg: &RustcCfg) {
+fn reconcile_cfg_attr_semantics(
+    attrs: &mut Vec<rustdoc_types::Attribute>,
+    cfg: &RustcCfg,
+) -> Result<(), String> {
     let mut doc_cfg = cfg.clone();
     doc_cfg.flags.insert("doc".into());
-    let doc = cfg_attr_outputs(attrs, &doc_cfg);
-    let normal = cfg_attr_outputs(attrs, cfg);
+    let doc = cfg_attr_outputs(attrs, &doc_cfg)?;
+    let normal = cfg_attr_outputs(attrs, cfg)?;
 
     let mut derives = derived_names(&normal).into_iter().collect::<Vec<_>>();
     derives.sort();
@@ -3051,6 +3095,7 @@ fn reconcile_cfg_attr_semantics(attrs: &mut Vec<rustdoc_types::Attribute>, cfg: 
             attrs.push(rustdoc_types::Attribute::Repr(repr));
         }
     }
+    Ok(())
 }
 
 fn semantic_cfg_attr_outputs<'a>(
@@ -3169,19 +3214,29 @@ fn derive_path(path: &syn::Path) -> Option<String> {
     Some(cfg_path(path))
 }
 
-fn item_matches_cfg(item: &rustdoc_types::Item, cfg: &RustcCfg) -> bool {
-    item.attrs.iter().all(|attribute| {
+fn cfg_all_matches(
+    predicates: impl IntoIterator<Item = Result<bool, String>>,
+) -> Result<bool, String> {
+    // Check every operand, including those after a known false result.
+    // Otherwise an unsupported predicate could become a boolean under negation.
+    predicates
+        .into_iter()
+        .try_fold(true, |matches, next| Ok(next? && matches))
+}
+
+fn item_matches_cfg(item: &rustdoc_types::Item, cfg: &RustcCfg) -> Result<bool, String> {
+    cfg_all_matches(item.attrs.iter().map(|attribute| {
         let rustdoc_types::Attribute::Other(attribute) = attribute else {
-            return true;
+            return Ok(true);
         };
         if let Some(expression) = retained_attribute_expression(attribute, "cfg") {
             cfg_expression_matches(expression, cfg)
         } else if let Some(expression) = retained_attribute_expression(attribute, "cfg_attr") {
             cfg_attr_expression_matches(expression, cfg)
         } else {
-            true
+            Ok(true)
         }
-    })
+    }))
 }
 
 fn retained_attribute_expression<'a>(attribute: &'a str, name: &str) -> Option<&'a str> {
@@ -3193,73 +3248,77 @@ fn retained_attribute_expression<'a>(attribute: &'a str, name: &str) -> Option<&
         .strip_suffix(")]")
 }
 
-fn cfg_expression_matches(expression: &str, cfg: &RustcCfg) -> bool {
-    syn::parse_str::<syn::Meta>(expression).is_ok_and(|meta| cfg_meta_matches(&meta, cfg))
+fn cfg_expression_matches(expression: &str, cfg: &RustcCfg) -> Result<bool, String> {
+    let meta = syn::parse_str::<syn::Meta>(expression)
+        .map_err(|error| format!("cannot parse cfg predicate '{expression}': {error}"))?;
+    cfg_meta_matches(&meta, cfg)
 }
 
-fn cfg_attr_expression_matches(expression: &str, cfg: &RustcCfg) -> bool {
-    let Ok(nested) = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+fn cfg_attr_expression_matches(expression: &str, cfg: &RustcCfg) -> Result<bool, String> {
+    let nested = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
         .parse_str(expression)
-    else {
-        return false;
-    };
-    let Some(predicate) = nested.first() else {
-        return false;
-    };
-    !cfg_meta_matches(predicate, cfg)
-        || nested
+        .map_err(|error| format!("cannot parse cfg_attr '{expression}': {error}"))?;
+    if nested.len() < 2 {
+        return Err("cfg_attr requires a predicate and at least one output attribute".into());
+    }
+    let predicate = &nested[0];
+    if !cfg_meta_matches(predicate, cfg)? {
+        return Ok(true);
+    }
+    cfg_all_matches(
+        nested
             .iter()
             .skip(1)
-            .all(|attribute| cfg_attr_output_matches(attribute, cfg))
+            .map(|attribute| cfg_attr_output_matches(attribute, cfg)),
+    )
 }
 
-fn cfg_attr_output_matches(attribute: &syn::Meta, cfg: &RustcCfg) -> bool {
+fn cfg_attr_output_matches(attribute: &syn::Meta, cfg: &RustcCfg) -> Result<bool, String> {
     let syn::Meta::List(list) = attribute else {
-        return true;
+        return Ok(true);
     };
     match cfg_path(&list.path).as_str() {
-        "cfg" => syn::parse2::<syn::Meta>(list.tokens.clone())
-            .is_ok_and(|meta| cfg_meta_matches(&meta, cfg)),
-        "cfg_attr" => syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
-            .parse2(list.tokens.clone())
-            .is_ok_and(|nested| {
-                let Some(predicate) = nested.first() else {
-                    return false;
-                };
-                !cfg_meta_matches(predicate, cfg)
-                    || nested
-                        .iter()
-                        .skip(1)
-                        .all(|attribute| cfg_attr_output_matches(attribute, cfg))
-            }),
-        _ => true,
+        "cfg" => cfg_expression_matches(&list.tokens.to_string(), cfg),
+        "cfg_attr" => cfg_attr_expression_matches(&list.tokens.to_string(), cfg),
+        _ => Ok(true),
     }
 }
 
-fn cfg_meta_matches(meta: &syn::Meta, cfg: &RustcCfg) -> bool {
+fn cfg_meta_matches(meta: &syn::Meta, cfg: &RustcCfg) -> Result<bool, String> {
     match meta {
-        syn::Meta::Path(path) => cfg.contains_flag(&cfg_lookup_path(path)),
+        syn::Meta::Path(path) => Ok(cfg.contains_flag(&cfg_lookup_path(path))),
         syn::Meta::NameValue(name_value) => {
             let syn::Expr::Lit(expression) = &name_value.value else {
-                return false;
+                return Err("cfg values must be string literals".into());
             };
             let syn::Lit::Str(value) = &expression.lit else {
-                return false;
+                return Err("cfg values must be string literals".into());
             };
-            cfg.contains_value(&cfg_lookup_path(&name_value.path), &value.value())
+            Ok(cfg.contains_value(&cfg_lookup_path(&name_value.path), &value.value()))
         }
         syn::Meta::List(list) => {
-            let Ok(nested) =
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
-                    .parse2(list.tokens.clone())
-            else {
-                return false;
-            };
-            match cfg_path(&list.path).as_str() {
-                "all" => nested.iter().all(|meta| cfg_meta_matches(meta, cfg)),
-                "any" => nested.iter().any(|meta| cfg_meta_matches(meta, cfg)),
-                "not" if nested.len() == 1 => !cfg_meta_matches(&nested[0], cfg),
-                _ => false,
+            let name = cfg_path(&list.path);
+            if name == "version" {
+                return cfg.version_matches(&list.tokens);
+            }
+            if !matches!(name.as_str(), "all" | "any" | "not") {
+                return Err(format!(
+                    "cannot evaluate unsupported cfg predicate '{name}'"
+                ));
+            }
+            let nested = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+                .map_err(|error| format!("cannot parse cfg predicate '{name}': {error}"))?;
+            match name.as_str() {
+                "all" => cfg_all_matches(nested.iter().map(|meta| cfg_meta_matches(meta, cfg))),
+                "any" => cfg_all_matches(
+                    nested
+                        .iter()
+                        .map(|meta| cfg_meta_matches(meta, cfg).map(|value| !value)),
+                )
+                .map(|value| !value),
+                "not" if nested.len() == 1 => cfg_meta_matches(&nested[0], cfg).map(|value| !value),
+                _ => Err("cfg(not(...)) requires exactly one predicate".into()),
             }
         }
     }
@@ -3415,6 +3474,10 @@ fn generate_json_with_toolchain(
         )
         .env("EXCRA_WRAPPER_TARGET_NAME", &request.target.name)
         .env(
+            "EXCRA_WRAPPER_SOURCE_PATH",
+            request.target.src_path.as_std_path(),
+        )
+        .env(
             "EXCRA_WRAPPER_FEATURES",
             serde_json::to_string(&request.unit.features).expect("feature names serialize"),
         )
@@ -3441,7 +3504,22 @@ fn generate_json_with_toolchain(
                 request.package.name, request.package.version
             )
         })?;
-    handle_generate_output(request.package, toolchain, output)
+    handle_generate_output(request.package, toolchain, output)?;
+    let json_path = doc_dir.join(format!("{}.json", request.target.name.replace('-', "_")));
+    if !json_path.is_file() {
+        return Err(format!(
+            "Cargo completed without producing Rustdoc JSON for the selected unit: {} {} target {} (mode {}, platform {}, features {:?}, profile {}); expected {}",
+            request.package.name,
+            request.package.version,
+            request.target.name,
+            request.unit.mode,
+            request.unit.platform.as_deref().unwrap_or("host"),
+            request.unit.features,
+            request.unit.profile,
+            json_path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn target_default_panic(toolchain: &str, platform: Option<&str>) -> Result<&'static str, String> {
@@ -3470,7 +3548,7 @@ fn target_default_panic(toolchain: &str, platform: Option<&str>) -> Result<&'sta
     ))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ImportProbe {
     compiler: Vec<OsString>,
     directory: PathBuf,
@@ -3480,6 +3558,173 @@ struct ImportProbe {
 fn load_import_probe(json_path: &Path) -> Result<ImportProbe, String> {
     serde_json::from_slice(
         &fs::read(json_path.with_extension("probe")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn collect_cfg_versions(meta: &syn::Meta, versions: &mut HashSet<String>) {
+    fn predicate(meta: &syn::Meta, versions: &mut HashSet<String>) {
+        let syn::Meta::List(list) = meta else { return };
+        if list.path.is_ident("version") {
+            if let Ok(values) =
+                syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+                    .parse2(list.tokens.clone())
+                && values.len() == 1
+            {
+                versions.insert(values[0].value());
+            }
+        } else if ["all", "any", "not"]
+            .iter()
+            .any(|name| list.path.is_ident(name))
+            && let Ok(nested) =
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                    .parse2(list.tokens.clone())
+        {
+            for meta in nested {
+                predicate(&meta, versions);
+            }
+        }
+    }
+    let syn::Meta::List(list) = meta else { return };
+    if list.path.is_ident("cfg") {
+        if let Ok(meta) = syn::parse2(list.tokens.clone()) {
+            predicate(&meta, versions);
+        }
+    } else if list.path.is_ident("cfg_attr")
+        && let Ok(nested) =
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+    {
+        if let Some(condition) = nested.first() {
+            predicate(condition, versions);
+        }
+        for attribute in nested.iter().skip(1) {
+            collect_cfg_versions(attribute, versions);
+        }
+    }
+}
+
+fn collect_source_cfg_versions(tokens: proc_macro2::TokenStream, versions: &mut HashSet<String>) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(token) = tokens.next() {
+        match token {
+            TokenTree::Punct(pound) if pound.as_char() == '#' => {
+                if matches!(tokens.peek(), Some(TokenTree::Punct(mark)) if mark.as_char() == '!') {
+                    tokens.next();
+                }
+                if matches!(tokens.peek(), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket)
+                    && let Some(TokenTree::Group(group)) = tokens.next()
+                    && let Ok(meta) = syn::parse2::<syn::Meta>(group.stream())
+                    && (meta.path().is_ident("cfg") || meta.path().is_ident("cfg_attr"))
+                {
+                    collect_cfg_versions(&meta, versions);
+                }
+            }
+            TokenTree::Group(group) => collect_source_cfg_versions(group.stream(), versions),
+            _ => {}
+        }
+    }
+}
+
+fn capture_version_cfg(
+    compiler: &[OsString],
+    arguments: &[OsString],
+    cfg_path: &Path,
+    source_path: &Path,
+) -> Result<(), String> {
+    let directory = env::current_dir().map_err(|error| error.to_string())?;
+    let source_path = source_path
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let source_index = arguments.iter().position(|argument| {
+        directory.join(argument).canonicalize().ok().as_ref() == Some(&source_path)
+    });
+    let krate: Crate = serde_json::from_slice(
+        &fs::read(cfg_path.with_extension("json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut versions = HashSet::new();
+    let mut sources = HashSet::new();
+    if let Some(index) = source_index {
+        sources.insert(directory.join(&arguments[index]));
+    }
+    for item in krate.index.values().filter(|item| item.crate_id == 0) {
+        if let Some(span) = &item.span {
+            sources.insert(directory.join(&span.filename));
+        }
+        for attribute in &item.attrs {
+            if let rustdoc_types::Attribute::Other(attribute) = attribute {
+                for name in ["cfg", "cfg_attr"] {
+                    if let Some(expression) = retained_attribute_expression(attribute, name)
+                        && let Ok(meta) = syn::parse_str(&format!("{name}({expression})"))
+                    {
+                        collect_cfg_versions(&meta, &mut versions);
+                    }
+                }
+            }
+        }
+    }
+    for source in sources {
+        if let Ok(source) = fs::read_to_string(source)
+            && let Ok(tokens) = source.parse()
+        {
+            collect_source_cfg_versions(tokens, &mut versions);
+        }
+    }
+    let mut matches = HashMap::new();
+    if !versions.is_empty() {
+        let mut versions = versions.into_iter().collect::<Vec<_>>();
+        versions.sort();
+        let mut source = String::from(
+            "#![no_std]\n#![feature(cfg_version)]\nconst EXCRA_CFG_VERSION_PROBE: () = ();\n",
+        );
+        for (index, version) in versions.iter().enumerate() {
+            source.push_str(&format!(
+                "#[cfg(version({version:?}))] const EXCRA_CFG_VERSION_{index}: () = ();\n"
+            ));
+        }
+        // Keep Cargo's per-unit environment, crate name, arguments and wrapper chain.
+        // The import-only probe deliberately omits wrappers and cannot evaluate cfgs.
+        let source_path = cfg_path.with_extension("version-probe.rs");
+        fs::write(&source_path, source).map_err(|error| error.to_string())?;
+        let mut arguments = arguments.to_vec();
+        arguments[source_index.ok_or("selected compiler invocation has no source input")?] =
+            source_path.into_os_string();
+        let output = Command::new(
+            compiler
+                .first()
+                .ok_or("selected compiler invocation is empty")?,
+        )
+        .args(&compiler[1..])
+        .args(arguments)
+        .arg("-Zunpretty=expanded")
+        .output()
+        .map_err(|error| {
+            format!("failed to evaluate cfg(version) with selected compiler: {error}")
+        })?;
+        if !output.status.success() {
+            return Err(format!(
+                "selected wrapped compiler could not evaluate cfg(version): {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let expanded = String::from_utf8_lossy(&output.stdout);
+        if !expanded.contains("const EXCRA_CFG_VERSION_PROBE:") {
+            return Err(
+                "selected wrapped compiler did not produce the cfg(version) probe expansion".into(),
+            );
+        }
+        for (index, version) in versions.into_iter().enumerate() {
+            matches.insert(
+                version,
+                expanded.contains(&format!("const EXCRA_CFG_VERSION_{index}:")),
+            );
+        }
+    }
+    fs::write(
+        cfg_path.with_extension("versions"),
+        serde_json::to_vec(&matches).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -3622,18 +3867,25 @@ pub(crate) fn run_rustc_wrapper() -> ! {
 
     // Cargo emits its profile options before dependency search paths, and appends
     // user rustflags afterwards. Match the original profile so overrides cannot
-    // hide the selected unit or collapse distinct dev/build profiles.
+    // hide the selected unit or collapse distinct dev/build profiles. Bypass both
+    // compiler wrappers for this probe: they can also override profile options.
     let profile_arguments = cargo_profile_arguments(invocation.arguments);
-    let print_cfg = |arguments: &[OsString]| {
-        let mut command = if let Some(wrapper) = &original_wrapper {
-            let mut command = Command::new(wrapper);
-            command.arg(compiler);
+    let print_cfg = |arguments: &[OsString], wrapped: bool| {
+        let mut command = if wrapped {
+            let mut command = if let Some(wrapper) = &original_wrapper {
+                let mut command = Command::new(wrapper);
+                command.arg(compiler);
+                command
+            } else {
+                Command::new(compiler)
+            };
+            command
+                .args(&command_arguments[1..command_arguments.len() - invocation.arguments.len()]);
             command
         } else {
-            Command::new(compiler)
+            Command::new(invocation.rustc)
         };
         let cfg_output = command
-            .args(&command_arguments[1..command_arguments.len() - invocation.arguments.len()])
             .args(arguments)
             .arg("--print=cfg")
             .output()
@@ -3650,12 +3902,12 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         }
         cfg_output
     };
-    let profile_cfg = print_cfg(profile_arguments);
+    let profile_cfg = print_cfg(profile_arguments, false);
     if !profile_matches_selected_unit(&RustcCfg::parse(&profile_cfg.stdout), profile_arguments) {
         std::process::exit(0);
     }
     // Item filtering must still see the effective cfgs, including user overrides.
-    let cfg_output = print_cfg(invocation.arguments);
+    let cfg_output = print_cfg(invocation.arguments, true);
 
     let Some(doc_dir) = env::var_os("EXCRA_WRAPPER_DOC_DIR").map(PathBuf::from) else {
         eprintln!("excra Rust compiler wrapper is missing its Rustdoc output directory");
@@ -3718,7 +3970,7 @@ pub(crate) fn run_rustc_wrapper() -> ! {
         &command_arguments[..command_arguments.len() - invocation.arguments.len()],
     );
     if let Err(error) = save_import_probe(
-        artifact_compiler,
+        artifact_compiler.clone(),
         import_probe_compiler(&invocation),
         invocation.arguments,
         &cfg_path.with_extension("probe"),
@@ -3771,6 +4023,22 @@ pub(crate) fn run_rustc_wrapper() -> ! {
             );
             std::process::exit(1);
         });
+    if status.success() && cfg_path.with_extension("json").is_file() {
+        let versions = env::var_os("EXCRA_WRAPPER_SOURCE_PATH")
+            .ok_or_else(|| "selected compiler source path is unavailable".to_string())
+            .and_then(|source| {
+                capture_version_cfg(
+                    &artifact_compiler,
+                    invocation.arguments,
+                    &cfg_path,
+                    Path::new(&source),
+                )
+            });
+        if let Err(error) = versions {
+            eprintln!("excra failed to capture selected compiler version cfgs: {error}");
+            std::process::exit(1);
+        }
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -5513,7 +5781,7 @@ impl Other<S> { pub fn unrelated(&self) {} }
         ];
         let cfg = RustcCfg::parse(b"feature=\"enabled\"\nunix\n");
 
-        reconcile_cfg_attr_semantics(&mut attrs, &cfg);
+        reconcile_cfg_attr_semantics(&mut attrs, &cfg).unwrap();
 
         assert!(attrs.iter().any(|attribute| {
             matches!(
@@ -5532,14 +5800,185 @@ impl Other<S> { pub fn unrelated(&self) {} }
     }
 
     #[test]
+    fn unknown_cfg_predicates_never_become_false_or_true_under_negation() {
+        let cfg = RustcCfg::parse(b"enabled\n");
+        for expression in [
+            "unsupported(\"argument\")",
+            "not(unsupported())",
+            "all(disabled, unsupported())",
+            "any(enabled, unsupported())",
+            "not(any(disabled, all(enabled, unsupported())))",
+            "not()",
+            "not(enabled, disabled)",
+            "mode = 1",
+            "mode = function()",
+            "version()",
+            "version(\"1.80\", \"1.90\")",
+            "version(enabled)",
+            "all(",
+        ] {
+            assert!(
+                cfg_expression_matches(expression, &cfg).is_err(),
+                "{expression}"
+            );
+        }
+        assert!(
+            cfg_expression_matches("version(\"1.80\")", &cfg)
+                .unwrap_err()
+                .contains("not captured from the selected wrapped compiler")
+        );
+        for (expression, expected) in [
+            ("all()", true),
+            ("any()", false),
+            ("not(enabled)", false),
+            ("all(enabled, not(disabled))", true),
+            ("any(disabled, enabled)", true),
+        ] {
+            assert_eq!(cfg_expression_matches(expression, &cfg).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_cfg_attr_conditions_propagate_through_filters_and_semantics() {
+        let cfg = RustcCfg::parse(b"enabled\n");
+        for expression in [
+            "unsupported(), cfg(enabled)",
+            "not(unsupported()), derive(Clone)",
+            "enabled, cfg(not(unsupported()))",
+            "enabled, cfg_attr(enabled, cfg(unsupported()))",
+            "",
+            "enabled,",
+            "enabled, cfg_attr()",
+            "enabled, cfg(invalid = 1)",
+        ] {
+            assert!(
+                cfg_attr_expression_matches(expression, &cfg).is_err(),
+                "{expression}"
+            );
+        }
+        assert!(cfg_attr_expression_matches("disabled, cfg(unsupported())", &cfg).unwrap());
+        let attrs = vec![rustdoc_types::Attribute::Other(
+            "#[<cfg_attr>(enabled, cfg_attr(not(unsupported()), derive(Clone)))]".into(),
+        )];
+        assert!(cfg_attr_outputs(&attrs, &cfg).is_err());
+        let malformed = vec![rustdoc_types::Attribute::Other("#[cfg_attr()]".into())];
+        assert!(cfg_attr_outputs(&malformed, &cfg).is_err());
+        assert!(cfg_attr_derive_difference(&attrs, &cfg).is_err());
+        assert!(reconcile_cfg_attr_semantics(&mut attrs.clone(), &cfg).is_err());
+        let mut docs = minimal_crate(None, FORMAT_VERSION);
+        docs.index.get_mut(&docs.root).unwrap().attrs = attrs;
+        assert!(
+            reconcile_cfg_attr_deprecation(docs.index.get_mut(&docs.root).unwrap(), &cfg).is_err()
+        );
+        assert!(apply_non_doc_cfg(&mut docs, &cfg).is_err());
+    }
+
+    #[test]
+    fn version_capture_collects_only_cfg_predicates_including_macro_templates() {
+        let source = r#"
+#![cfg_attr(version("1.80"), cfg(not(version("999.0"))))]
+#[cfg(any(version("1.90"), all(not(version("1.91")), enabled)))] struct S;
+#[cfg_attr(enabled, cfg_attr(version("1.92"), must_use), version("attribute"))] struct T;
+#[other(version("unrelated"))] struct U;
+macro_rules! generated { () => { #[cfg(version("1.93"))] struct Generated; } }
+"#;
+        let mut versions = HashSet::new();
+        collect_source_cfg_versions(source.parse().unwrap(), &mut versions);
+        assert_eq!(
+            versions,
+            HashSet::from(["1.80", "999.0", "1.90", "1.91", "1.92", "1.93"].map(String::from))
+        );
+    }
+
+    #[test]
+    fn version_probe_errors_are_not_false_cfg_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let cfg_path = directory.path().join("dep.cfg");
+        fs::write(
+            cfg_path.with_extension("json"),
+            serde_json::to_vec(&minimal_crate(None, FORMAT_VERSION)).unwrap(),
+        )
+        .unwrap();
+        let source = directory.path().join("lib.rs");
+        fs::write(&source, "#[cfg(version(\"1.80\"))] pub struct S;").unwrap();
+        let arguments = vec![source.clone().into_os_string()];
+        assert!(
+            capture_version_cfg(&[], &arguments, &cfg_path, &source)
+                .unwrap_err()
+                .contains("selected compiler invocation is empty")
+        );
+        assert!(
+            capture_version_cfg(
+                &[directory.path().join("missing-rustc").into()],
+                &arguments,
+                &cfg_path,
+                &source
+            )
+            .unwrap_err()
+            .contains("failed to evaluate cfg(version) with selected compiler")
+        );
+        assert!(!cfg_path.with_extension("versions").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper = directory.path().join("skip-probe.sh");
+            fs::write(&wrapper, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+            let error =
+                capture_version_cfg(&[wrapper.into_os_string()], &arguments, &cfg_path, &source)
+                    .unwrap_err();
+            assert!(
+                error.contains("did not produce the cfg(version) probe expansion"),
+                "{error}"
+            );
+            assert!(!cfg_path.with_extension("versions").exists());
+        }
+    }
+
+    #[test]
+    fn version_results_remain_correct_when_nested_or_negated() {
+        let mut cfg = RustcCfg::parse(b"enabled\n");
+        cfg.version_matches
+            .extend([("1.80".into(), true), ("999.0".into(), false)]);
+        for (expression, expected) in [
+            ("version(\"1.80\")", true),
+            ("version(\"1.80\",)", true),
+            ("version(\"999.0\")", false),
+            ("not(version(\"1.80\"))", false),
+            ("not(version(\"999.0\"))", true),
+            (
+                "all(enabled, any(version(\"999.0\"), version(\"1.80\")))",
+                true,
+            ),
+        ] {
+            assert_eq!(cfg_expression_matches(expression, &cfg).unwrap(), expected);
+        }
+        assert!(
+            cfg_attr_expression_matches(
+                "version(\"1.80\"), cfg_attr(not(version(\"999.0\")), cfg(enabled))",
+                &cfg,
+            )
+            .unwrap()
+        );
+        let attrs = vec![rustdoc_types::Attribute::Other(
+            "#[<cfg_attr>(version(\"1.80\"), cfg_attr(not(version(\"999.0\")), derive(Clone)))]"
+                .into(),
+        )];
+        assert_eq!(
+            derived_names(&cfg_attr_outputs(&attrs, &cfg).unwrap()),
+            HashSet::from(["Clone".into()])
+        );
+    }
+
+    #[test]
     fn cfg_lookup_normalizes_raw_identifiers_without_changing_rendered_paths() {
         let cfg = RustcCfg::parse("async\nmode=\"fast\"\ncafé\ncafé=\"oui\"\n".as_bytes());
 
-        assert!(cfg_expression_matches("café", &cfg));
-        assert!(cfg_expression_matches("café = \"oui\"", &cfg));
+        assert!(cfg_expression_matches("café", &cfg).unwrap());
+        assert!(cfg_expression_matches("café = \"oui\"", &cfg).unwrap());
 
-        assert!(cfg_expression_matches("r#async", &cfg));
-        assert!(cfg_expression_matches("r#mode = \"fast\"", &cfg));
+        assert!(cfg_expression_matches("r#async", &cfg).unwrap());
+        assert!(cfg_expression_matches("r#mode = \"fast\"", &cfg).unwrap());
         let path = syn::parse_str::<syn::Path>("r#async::r#type").unwrap();
         assert_eq!(cfg_path(&path), "r#async::r#type");
         assert_eq!(cfg_lookup_path(&path), "async::type");
@@ -5547,7 +5986,7 @@ impl Other<S> { pub fn unrelated(&self) {} }
         let mut attrs = vec![rustdoc_types::Attribute::Other(
             "#[<cfg_attr>(r#async, derive(RawEnabled))]".into(),
         )];
-        reconcile_cfg_attr_semantics(&mut attrs, &cfg);
+        reconcile_cfg_attr_semantics(&mut attrs, &cfg).unwrap();
         assert!(attrs.iter().any(|attribute| {
             matches!(
                 attribute,

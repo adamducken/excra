@@ -775,3 +775,170 @@ pub fn block_derive(_: TokenStream, input: TokenStream) -> TokenStream {
         );
     }
 }
+
+mod expansion_verification {
+    use std::{env, fs, process::Command};
+    use tempfile::TempDir;
+
+    fn workspace(packages: &[(&str, &str, &str)]) -> TempDir {
+        let workspace = TempDir::new().unwrap();
+        let members = packages
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<Vec<_>>();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            format!("[workspace]\nmembers = {members:?}\nresolver = \"3\"\n"),
+        )
+        .unwrap();
+        for (name, dependencies, source) in packages {
+            let directory = workspace.path().join(name);
+            fs::create_dir_all(directory.join("src")).unwrap();
+            fs::write(directory.join("Cargo.toml"), format!("[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n{dependencies}")).unwrap();
+            fs::write(directory.join("src/lib.rs"), source).unwrap();
+        }
+        let lock = Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        assert!(
+            lock.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        workspace
+    }
+
+
+    #[test]
+    fn version_gated_api_matches_the_selected_compiler_including_its_release_boundary() {
+        let toolchain = env::var("EXCRA_TOOLCHAIN").unwrap_or_else(|_| {
+            include_str!("../rust-toolchain.toml")
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("channel = "))
+                .unwrap()
+                .trim_matches('"')
+                .to_string()
+        });
+        let version = Command::new("rustc")
+            .args([format!("+{toolchain}"), "-vV".into()])
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let release = version
+            .lines()
+            .find_map(|line| line.strip_prefix("release: "))
+            .unwrap()
+            .split('-')
+            .next()
+            .unwrap();
+        let workspace = workspace(&[
+            ("app", "[dependencies]\ndep = { path = \"../dep\" }\n", ""),
+            ("dep", "", ""),
+        ]);
+        let source = format!(
+            r#"
+    #![feature(cfg_version)]
+    #[cfg(version("1.80"))] pub struct Positive;
+    #[cfg(not(version("999.0")))] pub struct Negative;
+    #[cfg(all(version("1.80"), any(doc, not(version("999.0")))))] pub struct Nested;
+    #[cfg_attr(version("999.0"), cfg(any()))] pub struct Inactive;
+    #[cfg_attr(version("1.80"), cfg(not(version("999.0"))))] pub struct Enabled;
+    #[cfg_attr(version("1.80"), cfg_attr(not(version("999.0")), must_use = "selected version"))]
+    pub struct Semantic;
+    #[cfg_attr(all(version("1.80"), doc), must_use = "docs")]
+    #[cfg_attr(all(version("1.80"), not(doc)), must_use = "actual")]
+    pub struct DocSemantic;
+    #[cfg_attr(all(version("1.80"), doc), deprecated(note = "docs old"))]
+    #[cfg_attr(all(version("1.80"), not(doc)), deprecated(note = "actual old"))]
+    pub struct Deprecated;
+    #[cfg_attr(all(version("1.80"), doc), derive(Clone))] pub struct DocDerived;
+    #[cfg(version("999.0"))] pub struct Disabled;
+    #[cfg(version({release:?}))] pub struct Boundary {{ pub accepted: u8 }}
+    #[cfg(not(version({release:?})))] pub struct Boundary {{ pub rejected: u16 }}
+    "#
+        );
+        let source_path = workspace.path().join("dep/src/lib.rs");
+        fs::write(&source_path, source).unwrap();
+        let query = |import: &str, flags: &str| {
+            Command::new(env!("CARGO_BIN_EXE_excra"))
+                .arg(import)
+                .arg("--root")
+                .arg(workspace.path())
+                .args(["--package", "app"])
+                .env("EXCRA_TOOLCHAIN", &toolchain)
+                .env("RUSTFLAGS", flags)
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env("CARGO_NET_OFFLINE", "true")
+                .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                .output()
+                .unwrap()
+        };
+        for flags in [
+            "-Zassume-incomplete-release=yes",
+            "-Z assume-incomplete-release=no",
+        ] {
+            // Compiler expansion supplies the expected boundary independently of Excra,
+            // including its release channel and the effective unstable flag.
+            let baseline = Command::new("rustc")
+                .arg(format!("+{toolchain}"))
+                .args(["--crate-type=lib", "-Zunpretty=expanded"])
+                .args(flags.split_whitespace())
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(
+                baseline.status.success(),
+                "{}",
+                String::from_utf8_lossy(&baseline.stderr)
+            );
+            let baseline = String::from_utf8(baseline.stdout).unwrap();
+            let output = query(
+                "use dep::{Positive, Negative, Nested, Inactive, Enabled, Semantic, DocSemantic, Deprecated, DocDerived, Boundary};",
+                flags,
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report = String::from_utf8(output.stdout).unwrap();
+            for name in ["Positive", "Negative", "Nested", "Inactive", "Enabled"] {
+                assert!(report.contains(&format!("pub struct {name};")), "{report}");
+            }
+            assert!(
+                report.contains("#[must_use = \"selected version\"]"),
+                "{report}"
+            );
+            assert!(report.contains("#[must_use = \"actual\"]"), "{report}");
+            assert!(!report.contains("#[must_use = \"docs\"]"), "{report}");
+            assert!(report.contains("actual old"), "{report}");
+            assert!(!report.contains("docs old"), "{report}");
+            let doc_derived = report
+                .split("item: struct DocDerived\n")
+                .nth(1)
+                .unwrap()
+                .split("crate: dep ")
+                .next()
+                .unwrap();
+            assert!(
+                !doc_derived.contains("impl Clone for DocDerived"),
+                "{report}"
+            );
+            assert_eq!(
+                report.contains("pub accepted: u8"),
+                baseline.contains("pub accepted: u8"),
+                "{flags}: {report}"
+            );
+            assert_eq!(
+                report.contains("pub rejected: u16"),
+                baseline.contains("pub rejected: u16"),
+                "{flags}: {report}"
+            );
+        }
+        let output = query("use dep::Disabled;", "");
+        assert!(!output.status.success());
+    }
+}

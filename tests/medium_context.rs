@@ -460,4 +460,251 @@ mod tests {
         assert!(stdout.contains("direct: u8"), "{stdout}");
         assert!(!stdout.contains("from_macro: u8"), "{stdout}");
     }
+
+    #[cfg(unix)]
+    mod profile_wrappers {
+        use super::write_package;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::process::{Command, Output};
+        use tempfile::TempDir;
+
+        fn workspace(debug_assertions: bool, selected_cfg: &str) -> TempDir {
+            let workspace = TempDir::new().unwrap();
+            fs::create_dir(workspace.path().join(".cargo")).unwrap();
+            fs::write(
+                workspace.path().join("Cargo.toml"),
+                format!(
+                    "[workspace]\nmembers = [\"app\", \"dep\"]\nresolver = \"3\"\n[profile.dev]\ndebug-assertions = {debug_assertions}\n"
+                ),
+            )
+            .unwrap();
+            for (name, dependencies, source) in [
+                (
+                    "app",
+                    "[dependencies]\ndep = { path = \"../dep\" }\n",
+                    String::new(),
+                ),
+                (
+                    "dep",
+                    "",
+                    format!("#[cfg(any(doc, {selected_cfg}))]\npub struct Selected;\n"),
+                ),
+            ] {
+                write_package(
+                    &workspace,
+                    name,
+                    &format!(
+                        "[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n{dependencies}"
+                    ),
+                    &source,
+                );
+            }
+            let lock = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(
+                lock.status.success(),
+                "{}",
+                String::from_utf8_lossy(&lock.stderr)
+            );
+            workspace
+        }
+
+        fn write_wrapper(path: &Path, source: &str) {
+            fs::write(path, source).unwrap();
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        fn query(workspace: &TempDir) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_excra"))
+                .args(["use dep::Selected;", "--root"])
+                .arg(workspace.path())
+                .args(["--package", "app"])
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env("CARGO_TARGET_DIR", workspace.path().join("target"))
+                .env("CARGO_NET_OFFLINE", "true")
+                .output()
+                .unwrap()
+        }
+
+        #[test]
+        fn wrapper_profile_overrides_preserve_selection_and_effective_cfgs() {
+            for (general, scoped, original_debug, effective_debug) in [
+                (true, false, true, false),
+                (false, true, true, false),
+                (true, true, true, false),
+                (true, false, false, true),
+            ] {
+                let debug_cfg = if effective_debug {
+                    "debug_assertions"
+                } else {
+                    "not(debug_assertions)"
+                };
+                let workspace = workspace(
+                    original_debug,
+                    &format!("all({debug_cfg}, panic = \"abort\", wrapper_cfg)"),
+                );
+                let wrapper = workspace.path().join("wrapper.sh");
+                write_wrapper(
+                    &wrapper,
+                    &format!(
+                        "#!/bin/sh\nexec \"$@\" -Cdebug-assertions={} -Coverflow-checks=no -Cpanic=abort --cfg wrapper_cfg\n",
+                        if effective_debug { "yes" } else { "no" }
+                    ),
+                );
+                let mut config = String::from("[build]\n");
+                if general {
+                    config.push_str(&format!(
+                        "rustc-wrapper = {:?}\n",
+                        wrapper.to_str().unwrap()
+                    ));
+                }
+                if scoped {
+                    config.push_str(&format!(
+                        "rustc-workspace-wrapper = {:?}\n",
+                        wrapper.to_str().unwrap()
+                    ));
+                }
+                if general && scoped {
+                    // Appended flags must not replace the original Cargo profile identity.
+                    config.push_str("rustflags = [\"-Cdebug-assertions=no\"]\n");
+                }
+                fs::write(workspace.path().join(".cargo/config.toml"), config).unwrap();
+                let output = query(&workspace);
+                assert!(
+                    output.status.success(),
+                    "general={general}, scoped={scoped}, original_debug={original_debug}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    stdout.contains("definition: pub struct Selected;"),
+                    "{stdout}"
+                );
+                let json_path = Path::new(
+                    stdout
+                        .lines()
+                        .find_map(|line| line.strip_prefix("source: "))
+                        .unwrap(),
+                );
+                let cfg = fs::read_to_string(json_path.with_extension("cfg")).unwrap();
+                assert_eq!(
+                    cfg.lines().any(|line| line == "debug_assertions"),
+                    effective_debug
+                );
+                assert!(!cfg.lines().any(|line| line == "overflow_checks"), "{cfg}");
+                assert!(cfg.lines().any(|line| line == "panic=\"abort\""), "{cfg}");
+                assert!(cfg.lines().any(|line| line == "wrapper_cfg"), "{cfg}");
+            }
+        }
+
+        #[test]
+        fn version_predicates_use_effective_cargo_wrappers() {
+            let toolchain = std::env::var("EXCRA_TOOLCHAIN").unwrap_or_else(|_| {
+                include_str!("../rust-toolchain.toml")
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("channel = "))
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string()
+            });
+            let output = Command::new("rustc")
+                .args([format!("+{toolchain}"), "-vV".into()])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let output = String::from_utf8(output.stdout).unwrap();
+            let release = output
+                .lines()
+                .find_map(|line| line.strip_prefix("release: "))
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap();
+            for (general, scoped) in [(true, false), (false, true), (true, true)] {
+                let workspace = workspace(true, "debug_assertions");
+                fs::write(
+                    workspace.path().join("dep/src/lib.rs"),
+                    format!(
+                        r#"
+#![feature(cfg_version)]
+#[cfg(not(version({release:?})))]
+#[cfg_attr(not(version({release:?})), must_use = "actual version")]
+pub struct Selected {{ pub actual: u8 }}
+#[cfg(version({release:?}))] pub struct Selected {{ pub wrong: u16 }}
+"#
+                    ),
+                )
+                .unwrap();
+                let wrapper = workspace.path().join("wrapper.sh");
+                write_wrapper(
+                    &wrapper,
+                    "#!/bin/sh\n[ -n \"$CARGO_PKG_NAME\" ] || { exec \"$@\"; }\n[ \"$CARGO_PKG_NAME\" = dep ] && exec \"$@\" -Zassume-incomplete-release=yes\nexec \"$@\"\n",
+                );
+                let mut config = String::from("[build]\n");
+                for (enabled, name) in [
+                    (general, "rustc-wrapper"),
+                    (scoped, "rustc-workspace-wrapper"),
+                ] {
+                    if enabled {
+                        config.push_str(&format!("{name} = {:?}\n", wrapper.to_str().unwrap()));
+                    }
+                }
+                fs::write(workspace.path().join(".cargo/config.toml"), config).unwrap();
+                let output = query(&workspace);
+                assert!(output.status.success(), "scoped={scoped}: {output:?}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(stdout.contains("pub actual: u8"), "{stdout}");
+                assert!(!stdout.contains("pub wrong: u16"), "{stdout}");
+                assert!(
+                    stdout.contains("#[must_use = \"actual version\"]"),
+                    "{stdout}"
+                );
+            }
+        }
+
+        #[test]
+        fn successful_cargo_without_documentation_names_the_selected_unit() {
+            let workspace = workspace(true, "debug_assertions");
+            let wrapper = workspace.path().join("skip-rustdoc.sh");
+            write_wrapper(
+                &wrapper,
+                "#!/bin/sh\ncase \"$1\" in *rustdoc|*rustdoc.exe) exit 0;; esac\nexec \"$@\"\n",
+            );
+            fs::write(
+                workspace.path().join(".cargo/config.toml"),
+                format!("[build]\nrustc-wrapper = {:?}\n", wrapper.to_str().unwrap()),
+            )
+            .unwrap();
+            let output = query(&workspace);
+            assert!(!output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains(
+                    "Cargo completed without producing Rustdoc JSON for the selected unit"
+                ),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("dep 0.1.0 target dep (mode check, platform host"),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("features []") && stderr.contains("profile {"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("No such file or directory"), "{stderr}");
+        }
+    }
 }
