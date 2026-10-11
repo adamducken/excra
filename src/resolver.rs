@@ -45,7 +45,6 @@ pub(crate) struct DependencyFilter {
 pub(crate) struct DependencyContext {
     pub(crate) kind: DependencyKind,
     pub(crate) target: Option<String>,
-    pub(crate) via: Option<String>,
 }
 
 impl DependencyContext {
@@ -56,123 +55,15 @@ impl DependencyContext {
             DependencyKind::Build => "build",
             _ => "unknown",
         };
-        let label = match &self.target {
+        match &self.target {
             Some(target) => format!("{kind} ({target})"),
             None => kind.to_string(),
-        };
-        match &self.via {
-            Some(via) => format!("transitive via {via} ({label})"),
-            None => label,
         }
     }
-}
-
-fn transitive_context(source_context: &DependencyContext, source_crate: &str) -> DependencyContext {
-    DependencyContext {
-        kind: source_context.kind,
-        target: source_context.target.clone(),
-        via: Some(source_crate.to_string()),
-    }
-}
-
-fn normalized_crate_name(name: &str) -> String {
-    name.replace('-', "_")
 }
 
 fn package_by_id<'a>(packages: &'a [Package], package_id: &PackageId) -> Option<&'a Package> {
     packages.iter().find(|pkg| &pkg.id == package_id)
-}
-
-fn dependency_matches_crate_name(dep: &cargo_metadata::NodeDep, crate_name: &str) -> bool {
-    normalized_crate_name(&dep.name) == crate_name
-}
-
-pub(crate) fn resolve_dependency_from_package<'a>(
-    metadata: &Metadata,
-    packages: &'a [Package],
-    source_package: &Package,
-    source_contexts: &[DependencyContext],
-    crate_name: &str,
-) -> Result<ResolvedDependency<'a>, ResolveError> {
-    let Some(resolve) = metadata.resolve.as_ref() else {
-        return Err(ResolveError::Other(
-            "cargo metadata did not include a dependency graph".to_string(),
-        ));
-    };
-    let Some(node) = resolve
-        .nodes
-        .iter()
-        .find(|node| node.id == source_package.id)
-    else {
-        return Err(ResolveError::Other(format!(
-            "package '{}' missing from cargo metadata dependency graph",
-            source_package.name
-        )));
-    };
-
-    let mut matches = Vec::<DependencyEntry>::new();
-    for dep in &node.deps {
-        if !dependency_matches_crate_name(dep, crate_name) {
-            continue;
-        }
-        if dep
-            .dep_kinds
-            .iter()
-            .all(|dep_kind| dep_kind.kind != DependencyKind::Normal)
-        {
-            continue;
-        }
-        for source_context in source_contexts {
-            push_dependency_context(
-                &mut matches,
-                dep.pkg.clone(),
-                transitive_context(source_context, &source_package.name),
-            );
-        }
-    }
-
-    let mut package_ids = matches
-        .iter()
-        .map(|entry| entry.package_id.clone())
-        .collect::<Vec<_>>();
-    package_ids.sort_by(|left, right| left.repr.cmp(&right.repr));
-    package_ids.dedup();
-
-    match package_ids.as_slice() {
-        [] => Err(ResolveError::NotDirectDependency(format!(
-            "crate '{crate_name}' is not a dependency of direct dependency '{}'",
-            source_package.name
-        ))),
-        [_] => {
-            let entry = matches
-                .iter()
-                .find(|entry| entry.package_id == package_ids[0])
-                .expect("entry exists for deduplicated package id");
-            let package = package_by_id(packages, &entry.package_id).ok_or_else(|| {
-                ResolveError::Other(format!(
-                    "dependency '{crate_name}' of '{}' missing from cargo metadata",
-                    source_package.name
-                ))
-            })?;
-            let target = library_target(package).map_err(ResolveError::Other)?;
-            Ok(ResolvedDependency {
-                package,
-                target,
-                contexts: entry.contexts.clone(),
-            })
-        }
-        _ => {
-            let candidates = package_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(ResolveError::Other(format!(
-                "crate '{crate_name}' matched multiple dependencies of '{}': {candidates}",
-                source_package.name
-            )))
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -237,7 +128,6 @@ fn sort_dependency_contexts(contexts: &mut [DependencyContext]) {
         dependency_kind_order(left.kind)
             .cmp(&dependency_kind_order(right.kind))
             .then_with(|| left.target.cmp(&right.target))
-            .then_with(|| left.via.cmp(&right.via))
     });
 }
 
@@ -289,6 +179,14 @@ pub(crate) fn select_package<'a>(
     if let Some(package) = metadata.root_package() {
         return Ok(package);
     }
+    // Metadata without a resolve graph does not identify the selected member.
+    if let Some(package) = metadata
+        .packages
+        .iter()
+        .find(|package| package.manifest_path.as_std_path() == manifest_path)
+    {
+        return Ok(package);
+    }
 
     let root = manifest_path
         .parent()
@@ -334,7 +232,6 @@ pub(crate) fn package_dependencies(
                     DependencyContext {
                         kind: dep_kind.kind,
                         target: dep_kind.target.as_ref().map(ToString::to_string),
-                        via: None,
                     },
                 );
             }
@@ -682,7 +579,24 @@ edition = "2024"
 
     #[test]
     fn filters_dev_dependencies_by_default() {
-        let metadata = metadata();
+        let mut metadata = metadata();
+        let root_id = metadata.root_package().unwrap().id.clone();
+        let node = metadata
+            .resolve
+            .as_mut()
+            .unwrap()
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == root_id)
+            .unwrap();
+        let dep = node
+            .deps
+            .iter_mut()
+            .find(|dep| dep.name == "tempfile")
+            .unwrap();
+        for kind in &mut dep.dep_kinds {
+            kind.kind = DependencyKind::Development;
+        }
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
 
         let default_deps = package_dependencies(&metadata, &package.id, default_filter());
@@ -733,136 +647,6 @@ edition = "2024"
     }
 
     #[test]
-    fn resolves_reexport_target_from_direct_dependency_graph() {
-        let metadata = metadata();
-        let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
-        let deps = package_dependencies(&metadata, &package.id, default_filter());
-        let serde = one_dependency(resolve_dependency(&metadata.packages, &deps, "serde"));
-
-        let serde_core = resolve_dependency_from_package(
-            &metadata,
-            &metadata.packages,
-            serde.package,
-            &serde.contexts,
-            "serde_core",
-        )
-        .unwrap();
-
-        assert_eq!(serde_core.package.name, "serde_core");
-        assert_eq!(
-            serde_core.contexts[0].label(),
-            "transitive via serde (normal)"
-        );
-    }
-
-    #[test]
-    fn transitive_resolution_uses_normal_effective_extern_names_only() {
-        let workspace = TempDir::new().unwrap();
-        for member in ["source", "normal_pkg", "dev_origin"] {
-            fs::create_dir_all(workspace.path().join(member).join("src")).unwrap();
-            fs::write(workspace.path().join(member).join("src/lib.rs"), "").unwrap();
-        }
-        fs::write(
-            workspace.path().join("Cargo.toml"),
-            r#"
-[workspace]
-members = ["source", "normal_pkg", "dev_origin"]
-resolver = "3"
-"#,
-        )
-        .unwrap();
-        fs::write(
-            workspace.path().join("source/Cargo.toml"),
-            r#"
-[package]
-name = "source"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies.origin]
-package = "normal_pkg"
-path = "../normal_pkg"
-
-[dev-dependencies.dev_origin]
-package = "origin"
-path = "../dev_origin"
-"#,
-        )
-        .unwrap();
-        fs::write(
-            workspace.path().join("normal_pkg/Cargo.toml"),
-            r#"
-[package]
-name = "normal_pkg"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-name = "origin"
-"#,
-        )
-        .unwrap();
-        fs::write(
-            workspace.path().join("dev_origin/Cargo.toml"),
-            r#"
-[package]
-name = "origin"
-version = "0.2.0"
-edition = "2024"
-"#,
-        )
-        .unwrap();
-
-        let metadata = MetadataCommand::new()
-            .manifest_path(workspace.path().join("Cargo.toml"))
-            .exec()
-            .unwrap();
-        let source = metadata
-            .packages
-            .iter()
-            .find(|package| package.name == "source")
-            .unwrap();
-        let source_contexts = [DependencyContext {
-            kind: DependencyKind::Normal,
-            target: None,
-            via: None,
-        }];
-
-        let resolved = resolve_dependency_from_package(
-            &metadata,
-            &metadata.packages,
-            source,
-            &source_contexts,
-            "origin",
-        )
-        .unwrap();
-        assert_eq!(resolved.package.name, "normal_pkg");
-        assert_eq!(resolved.contexts.len(), 1);
-        assert_eq!(resolved.contexts[0].kind, DependencyKind::Normal);
-
-        assert!(
-            resolve_dependency_from_package(
-                &metadata,
-                &metadata.packages,
-                source,
-                &source_contexts,
-                "normal_pkg"
-            )
-            .is_err()
-        );
-        assert!(
-            resolve_dependency_from_package(
-                &metadata,
-                &metadata.packages,
-                source,
-                &source_contexts,
-                "dev_origin"
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn duplicate_dependency_contexts_for_same_package_are_merged() {
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
@@ -875,7 +659,6 @@ edition = "2024"
             DependencyContext {
                 kind: DependencyKind::Development,
                 target: None,
-                via: None,
             },
         );
 
@@ -899,21 +682,20 @@ edition = "2024"
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let mut deps = package_dependencies(&metadata, &package.id, default_filter());
-        let serde_id = metadata
+        let html_id = metadata
             .packages
             .iter()
-            .find(|package| package.name == "serde")
+            .find(|package| package.name == "html-to-markdown-rs")
             .unwrap()
             .id
             .clone();
         deps.insert(
             "cargo_metadata".into(),
             DependencyEntry {
-                package_id: serde_id.clone(),
+                package_id: html_id.clone(),
                 contexts: vec![DependencyContext {
                     kind: DependencyKind::Development,
                     target: None,
-                    via: None,
                 }],
             },
         );
@@ -922,7 +704,7 @@ edition = "2024"
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].package.name, "cargo_metadata");
         assert_eq!(resolved[0].contexts[0].kind, DependencyKind::Normal);
-        assert_eq!(resolved[1].package.id, serde_id);
+        assert_eq!(resolved[1].package.id, html_id);
         assert_eq!(resolved[1].contexts[0].kind, DependencyKind::Development);
     }
 
@@ -931,21 +713,20 @@ edition = "2024"
         let metadata = metadata();
         let package = select_package(&metadata, Path::new("Cargo.toml"), None).unwrap();
         let mut deps = package_dependencies(&metadata, &package.id, default_filter());
-        let serde_id = metadata
+        let html_id = metadata
             .packages
             .iter()
-            .find(|package| package.name == "serde")
+            .find(|package| package.name == "html-to-markdown-rs")
             .unwrap()
             .id
             .clone();
         deps.insert(
             "cargo_metadata".into(),
             DependencyEntry {
-                package_id: serde_id,
+                package_id: html_id,
                 contexts: vec![DependencyContext {
                     kind: DependencyKind::Normal,
                     target: Some("cfg(unix)".into()),
-                    via: None,
                 }],
             },
         );

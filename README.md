@@ -1,109 +1,111 @@
 # Excra
 
-**Exact Rust crate APIs for coding agents.**
+**Cargo-resolved Rust documentation for coding agents.**
 
-When an agent writes Rust, it needs the API that *this project* can compile,
-not a signature from another crate release or feature set. Excra takes a Rust
-`use` declaration, resolves it in your Cargo project, and returns compact,
-source-linked documentation for the selected dependency items.
+Excra takes a Rust `use` declaration, resolves its direct dependency in your
+Cargo project, generates ordinary rustdoc HTML with stable Cargo, and converts
+every API page of the requested crate to Markdown with
+[html-to-markdown-rs](https://crates.io/crates/html-to-markdown-rs).
 
 ```bash
 excra 'use syn::{parse_file, File};' --root /path/to/project
 ```
 
-The report identifies the resolved crate version and enabled features, then
-shows each item's definition, documentation, source location, and relevant
-details such as fields, variants, methods, and direct trait implementations.
-Excra generates Rustdoc JSON locally from the Cargo-selected dependency unit,
-so target and dependency context are part of the answer.
-
-## Give an agent the right API
-
-Use Excra when an agent needs to answer questions like:
-
-- What does this function take and return in the version I actually use?
-- Which fields or enum variants are available with my enabled features?
-- Which methods and trait implementations does this type expose?
-- Where is this item declared, and what do its docs say?
-
-The agent can query one item or batch related imports in a single command:
-
-```bash
-excra 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root .
-```
-
-For agent instructions and supported query forms, see
-[excra-skill.md](excra-skill.md).
+Each report includes the resolved crate version, selected package, dependency
+context, root feature selection, HTML and Markdown paths, and only the requested
+items' converted pages. Signatures, documentation, fields, variants, methods,
+and implementations come directly from rustdoc's HTML.
 
 ## Install
 
-You need Rust 1.89 or newer to build Excra, plus Rustup and
-`nightly-2025-09-10` to generate Rustdoc JSON.
+Rust 1.89 or newer is required. Use your ordinary stable Rust installation:
 
 ```bash
-rustup toolchain install nightly-2025-09-10
 cargo install excra --locked
 ```
 
-The project being queried must have a current `Cargo.lock`. Excra does not
-create or update it. If Cargo reports a missing or stale lockfile, run
-`cargo check` or `cargo build` in that project, then retry.
+The queried project must have a current `Cargo.lock`. Excra resolves it with
+`cargo metadata --locked`; it never creates or updates the project's lockfile.
+Refresh a missing or stale lockfile with `cargo check` or `cargo build`, then retry.
 
-## Query your project
+## Query a project
 
-Pass a complete external `use` declaration. `--root .` is implicit when run
-from the project root.
-
-```bash
-excra 'use syn::parse_file;' --root /path/to/project
-excra 'use syn::{parse_file, File};'
-```
-
-Feature flags follow Cargo semantics, including workspace package selection:
+Pass a complete external `use` declaration as one shell argument. The current
+directory is the default root.
 
 ```bash
+excra 'use syn::parse_file;'
+excra 'use tokio::sync::{Mutex, RwLock, Semaphore};' --root /path/to/project
 excra 'use dependency::Extra;' --features extra
 excra 'use dependency::Extra;' --all-features
 excra 'use dependency::DefaultApi;' --no-default-features
 excra 'use dependency::Item;' --package workspace-member
+excra 'use dependency::Item;' --target x86_64-unknown-linux-gnu
 ```
 
-Normal dependencies are queried by default. Opt in to other direct dependency
-contexts when needed:
+`--features` accepts comma- or space-separated names and may be repeated.
+Virtual workspace roots require `--package`. Dependency renames use the name
+imported by the consumer.
+
+Normal direct dependencies are queried by default. Additional contexts are
+opt-in:
 
 ```bash
 excra 'use dev_dependency::Item;' --include-dev
 excra 'use build_dependency::Item;' --include-build
 ```
 
-Use `--target TRIPLE` to select a target explicitly. Otherwise, Excra honors
-Cargo's effective target configuration.
+Requested crates use their Cargo-resolved features. Normal and dev contexts
+share documentation; build documentation uses the compiler host. Build-only
+dependencies outside the workspace are supported.
+
+## How it works
+
+The normal pipeline is:
+
+```text
+cargo metadata --locked
+cargo doc --offline --no-deps --lib --package <requested-crate>
+all requested-crate HTML API pages → html-to-markdown-rs → .md files
+requested item pages → stdout
+```
+
+Excra creates a small isolated Cargo manifest pointing at the resolved crate's
+local source, with its selected features and a copy of the project's lockfile.
+Only that crate is documented. Its required dependencies may be compiled;
+the consuming application and unrelated dependencies are not built or documented.
+Cargo runs from the queried project's directory, using its installed toolchain
+and Cargo configuration. With no `--target`, Cargo handles its configured target.
+The isolated manifest uses its default development profile; root manifest
+profile and patch overrides are not copied.
+
+HTML, Markdown, and build artifacts remain under `target/excra/docs-*`, relative
+to Cargo's target directory. Matching crate, feature, target, lockfile, and Cargo
+configuration selections reuse build artifacts and unchanged Markdown. Other
+selections use separate directories. Cargo progress is displayed on stderr. Remove
+`target/excra` when you no longer need the generated files.
+
+Markdown files sit beside their HTML pages, keeping relative source and API
+links usable. Navigation and interface controls are omitted from Markdown.
 
 ## Supported scope
 
-Excra supports concrete external paths, nested brace imports, renames,
-modules, enum variants, raw identifiers, and public re-exports. It queries
-direct dependencies of the selected package, including dev and build
-dependencies when requested.
+Concrete paths, nested brace imports, renames, modules, enum variants, raw
+identifiers, and public re-exports with pages inside the requested crate are
+supported. Enum variant queries return the containing enum page. Ambiguous item
+names are reported as errors.
 
-It does not accept glob imports such as `use syn::*;`, standard-library crates
-(`std`, `core`, `alloc`), local paths beginning with `crate`, `self`, or
-`super`, or transitive dependencies that are not exposed through a direct
-dependency. Query a concrete item path instead of a glob.
+Glob imports, local paths (`crate`, `self`, `super`), standard-library crates
+(`std`, `core`, `alloc`), and dependencies not exposed through a direct
+dependency are outside the query scope. Hidden items without a public rustdoc
+page cannot be reported. External module re-exports without a page in the
+requested crate are unavailable. Cargo failures are reported as errors.
 
-Managed Rustdoc output is stored under the project's `target/excra` directory.
+Output follows ordinary rustdoc semantics, including `cfg(doc)`. Excra does
+not reconstruct or validate a separate compiler-expanded API. The requested
+crate must successfully document with `cargo doc`.
 
-## Toolchain override
-
-The default nightly is pinned to the Rustdoc schema used by this release.
-Advanced users can select a compatible toolchain for an entire query:
-
-```bash
-EXCRA_TOOLCHAIN=<compatible-toolchain> excra 'use dependency::Item;'
-```
-
-The selected toolchain must support the target project and emit the
-`rustdoc-types 0.56.x` JSON schema.
+For agent instructions, see [excra-skill.md](excra-skill.md).
 
 ## License
 

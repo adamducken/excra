@@ -17,11 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 cargo_metadata = "0.18"
-proc-macro2 = { version = "1", features = ["span-locations"] }
-rustdoc-types = "0.56.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+html-to-markdown-rs = { version = "3", default-features = false, features = ["visitor"] }
+syn = { version = "2", default-features = false, features = ["full", "parsing"] }
 
 [dev-dependencies]
 tempfile = "3"
