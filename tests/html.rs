@@ -142,6 +142,7 @@ fn query(root: &Path, import: &str, flags: &[&str]) -> Output {
         .args(["--package", "app"])
         .args(flags)
         .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TERM_COLOR", "never")
         .env("RUSTC_BOOTSTRAP", "0")
         .output()
         .unwrap()
