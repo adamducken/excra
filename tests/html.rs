@@ -1053,3 +1053,238 @@ pub enum Kind {
         assert_eq!(manifest["workspace"]["resolver"].as_str(), Some(resolver));
     }
 }
+
+#[test]
+fn git_siblings_keep_resolved_sources_revisions_and_unified_features() {
+    let dir = TempDir::new().unwrap();
+    let repository = dir.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    fs::write(
+        repository.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"api\", \"inner\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    member(
+        &repository,
+        "api",
+        "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ninner = { path = \"../inner\" }\n",
+        "pub use inner::{Kind, Extra};",
+    );
+    member(
+        &repository,
+        "inner",
+        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\nextra = []\n",
+        "pub enum Kind { Base, #[cfg(feature = \"extra\")] Extra }\n#[cfg(feature = \"extra\")] pub struct Extra;",
+    );
+    for args in [
+        vec!["init", "--initial-branch", "fixture"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Excra Test",
+            "-c",
+            "user.email=excra@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        vec!["tag", "fixture"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+    }
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repository)
+        .output()
+        .unwrap();
+    let revision = String::from_utf8(revision.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let url = url::Url::from_directory_path(&repository).unwrap();
+    let cargo_home = dir.path().join("cargo-home");
+    for (index, reference) in [
+        String::new(),
+        ", branch = \"fixture\"".into(),
+        ", tag = \"fixture\"".into(),
+        format!(", rev = \"{revision}\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = dir.path().join(format!("consumer-{index}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        member(
+            &root,
+            "app",
+            &format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\napi = {{ git = \"{url}\"{reference} }}\ninner = {{ git = \"{url}\"{reference}, features = [\"extra\"] }}\n"
+            ),
+            "pub use api::{Kind::Extra as Variant, Extra};",
+        );
+        let checked = Command::new("cargo")
+            .args(["check", "--package", "app"])
+            .current_dir(&root)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_NET_OFFLINE", "false")
+            .output()
+            .unwrap();
+        assert!(checked.status.success(), "{:?}", checked);
+        let lock = fs::read(root.join("Cargo.lock")).unwrap();
+        let mut command = query_command(&root, "use api::{Kind, Kind::Extra, Extra};", &[]);
+        command.env("CARGO_HOME", &cargo_home);
+        let report = success(command.output().unwrap());
+        assert!(report.contains("pub struct Extra"), "{report}");
+        assert!(report.contains("Extra"), "{report}");
+        let pages = paths(&report, "markdown: ");
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0], pages[1]);
+        let generation = pages[0]
+            .ancestors()
+            .find(|path| path.join("Cargo.toml").is_file())
+            .unwrap();
+        let metadata = Command::new("cargo")
+            .args([
+                "metadata",
+                "--offline",
+                "--locked",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(generation.join("Cargo.toml"))
+            .current_dir(&root)
+            .env("CARGO_HOME", &cargo_home)
+            .output()
+            .unwrap();
+        assert!(metadata.status.success(), "{:?}", metadata);
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+        for name in ["api", "inner"] {
+            let packages = metadata["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|package| package["name"] == name)
+                .collect::<Vec<_>>();
+            assert_eq!(packages.len(), 1, "{metadata}");
+            let source = packages[0]["source"].as_str().unwrap();
+            assert!(source.starts_with("git+"), "{source}");
+            assert!(source.ends_with(&format!("#{revision}")), "{source}");
+        }
+        assert_eq!(fs::read(root.join("Cargo.lock")).unwrap(), lock);
+    }
+}
+
+#[test]
+fn proc_macro_consumers_query_ordinary_dependencies_in_the_host_context() {
+    let dir = project();
+    let root = dir.path();
+    member(
+        root,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nalias = { package = \"api\", path = \"../api\", features = [\"target\"] }\nmacros = { path = \"../macros\" }\n",
+        "pub use alias::Record;",
+    );
+    member(
+        root,
+        "macros",
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n[dependencies]\nalias = { package = \"api\", path = \"../api\", features = [\"host\"] }\n",
+        "",
+    );
+    member(
+        root,
+        "api",
+        "[package]\nname = \"api\"\nversion = \"1.2.3\"\nedition = \"2024\"\n[features]\nhost = []\ntarget = []\n",
+        "pub struct Record;\nimpl Record {\n#[cfg(feature = \"host\")] pub fn host_only() {}\n#[cfg(feature = \"target\")] pub fn target_only() {}\n}",
+    );
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--package", "app"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{:?}", checked);
+    let report = success(query(root, "use alias::Record;", &[]));
+    assert!(report.contains("fn target_only("), "{report}");
+    assert!(!report.contains("fn host_only("), "{report}");
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let other_target = if cfg!(windows) {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        "x86_64-pc-windows-gnu"
+    };
+    for flags in [
+        vec![],
+        vec!["--target", host],
+        vec!["--target", other_target],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_excra"))
+            .args(["use alias::Record;", "--root"])
+            .arg(root)
+            .args(["--package", "macros"])
+            .args(flags)
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        let report = success(output);
+        assert!(report.contains("dependency: normal\n"), "{report}");
+        assert!(report.contains("fn host_only("), "{report}");
+        assert!(!report.contains("fn target_only("), "{report}");
+    }
+}
+
+#[test]
+fn concurrent_rustdoc_flag_selections_have_separate_consistent_caches() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        "#[cfg(first)] pub fn item(_: u8) {}\n#[cfg(not(first))] pub fn item(_: u16) {}",
+    )
+    .unwrap();
+    let import = "use alias::{item as First, item as Second};";
+    let mut first = query_command(dir.path(), import, &[]);
+    first
+        .env("RUSTDOCFLAGS", "--cfg first")
+        .env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
+    let mut second = query_command(dir.path(), import, &[]);
+    second
+        .env_remove("RUSTDOCFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
+    let first = first
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = second
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first = success(first.wait_with_output().unwrap());
+    let second = success(second.wait_with_output().unwrap());
+    for (report, signature) in [
+        (&first, "pub fn item(_: u8)"),
+        (&second, "pub fn item(_: u16)"),
+    ] {
+        assert_eq!(report.matches(signature).count(), 2, "{report}");
+    }
+    let first_pages = paths(&first, "markdown: ");
+    let second_pages = paths(&second, "markdown: ");
+    assert_eq!(first_pages[0], first_pages[1]);
+    assert_eq!(second_pages[0], second_pages[1]);
+    assert_ne!(first_pages[0], second_pages[0]);
+}

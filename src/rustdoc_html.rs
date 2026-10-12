@@ -1,4 +1,5 @@
-use crate::cargo_graph::FeatureGraph;
+use crate::cargo_graph::{self, FeatureGraph};
+use crate::cli::FeatureSelection;
 use crate::imports::{ImportPath, NamespaceConstraint, identifier_key};
 use crate::resolver::{ResolvedDependency, package_spec};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
@@ -12,6 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+pub(crate) struct Documentation {
+    pub(crate) directory: PathBuf,
+    _generation_lock: fs::File,
+}
+
 pub(crate) fn generate(
     manifest: &Path,
     metadata: &Metadata,
@@ -19,7 +25,7 @@ pub(crate) fn generate(
     dependency: &ResolvedDependency<'_>,
     graph: &FeatureGraph,
     host_context: bool,
-) -> Result<PathBuf, String> {
+) -> Result<Documentation, String> {
     let package = dependency.package;
     let contents = documentation_manifest(metadata, graph, package, host_context)?;
     let lock = fs::read(metadata.workspace_root.join("Cargo.lock"))
@@ -31,7 +37,35 @@ pub(crate) fn generate(
     package.manifest_path.hash(&mut identity);
     contents.hash(&mut identity);
     target.hash(&mut identity);
-    std::env::var_os("CARGO_BUILD_TARGET").hash(&mut identity);
+    for name in [
+        "CARGO_BUILD_TARGET",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_ENCODED_RUSTDOCFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_RUSTDOCFLAGS",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_TOOLCHAIN",
+    ] {
+        name.hash(&mut identity);
+        std::env::var_os(name).hash(&mut identity);
+    }
+    let mut target_flags = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            name.starts_with("CARGO_TARGET_") && name.ends_with("_RUSTFLAGS")
+        })
+        .collect::<Vec<_>>();
+    target_flags.sort();
+    target_flags.hash(&mut identity);
     lock.hash(&mut identity);
     let mut configuration = manifest
         .parent()
@@ -84,8 +118,7 @@ pub(crate) fn generate(
         })
         .map_err(|error| format!("cannot prepare documentation manifest: {error}"))?;
     }
-    // The isolated manifest turns registry/git packages into path dependencies.
-    // Ask Cargo for that graph's identity rather than dropping the source.
+    // The copied lockfile pins the original registry versions and Git revisions.
     let generated_metadata = MetadataCommand::new()
         .manifest_path(&generated_manifest)
         .current_dir(manifest.parent().expect("manifest has a parent"))
@@ -95,17 +128,61 @@ pub(crate) fn generate(
     let documented = generated_metadata
         .packages
         .iter()
-        .find(|candidate| candidate.manifest_path == package.manifest_path)
+        .find(|candidate| candidate.id == package.id)
         .ok_or_else(|| {
             format!(
                 "documented package {} missing from isolated graph",
                 package.id
             )
         })?;
+    let generated_graph = cargo_graph::features(
+        manifest,
+        &generated_metadata,
+        generated_metadata
+            .root_package()
+            .expect("documentation manifest has a root package"),
+        &FeatureSelection::default(),
+        target,
+        false,
+    )?;
+    let expected = graph
+        .closure((package.id.clone(), host_context))?
+        .into_iter()
+        .map(|unit| (unit.package.clone(), unit.host, unit.features.clone()))
+        .collect::<HashSet<_>>();
+    let proc_macro = dependency
+        .target
+        .kind
+        .iter()
+        .any(|kind| kind == "proc-macro");
+    let actual = generated_graph
+        .closure((documented.id.clone(), proc_macro))?
+        .into_iter()
+        .map(|unit| {
+            (
+                unit.package.clone(),
+                host_context || unit.host,
+                unit.features.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "documentation graph changed Cargo package, host, or feature context for {}",
+            package.id
+        ));
+    }
     let mut command = Command::new("cargo");
     command.current_dir(manifest.parent().expect("manifest has a parent"));
     command
-        .args(["doc", "--offline", "--no-deps", "--lib", "--manifest-path"])
+        .args([
+            "doc",
+            "--offline",
+            "--locked",
+            "--no-deps",
+            "--lib",
+            "--manifest-path",
+        ])
         .arg(&generated_manifest);
     command
         .args(["--package", &package_spec(documented), "--target-dir"])
@@ -126,7 +203,10 @@ pub(crate) fn generate(
     }
     let docs = documentation_dir(generation.join("build").as_std_path())?;
     convert_crate(&docs, &docs.join(dependency.target.name.replace('-', "_")))?;
-    Ok(docs)
+    Ok(Documentation {
+        directory: docs,
+        _generation_lock: generation_lock,
+    })
 }
 
 fn documentation_manifest(
@@ -143,16 +223,10 @@ fn documentation_manifest(
     let mut manifest = format!(
         "[package]\nname = \"excra-doc\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
          [lib]\npath = \"lib.rs\"\n[workspace]\nresolver = {}\n[dependencies]\n\
-         documented = {{ package = {}, path = {}, default-features = false, features = {} }}\n",
+         documented = {{ package = {}, {}, default-features = false, features = {} }}\n",
         quoted(&resolver_version(metadata)?),
         quoted(&package.name),
-        quoted(
-            package
-                .manifest_path
-                .parent()
-                .expect("manifest has a parent")
-                .as_str()
-        ),
+        dependency_source(package)?,
         serde_json::to_string(&selected.features).expect("feature names serialize"),
     );
     for build in [false, true] {
@@ -191,20 +265,7 @@ fn documentation_manifest(
                         .expect("unit is in closure")
                 )
             };
-            let source = if unit.package == package.id {
-                format!(
-                    "path = {}",
-                    quoted(
-                        package
-                            .manifest_path
-                            .parent()
-                            .expect("manifest has a parent")
-                            .as_str()
-                    )
-                )
-            } else {
-                dependency_source(dependency)?
-            };
+            let source = dependency_source(dependency)?;
             manifest.push_str(&format!(
                 "{alias} = {{ package = {}, {source}, default-features = false, features = {} }}\n",
                 quoted(&dependency.name),
@@ -637,6 +698,87 @@ fn code_node(ctx: &NodeContext<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readers_keep_the_generation_lock_during_source_regeneration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("api")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n[dependencies]\napi = { path = \"api\" }\n[workspace]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("lib.rs"), "").unwrap();
+        fs::write(
+            root.join("api/Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+        )
+        .unwrap();
+        let source = root.join("api/lib.rs");
+        fs::write(&source, "pub fn item(_: u8) {}").unwrap();
+        let manifest = root.join("Cargo.toml");
+        let metadata = MetadataCommand::new()
+            .manifest_path(&manifest)
+            .other_options(vec!["--offline".into()])
+            .exec()
+            .unwrap();
+        let graph = cargo_graph::features(
+            &manifest,
+            &metadata,
+            metadata.root_package().unwrap(),
+            &FeatureSelection::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let package = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "api")
+            .unwrap();
+        let dependency = ResolvedDependency {
+            package,
+            target: crate::resolver::library_target(package).unwrap(),
+            contexts: Vec::new(),
+        };
+        let docs = generate(&manifest, &metadata, None, &dependency, &graph, false).unwrap();
+        let import = crate::imports::parse_use_lines("use api::item;")
+            .unwrap()
+            .remove(0);
+        let page = find_page(&docs.directory, "api", &import).unwrap();
+        let lock = docs
+            .directory
+            .ancestors()
+            .find(|path| path.join("Cargo.toml").is_file())
+            .unwrap()
+            .join(".lock");
+        fs::write(&source, "pub fn item(_: u16) {}").unwrap();
+        let (ready, waiting) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let contender = fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(&lock)
+                    .unwrap();
+                assert!(contender.try_lock().is_err(), "reader released its lock");
+                ready.send(()).unwrap();
+                let next =
+                    generate(&manifest, &metadata, None, &dependency, &graph, false).unwrap();
+                assert_eq!(next.directory, page.parent().unwrap().parent().unwrap());
+                fs::read_to_string(page.with_extension("md")).unwrap()
+            });
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            let content = fs::read_to_string(page.with_extension("md")).unwrap();
+            assert!(content.contains("pub fn item(_: u8)"), "{content}");
+            drop(docs);
+            let content = writer.join().unwrap();
+            assert!(content.contains("pub fn item(_: u16)"), "{content}");
+        });
+    }
 
     #[test]
     fn failed_atomic_writes_leave_no_partial_cache_or_replace_valid_content() {

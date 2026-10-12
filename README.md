@@ -67,14 +67,15 @@ The normal pipeline is:
 ```text
 cargo metadata --locked
 cargo tree --offline --locked --package <consumer>
-cargo doc --offline --no-deps --lib --package <requested-crate>
+cargo doc --offline --locked --no-deps --lib --package <requested-crate>
 all requested-crate HTML API pages → html-to-markdown-rs → .md files
 requested item pages → stdout
 ```
 
-Excra creates a small isolated Cargo manifest pointing at the resolved crate's
-local source, preserving the workspace resolver, applicable features throughout
-its dependency closure, and a copy of the project's lockfile.
+Excra creates a small isolated Cargo manifest preserving the resolved crate's
+source identity, workspace resolver, applicable features throughout its dependency
+closure, and a copy of the project's lockfile. It verifies the isolated package,
+host/target, and feature contexts before documentation, including locked Git revisions.
 Only that crate is documented. Its required dependencies may be compiled;
 the consuming application and unrelated dependencies are not built or documented.
 Cargo runs from the queried project's directory, using its installed toolchain
@@ -83,9 +84,11 @@ The isolated manifest uses its default development profile; root manifest
 profile and patch overrides are not copied.
 
 HTML, Markdown, and build artifacts remain under `target/excra/docs-*`, relative
-to Cargo's target directory. Matching crate, feature, target, lockfile, and Cargo
-configuration selections reuse build artifacts and unchanged Markdown. Other
-selections use separate directories. Cargo progress is displayed on stderr. Remove
+to Cargo's target directory. Matching crate, feature, target, lockfile, Cargo
+configuration, compiler, and rustdoc flag selections reuse build artifacts and
+unchanged Markdown. Other selections use separate directories. Each crate's cache
+stays locked until its requested reports have been copied into memory.
+Cargo progress is displayed on stderr. Remove
 `target/excra` when you no longer need the generated files.
 
 Markdown files sit beside their HTML pages, keeping relative source and API

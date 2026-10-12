@@ -224,9 +224,11 @@ pub(crate) fn package_dependencies_for_platform(
     let mut dependencies = index_dependencies(metadata, package_id, filter, Some((platform, host)));
     dependencies.entries.retain(|_, entries| {
         entries.retain_mut(|entry| {
-            entry
-                .contexts
-                .retain(|context| features.direct_dependency(&entry.package_id, context.kind));
+            entry.contexts.retain(|context| {
+                features
+                    .direct_dependency(&entry.package_id, context.kind)
+                    .is_some()
+            });
             !entry.contexts.is_empty()
         });
         !entries.is_empty()

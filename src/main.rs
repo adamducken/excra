@@ -117,56 +117,65 @@ fn run() -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
+        .map(|(import, dependency)| {
+            let unit = feature_graph
+                .direct_dependency(&dependency.package.id, dependency.contexts[0].kind)
+                .expect("dependency contexts were filtered against the feature graph");
+            (import, dependency, unit)
+        })
         .collect::<Vec<_>>();
     let mut reports = Vec::new();
     for build in [false, true] {
         let group = queries
             .iter()
-            .filter(|(_, dep)| (dep.contexts[0].kind == DependencyKind::Build) == build)
+            .filter(|(_, dep, _)| (dep.contexts[0].kind == DependencyKind::Build) == build)
             .collect::<Vec<_>>();
         if group.is_empty() {
             continue;
         }
-        let mut generated = HashMap::new();
-        for (import, dependency) in group {
-            let host_context = build
-                || dependency
-                    .target
-                    .kind
-                    .iter()
-                    .any(|kind| kind == "proc-macro");
+        let mut reports_for_group = vec![String::new(); group.len()];
+        let mut by_unit = HashMap::new();
+        for (index, query) in group.into_iter().enumerate() {
+            by_unit
+                .entry(query.2.clone())
+                .or_insert_with(Vec::new)
+                .push((index, query));
+        }
+        for (unit, queries) in by_unit {
+            let (_, (_, dependency, _)) = queries[0];
+            let host_context = unit.1;
             let target = if host_context {
                 Some(host.as_str())
             } else {
                 args.target.as_deref()
             };
-            let docs = if let Some(docs) = generated.get(&dependency.package.id) {
-                docs
-            } else {
-                let docs = rustdoc_html::generate(
-                    &manifest,
-                    &metadata,
-                    target,
-                    dependency,
-                    &feature_graph,
-                    host_context,
-                )?;
-                generated
-                    .entry(dependency.package.id.clone())
-                    .or_insert(docs)
-            };
-            let page =
-                rustdoc_html::find_page(docs, &dependency.target.name.replace('-', "_"), import)?;
-            let markdown = page.with_extension("md");
-            reports.push(render_report(
-                root,
+            let docs = rustdoc_html::generate(
+                &manifest,
+                &metadata,
+                target,
                 dependency,
-                import,
-                &args.feature_selection,
-                &page,
-                &markdown,
-            )?);
+                &feature_graph,
+                host_context,
+            )?;
+            // Keep only one crate lock at a time, through every page read.
+            for (index, (import, dependency, _)) in queries {
+                let page = rustdoc_html::find_page(
+                    &docs.directory,
+                    &dependency.target.name.replace('-', "_"),
+                    import,
+                )?;
+                let markdown = page.with_extension("md");
+                reports_for_group[index] = render_report(
+                    root,
+                    dependency,
+                    import,
+                    &args.feature_selection,
+                    &page,
+                    &markdown,
+                )?;
+            }
         }
+        reports.extend(reports_for_group);
     }
     println!("{}", reports.join("\n"));
     Ok(())
