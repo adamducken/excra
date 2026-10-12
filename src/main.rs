@@ -1,3 +1,4 @@
+mod cargo_graph;
 mod cli;
 mod imports;
 mod resolver;
@@ -5,10 +6,10 @@ mod rustdoc_html;
 
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package};
 use cli::{FeatureSelection, ParsedCommand};
-use resolver::{DependencyFilter, ResolvedDependency, package_dependencies, select_package};
+use resolver::{DependencyFilter, ResolvedDependency, select_package};
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match run() {
@@ -54,48 +55,33 @@ fn run() -> Result<(), String> {
     let metadata = metadata_for(
         selected.manifest_path.as_std_path(),
         &manifest,
-        args.target.as_deref(),
+        None,
         &metadata_features,
         false,
     )?;
     let root = select_package(&metadata, &manifest, args.package.as_deref())?;
-    let mut dependencies = package_dependencies(
+    let target_platform = cargo_graph::platform(&manifest, &metadata, args.target.as_deref())?;
+    let host = cargo_graph::host_triple(&manifest, &metadata)?;
+    let host_platform = cargo_graph::platform(&manifest, &metadata, Some(&host))?;
+    let feature_graph = cargo_graph::features(
+        &manifest,
+        &metadata,
+        root,
+        &args.feature_selection,
+        args.target.as_deref(),
+        args.include_dev,
+    )?;
+    let dependencies = resolver::package_dependencies_for_platform(
         &metadata,
         &root.id,
         DependencyFilter {
             include_dev: args.include_dev,
-            include_build: false,
+            include_build: args.include_build,
         },
+        &target_platform,
+        &host_platform,
+        &feature_graph,
     );
-    let host = if args.include_build {
-        Some(host_triple(&manifest)?)
-    } else {
-        None
-    };
-    let host_metadata = if let Some(host) = &host {
-        let host_metadata = metadata_for(
-            root.manifest_path.as_std_path(),
-            &manifest,
-            Some(host),
-            &metadata_features,
-            false,
-        )?;
-        resolver::merge_dependency_kind(
-            &mut dependencies,
-            package_dependencies(
-                &host_metadata,
-                &root.id,
-                DependencyFilter {
-                    include_dev: false,
-                    include_build: true,
-                },
-            ),
-            DependencyKind::Build,
-        );
-        Some(host_metadata)
-    } else {
-        None
-    };
 
     let queries = imports
         .iter()
@@ -141,22 +127,30 @@ fn run() -> Result<(), String> {
         if group.is_empty() {
             continue;
         }
-        let context_metadata = if build {
-            host_metadata.as_ref().expect("build metadata loaded")
-        } else {
-            &metadata
-        };
-        let target = if build {
-            host.as_deref()
-        } else {
-            args.target.as_deref()
-        };
         let mut generated = HashMap::new();
         for (import, dependency) in group {
+            let host_context = build
+                || dependency
+                    .target
+                    .kind
+                    .iter()
+                    .any(|kind| kind == "proc-macro");
+            let target = if host_context {
+                Some(host.as_str())
+            } else {
+                args.target.as_deref()
+            };
             let docs = if let Some(docs) = generated.get(&dependency.package.id) {
                 docs
             } else {
-                let docs = rustdoc_html::generate(&manifest, context_metadata, target, dependency)?;
+                let docs = rustdoc_html::generate(
+                    &manifest,
+                    &metadata,
+                    target,
+                    dependency,
+                    &feature_graph,
+                    host_context,
+                )?;
                 generated
                     .entry(dependency.package.id.clone())
                     .or_insert(docs)
@@ -176,25 +170,6 @@ fn run() -> Result<(), String> {
     }
     println!("{}", reports.join("\n"));
     Ok(())
-}
-
-fn host_triple(manifest: &Path) -> Result<String, String> {
-    let output = Command::new("rustc")
-        .arg("-vV")
-        .current_dir(manifest.parent().expect("manifest has a parent"))
-        .output()
-        .map_err(|error| format!("cannot run rustc: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustc failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .map(str::to_string)
-        .ok_or_else(|| "rustc did not report a host target".into())
 }
 
 fn package_features(package: &Package, selection: &FeatureSelection) -> FeatureSelection {
@@ -275,6 +250,9 @@ fn render_report(
 ) -> Result<String, String> {
     let content = std::fs::read_to_string(markdown)
         .map_err(|error| format!("cannot read {}: {error}", markdown.display()))?;
+    if content.trim().is_empty() {
+        return Err(format!("empty Markdown in {}", markdown.display()));
+    }
     let contexts = dependency
         .contexts
         .iter()

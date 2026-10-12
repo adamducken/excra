@@ -204,10 +204,44 @@ pub(crate) fn select_package<'a>(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn package_dependencies(
     metadata: &Metadata,
     package_id: &PackageId,
     filter: DependencyFilter,
+) -> DependencyIndex {
+    index_dependencies(metadata, package_id, filter, None)
+}
+
+pub(crate) fn package_dependencies_for_platform(
+    metadata: &Metadata,
+    package_id: &PackageId,
+    filter: DependencyFilter,
+    platform: &crate::cargo_graph::TargetPlatform,
+    host: &crate::cargo_graph::TargetPlatform,
+    features: &crate::cargo_graph::FeatureGraph,
+) -> DependencyIndex {
+    let mut dependencies = index_dependencies(metadata, package_id, filter, Some((platform, host)));
+    dependencies.entries.retain(|_, entries| {
+        entries.retain_mut(|entry| {
+            entry
+                .contexts
+                .retain(|context| features.direct_dependency(&entry.package_id, context.kind));
+            !entry.contexts.is_empty()
+        });
+        !entries.is_empty()
+    });
+    dependencies
+}
+
+fn index_dependencies(
+    metadata: &Metadata,
+    package_id: &PackageId,
+    filter: DependencyFilter,
+    platform: Option<(
+        &crate::cargo_graph::TargetPlatform,
+        &crate::cargo_graph::TargetPlatform,
+    )>,
 ) -> DependencyIndex {
     let mut deps = DependencyIndex::default();
     if let Some(resolve) = metadata.resolve.as_ref()
@@ -215,6 +249,16 @@ pub(crate) fn package_dependencies(
     {
         for dep in &node.deps {
             for dep_kind in &dep.dep_kinds {
+                if platform.is_some_and(|(target, host)| {
+                    let platform = if dep_kind.kind == DependencyKind::Build {
+                        host
+                    } else {
+                        target
+                    };
+                    !platform.matches(dep_kind.target.as_ref())
+                }) {
+                    continue;
+                }
                 if !dependency_kind_allowed(dep_kind.kind, filter) {
                     let excluded = deps.excluded.entry(dep.name.replace('-', "_")).or_default();
                     match dep_kind.kind {
@@ -240,6 +284,7 @@ pub(crate) fn package_dependencies(
     deps
 }
 
+#[cfg(test)]
 pub(crate) fn merge_dependency_kind(
     dependencies: &mut DependencyIndex,
     additional: DependencyIndex,

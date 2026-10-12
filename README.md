@@ -55,9 +55,10 @@ excra 'use dev_dependency::Item;' --include-dev
 excra 'use build_dependency::Item;' --include-build
 ```
 
-Requested crates use their Cargo-resolved features. Normal and dev contexts
-share documentation; build documentation uses the compiler host. Build-only
-dependencies outside the workspace are supported.
+Requested crates use features from Cargo's selected package, dependency context,
+and effective target. Dev features join normal documentation with `--include-dev`;
+build features stay separate under resolvers 2 and 3. Build documentation uses
+the compiler host. Build-only dependencies outside the workspace are supported.
 
 ## How it works
 
@@ -65,13 +66,15 @@ The normal pipeline is:
 
 ```text
 cargo metadata --locked
+cargo tree --offline --locked --package <consumer>
 cargo doc --offline --no-deps --lib --package <requested-crate>
 all requested-crate HTML API pages → html-to-markdown-rs → .md files
 requested item pages → stdout
 ```
 
 Excra creates a small isolated Cargo manifest pointing at the resolved crate's
-local source, with its selected features and a copy of the project's lockfile.
+local source, preserving the workspace resolver, applicable features throughout
+its dependency closure, and a copy of the project's lockfile.
 Only that crate is documented. Its required dependencies may be compiled;
 the consuming application and unrelated dependencies are not built or documented.
 Cargo runs from the queried project's directory, using its installed toolchain

@@ -16,9 +16,11 @@ name = "excra"
 path = "src/main.rs"
 
 [dependencies]
+cargo-platform = "0.1"
 cargo_metadata = "0.18"
 html-to-markdown-rs = { version = "3", default-features = false, features = ["visitor"] }
+serde_json = "1"
 syn = { version = "2", default-features = false, features = ["full", "parsing"] }
-
-[dev-dependencies]
 tempfile = "3"
+toml = { version = "0.9", default-features = false, features = ["parse", "std", "serde"] }
+url = "2"

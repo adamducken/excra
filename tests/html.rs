@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 fn member(root: &Path, name: &str, manifest: &str, source: &str) {
@@ -135,7 +135,12 @@ enabled = []
 }
 
 fn query(root: &Path, import: &str, flags: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_excra"))
+    query_command(root, import, flags).output().unwrap()
+}
+
+fn query_command(root: &Path, import: &str, flags: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_excra"));
+    command
         .arg(import)
         .arg("--root")
         .arg(root)
@@ -143,9 +148,8 @@ fn query(root: &Path, import: &str, flags: &[&str]) -> Output {
         .args(flags)
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TERM_COLOR", "never")
-        .env("RUSTC_BOOTSTRAP", "0")
-        .output()
-        .unwrap()
+        .env("RUSTC_BOOTSTRAP", "0");
+    command
 }
 
 fn success(output: Output) -> String {
@@ -613,4 +617,439 @@ fn help_and_relative_member_roots_work() {
         .output()
         .unwrap();
     assert!(success(output).contains("pub struct Record"));
+}
+
+#[test]
+fn documentation_selects_the_source_when_name_and_version_collide() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nexclude = [\"api\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    member(
+        root,
+        "app",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nalias = { package = \"review_api\", path = \"../api\" }\n",
+        "pub use alias::Item;",
+    );
+    member(
+        root,
+        "api",
+        "[package]\nname = \"review_api\"\nversion = \"1.0.0\"\nedition = \"2024\"\n[dependencies]\ninner = { package = \"review_api\", version = \"1.0.0\" }\n",
+        "pub struct Item { pub inner: inner::Item }",
+    );
+    member(
+        root,
+        "vendor/review_api-1.0.0",
+        "[package]\nname = \"review_api\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+        "pub struct Item;",
+    );
+    fs::write(
+        root.join("vendor/review_api-1.0.0/.cargo-checksum.json"),
+        r#"{"package":null,"files":{}}"#,
+    )
+    .unwrap();
+    fs::create_dir(root.join(".cargo")).unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = \"vendored\"\n[source.vendored]\ndirectory = {:?}\n",
+            root.join("vendor")
+        ),
+    )
+    .unwrap();
+    let locked = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(locked.status.success());
+    let report = success(query(root, "use alias::Item;", &[]));
+    assert!(report.contains("pub inner: Item"), "{report}");
+}
+
+#[test]
+fn signature_links_preserve_pointer_token_boundaries() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub struct Item;
+impl Item {
+    pub fn pointer(&self, value: *const u8) -> *const u8 { value }
+    pub fn mut_pointer(&self, value: *mut Item) -> *mut Item { value }
+    pub fn generic<T>(&self, value: T) -> T { value }
+}
+/// See [Item].
+pub fn pointer(value: *const Item) -> *const Item { value }
+"#,
+    )
+    .unwrap();
+    let report = success(query(dir.path(), "use alias::{Item, pointer};", &[]));
+    for signature in [
+        "pub fn pointer(&self, value: *const u8) -> *const u8",
+        "pub fn mut_pointer(&self, value: *mut Item) -> *mut Item",
+        "pub fn pointer(value: *const Item) -> *const Item",
+    ] {
+        assert!(report.contains(signature), "missing {signature}: {report}");
+    }
+    assert!(report.contains("[Item](struct.Item.html"), "{report}");
+    assert!(
+        report.contains("#### `pub fn generic<T>(&self, value: T) -> T`"),
+        "{report}"
+    );
+}
+
+#[test]
+fn non_inlined_reexports_participate_in_namespace_and_ambiguity_checks() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub mod original { pub struct Mixed; }
+#[doc(no_inline)] pub use original::Mixed;
+#[macro_export] macro_rules! Mixed { () => { 1 }; }
+#[doc(no_inline)] pub use Mixed as OnlyMacroAndType;
+#[macro_export] macro_rules! make { () => { 1 }; }
+#[doc(no_inline)] pub use make as OnlyMacro;
+"#,
+    )
+    .unwrap();
+    for name in ["Mixed", "OnlyMacroAndType"] {
+        assert!(
+            failure(query(dir.path(), &format!("use alias::{name};"), &[])).contains("ambiguous")
+        );
+        let report = success(query(
+            dir.path(),
+            &format!("use alias::{name}::{{self}};"),
+            &[],
+        ));
+        assert!(report.contains("pub struct Mixed"));
+    }
+    assert!(success(query(dir.path(), "use alias::OnlyMacro;", &[])).contains("macro_rules! make"));
+    assert!(failure(query(dir.path(), "use alias::OnlyMacro::{self};", &[])).contains("not found"));
+}
+
+#[test]
+fn empty_cached_markdown_is_repaired_and_concurrent_queries_are_complete() {
+    let dir = project();
+    let mut first = query_command(dir.path(), "use alias::Record;", &[]);
+    let mut second = query_command(dir.path(), "use alias::Record;", &[]);
+    let first = first
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = second
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first = success(first.wait_with_output().unwrap());
+    let second = success(second.wait_with_output().unwrap());
+    assert!(first.contains("pub struct Record"));
+    assert_eq!(first, second);
+    let markdown = &paths(&first, "markdown: ")[0];
+    fs::write(markdown, "").unwrap();
+    let repaired = success(query(dir.path(), "use alias::Record;", &[]));
+    assert!(repaired.contains("pub struct Record"));
+    assert!(!fs::read_to_string(markdown).unwrap().is_empty());
+}
+
+#[test]
+fn inactive_platform_dependencies_and_coalesced_contexts_are_filtered() {
+    let dir = project();
+    let root = dir.path();
+    member(
+        root,
+        "windows-api",
+        "[package]\nname = \"windows-api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "pub struct WindowsOnly;",
+    );
+    let manifest = root.join("app/Cargo.toml");
+    let additions = r#"
+[target.'cfg(windows)'.dependencies]
+windows_api = { package = "windows-api", path = "../windows-api" }
+alias = { package = "api", path = "../api", default-features = false }
+[target.'cfg(windows)'.dev-dependencies]
+alias = { package = "api", path = "../api", default-features = false }
+[target.'cfg(windows)'.build-dependencies]
+windows_api = { package = "windows-api", path = "../windows-api" }
+build_api = { package = "build-api", path = "../build-api", default-features = false, features = ["enabled"] }
+"#;
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest).unwrap() + additions,
+    )
+    .unwrap();
+    let locked = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(locked.status.success());
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    // The fixture's inactive predicate must be opposite the compiler host.
+    if cfg!(windows) {
+        fs::write(
+            &manifest,
+            fs::read_to_string(&manifest)
+                .unwrap()
+                .replace("cfg(windows)", "cfg(unix)"),
+        )
+        .unwrap();
+    }
+    for flags in [vec![], vec!["--target", host], vec!["--include-dev"]] {
+        assert!(
+            failure(query(root, "use windows_api::WindowsOnly;", &flags))
+                .contains("not a direct dependency")
+        );
+        let report = success(query(root, "use alias::Record;", &flags));
+        assert!(report.contains("dependency: normal\n"), "{report}");
+    }
+    // A build dependency's predicate and documentation use the compiler host,
+    // even when the selected consumer target has the opposite OS.
+    let other_target = if cfg!(windows) {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        "x86_64-pc-windows-gnu"
+    };
+    let flags = ["--target", other_target, "--include-build"];
+    let report = success(query(root, "use build_api::Enabled;", &flags));
+    assert!(report.contains("dependency: build\n"), "{report}");
+    assert!(report.contains("pub struct Enabled"));
+    assert!(
+        failure(query(
+            root,
+            "use windows_api::WindowsOnly;",
+            &["--include-build"]
+        ))
+        .contains("not a direct dependency")
+    );
+    fs::create_dir(root.join(".cargo")).unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        format!("[build]\ntarget = \"{host}\"\n"),
+    )
+    .unwrap();
+    assert!(
+        failure(query(root, "use windows_api::WindowsOnly;", &[]))
+            .contains("not a direct dependency")
+    );
+    let mut command = query_command(root, "use windows_api::WindowsOnly;", &[]);
+    command.env("CARGO_BUILD_TARGET", host);
+    assert!(failure(command.output().unwrap()).contains("not a direct dependency"));
+}
+
+#[test]
+fn features_are_selected_per_package_platform_and_normal_build_dev_context() {
+    let dir = project();
+    let root = dir.path();
+    member(
+        root,
+        "app",
+        r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+alias = { package = "api", path = "../api", default-features = false, features = ["normal"] }
+[build-dependencies]
+alias = { package = "api", path = "../api", default-features = false, features = ["build"] }
+[dev-dependencies]
+alias = { package = "api", path = "../api", default-features = false, features = ["dev"] }
+[target.'cfg(target_os = "none")'.dependencies]
+alias = { package = "api", path = "../api", default-features = false, features = ["inactive"] }
+"#,
+        "pub use alias::Normal;",
+    );
+    fs::write(
+        root.join("app/build.rs"),
+        "fn main() { let _ = alias::Build; }",
+    )
+    .unwrap();
+    member(
+        root,
+        "api",
+        r#"
+[package]
+name = "api"
+version = "1.2.3"
+edition = "2024"
+[features]
+normal = []
+build = []
+dev = []
+unselected = []
+inactive = []
+"#,
+        r#"
+pub struct Record;
+#[cfg(feature = "normal")] pub struct Normal;
+#[cfg(feature = "build")] pub struct Build;
+impl Record {
+    #[cfg(feature = "normal")] pub fn normal() {}
+    #[cfg(feature = "build")] pub fn build() {}
+    #[cfg(feature = "dev")] pub fn dev() {}
+    #[cfg(feature = "unselected")] pub fn unselected() {}
+    #[cfg(feature = "inactive")] pub fn inactive() {}
+}
+
+"#,
+    );
+    let unselected = root.join("build-api/Cargo.toml");
+    fs::write(
+        &unselected,
+        fs::read_to_string(&unselected).unwrap()
+            + "\n[dependencies]\napi = { path = \"../api\", features = [\"unselected\"] }\n",
+    )
+    .unwrap();
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--package", "app"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    for target_flags in [vec![], vec!["--target", host]] {
+        for include_dev in [false, true] {
+            let mut flags = target_flags.clone();
+            flags.push("--include-build");
+            if include_dev {
+                flags.push("--include-dev");
+            }
+            let report = success(query(root, "use alias::Record;", &flags));
+            let pages = paths(&report, "markdown: ");
+            assert_eq!(pages.len(), 2);
+            for (page, build) in pages.iter().zip([false, true]) {
+                let content = fs::read_to_string(page).unwrap();
+                for (feature, enabled) in [
+                    ("normal", !build),
+                    ("build", build),
+                    ("dev", !build && include_dev),
+                    ("unselected", false),
+                    ("inactive", false),
+                ] {
+                    assert_eq!(
+                        content.contains(&format!("fn {feature}(")),
+                        enabled,
+                        "{feature}: {content}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn isolated_docs_preserve_unified_transitive_features_and_resolver_policy() {
+    for resolver in ["1", "2", "3"] {
+        let dir = project();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), format!(
+            "[workspace]\nmembers = [\"app\"]\nexclude = [\"api\", \"inner\"]\nresolver = \"{resolver}\"\n"
+        )).unwrap();
+        member(
+            root,
+            "app",
+            r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+alias = { package = "api", path = "../api" }
+inner = { path = "../inner", features = ["extra"] }
+[build-dependencies]
+inner = { path = "../inner", features = ["host"] }
+"#,
+            "pub use alias::{Kind::Extra as Variant, Extra};",
+        );
+        member(
+            root,
+            "api",
+            r#"
+[package]
+name = "api"
+version = "1.2.3"
+edition = "2024"
+[dependencies]
+inner = { path = "../inner" }
+[build-dependencies]
+inner = { path = "../inner" }
+"#,
+            "pub use inner::{Kind, Extra};",
+        );
+        fs::write(
+            root.join("api/build.rs"),
+            "fn main() { let _ = inner::Host; }",
+        )
+        .unwrap();
+        member(
+            root,
+            "inner",
+            r#"
+[package]
+name = "inner"
+version = "0.1.0"
+edition = "2024"
+[features]
+extra = []
+host = []
+"#,
+            r#"
+pub enum Kind {
+    Base,
+    #[cfg(feature = "extra")] Extra,
+    #[cfg(feature = "host")] Host,
+}
+#[cfg(feature = "extra")] pub struct Extra;
+#[cfg(feature = "host")] pub struct Host;
+"#,
+        );
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let report = success(query(root, "use alias::{Kind, Kind::Extra, Extra};", &[]));
+        assert!(report.contains("pub struct Extra"), "{report}");
+        let pages = paths(&report, "markdown: ");
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0], pages[1]);
+        let content = fs::read_to_string(&pages[0]).unwrap();
+        assert!(content.contains("Extra"), "{content}");
+        assert_eq!(content.contains("Host"), resolver == "1", "{content}");
+        let generation = pages[0]
+            .ancestors()
+            .find(|path| path.join("Cargo.toml").is_file())
+            .unwrap();
+        let manifest = fs::read_to_string(generation.join("Cargo.toml"))
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(manifest["workspace"]["resolver"].as_str(), Some(resolver));
+    }
 }
