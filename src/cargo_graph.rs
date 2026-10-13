@@ -97,6 +97,10 @@ pub(crate) struct FeatureGraph {
 }
 
 impl FeatureGraph {
+    pub(crate) fn root_is_host(&self) -> bool {
+        self.root.1
+    }
+
     pub(crate) fn direct_dependency(
         &self,
         package: &PackageId,

@@ -268,7 +268,7 @@ fn render_report(
         .map(|context| context.label())
         .collect::<Vec<_>>()
         .join(", ");
-    let path = if import.namespace.is_some() {
+    let path = if import.self_parent {
         format!("{}::{{self}}", import.full_path())
     } else {
         import.full_path()

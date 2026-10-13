@@ -703,12 +703,205 @@ pub fn pointer(value: *const Item) -> *const Item { value }
 }
 
 #[test]
+fn irrelevant_external_macro_reexports_do_not_block_local_modules() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub mod concat { pub struct Item; }
+#[doc(no_inline)] pub use core::concat;
+#[doc(no_inline)] pub use core::concat as OnlyExternal;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app/src/lib.rs"),
+        "use alias::concat::{self, Item};",
+    )
+    .unwrap();
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--locked", "--package", "app"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{:?}", checked);
+    for import in ["use alias::concat::{self};", "use alias::concat::Item;"] {
+        let report = success(query(dir.path(), import, &[]));
+        assert!(report.contains("Item"), "{report}");
+    }
+    let error = failure(query(dir.path(), "use alias::OnlyExternal;", &[]));
+    assert!(error.contains("rustdoc link 'https://doc.rust-lang.org/"));
+    assert!(error.contains("is unavailable"));
+}
+
+#[test]
+fn local_non_inlined_globs_resolve_concrete_names_and_preserve_precedence() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub mod one {
+    pub struct Item;
+    pub struct Shadowed { pub from_glob: u8 }
+    pub struct Clash;
+    pub enum Choice { Variant }
+    #[doc(no_inline)] pub use Choice::*;
+    #[doc(no_inline)] pub use super::two::*;
+}
+pub mod two {
+    pub struct Second;
+    pub struct Clash;
+    #[doc(no_inline)] pub use super::one::*;
+}
+#[doc(no_inline)] pub use one::*;
+#[doc(no_inline)] pub use two::*;
+pub struct Shadowed { pub explicit: u8 }
+#[macro_export] macro_rules! exported { () => { 1 }; }
+pub mod macros { #[doc(no_inline)] pub use crate::exported as Shared; }
+#[doc(no_inline)] pub use macros::*;
+pub mod Shared { pub struct Nested; }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app/src/lib.rs"),
+        "use alias::{Item, Second, Shadowed, Variant, Shared::{self, Nested}};",
+    )
+    .unwrap();
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--locked", "--package", "app"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{:?}", checked);
+    let report = success(query(
+        dir.path(),
+        "use alias::{Item, Second, Shadowed, Variant, Shared::{self, Nested}};",
+        &[],
+    ));
+    for text in [
+        "pub struct Item",
+        "pub struct Second",
+        "pub explicit: u8",
+        "pub enum Choice",
+        "pub struct Nested",
+    ] {
+        assert!(report.contains(text), "missing {text}: {report}");
+    }
+    assert!(!report.contains("pub from_glob"), "{report}");
+    for import in ["use alias::Clash;", "use alias::Shared;"] {
+        let output = query(dir.path(), import, &[]);
+        assert_eq!(output.status.code(), Some(2), "{import}: {output:?}");
+        assert!(failure(output).contains("ambiguous"));
+    }
+    assert!(failure(query(dir.path(), "use alias::Missing;", &[])).contains("not found"));
+    assert!(failure(query(dir.path(), "use alias::*;", &[])).contains("glob imports"));
+}
+
+#[test]
+fn glob_shadowing_tracks_type_and_value_constructor_namespaces() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub mod values {
+    pub const Unit: u8 = 1;
+    pub const Tuple: u8 = 1;
+    pub const NamedUnit: u8 = 1;
+    pub fn Record() {}
+    pub struct Combined(pub u8);
+    pub fn UnitVariant() {}
+    pub fn TupleVariant() {}
+    pub fn RecordVariant() {}
+    pub fn EmptyRecordVariant() {}
+}
+#[doc(no_inline)] pub use values::*;
+pub struct Unit;
+pub struct Tuple(pub u8);
+pub mod original { pub struct Unit; }
+#[doc(no_inline)] pub use original::Unit as NamedUnit;
+pub struct Record { pub value: u8 }
+pub struct Combined { pub value: u8 }
+pub enum E { UnitVariant, TupleVariant(u8), RecordVariant { value: u8 }, EmptyRecordVariant {} }
+#[doc(no_inline)] pub use E::{UnitVariant, TupleVariant, RecordVariant, EmptyRecordVariant};
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app/src/lib.rs"),
+        "use alias::{Unit, Tuple, NamedUnit, Record, Combined, UnitVariant, TupleVariant, RecordVariant, EmptyRecordVariant};\nfn probe() { let _: Unit = Unit; let _: Tuple = Tuple(0); let _: NamedUnit = NamedUnit; Record(); Combined(0); RecordVariant(); EmptyRecordVariant(); }",
+    )
+    .unwrap();
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--locked", "--package", "app"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{checked:?}");
+    let report = success(query(
+        dir.path(),
+        "use alias::{Unit, Tuple, NamedUnit, UnitVariant, TupleVariant};",
+        &[],
+    ));
+    assert!(report.contains("pub struct Unit"), "{report}");
+    assert!(report.contains("pub struct Tuple"), "{report}");
+    assert!(report.contains("pub enum E"), "{report}");
+    for name in ["Record", "Combined", "RecordVariant", "EmptyRecordVariant"] {
+        let error = failure(query(dir.path(), &format!("use alias::{name};"), &[]));
+        assert!(error.contains("ambiguous"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn variant_reexports_keep_their_identity_during_path_traversal() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub enum E { First, Other }
+#[doc(no_inline)] pub use E::First as Alias;
+#[doc(no_inline)] pub use E::First;
+#[doc(no_inline)] pub use E as EnumAlias;
+pub mod variants { #[doc(no_inline)] pub use super::E::*; }
+#[doc(no_inline)] pub use variants::*;
+pub mod one { #[doc(no_inline)] pub use super::E::First as Conflict; }
+pub mod two { #[doc(no_inline)] pub use super::E::Other as Conflict; }
+#[doc(no_inline)] pub use one::*;
+#[doc(no_inline)] pub use two::*;
+"#,
+    )
+    .unwrap();
+    let valid = "use alias::{Alias, First, E::Other, EnumAlias::Other as Renamed};";
+    fs::write(dir.path().join("app/src/lib.rs"), valid).unwrap();
+    let check = || {
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+    };
+    let checked = check();
+    assert!(checked.status.success(), "{checked:?}");
+    let report = success(query(dir.path(), valid, &[]));
+    assert!(report.contains("pub enum E"), "{report}");
+    for name in ["Alias", "First", "variants::First"] {
+        let import = format!("use alias::{name}::Other;");
+        fs::write(dir.path().join("app/src/lib.rs"), &import).unwrap();
+        let checked = check();
+        assert!(!checked.status.success(), "{import}: {checked:?}");
+        assert!(String::from_utf8_lossy(&checked.stderr).contains("E0432"));
+        assert!(failure(query(dir.path(), &import, &[])).contains("has no rustdoc HTML page"));
+    }
+    assert!(failure(query(dir.path(), "use alias::Conflict;", &[])).contains("ambiguous"));
+}
+
+#[test]
 fn non_inlined_reexports_participate_in_namespace_and_ambiguity_checks() {
     let dir = project();
     fs::write(
         dir.path().join("api/src/lib.rs"),
         r#"
-pub mod original { pub struct Mixed; }
+pub mod original { pub enum Mixed { Variant } }
 #[doc(no_inline)] pub use original::Mixed;
 #[macro_export] macro_rules! Mixed { () => { 1 }; }
 #[doc(no_inline)] pub use Mixed as OnlyMacroAndType;
@@ -717,6 +910,17 @@ pub mod original { pub struct Mixed; }
 "#,
     )
     .unwrap();
+    fs::write(
+        dir.path().join("app/src/lib.rs"),
+        "use alias::Mixed::{self, Variant};\nuse alias::OnlyMacroAndType::{self as Renamed};",
+    )
+    .unwrap();
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--locked", "--package", "app"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(checked.status.success(), "{checked:?}");
     for name in ["Mixed", "OnlyMacroAndType"] {
         assert!(
             failure(query(dir.path(), &format!("use alias::{name};"), &[])).contains("ambiguous")
@@ -726,10 +930,78 @@ pub mod original { pub struct Mixed; }
             &format!("use alias::{name}::{{self}};"),
             &[],
         ));
-        assert!(report.contains("pub struct Mixed"));
+        assert!(report.contains("pub enum Mixed"));
     }
     assert!(success(query(dir.path(), "use alias::OnlyMacro;", &[])).contains("macro_rules! make"));
     assert!(failure(query(dir.path(), "use alias::OnlyMacro::{self};", &[])).contains("not found"));
+}
+
+#[test]
+fn self_imports_require_module_enum_or_trait_parents() {
+    let dir = project();
+    fs::write(
+        dir.path().join("api/src/lib.rs"),
+        r#"
+pub mod module {}
+pub enum Enum { Variant }
+pub trait Trait {}
+pub struct Item;
+pub union Bits { pub value: u8 }
+pub type Alias = Item;
+pub mod globbed { pub mod Item {} }
+#[doc(no_inline)] pub use globbed::*;
+#[doc(no_inline)] pub use module as ModuleAlias;
+#[doc(no_inline)] pub use Enum as EnumAlias;
+#[doc(no_inline)] pub use Trait as TraitAlias;
+#[doc(no_inline)] pub use Item as ItemAlias;
+#[doc(no_inline)] pub use Bits as BitsAlias;
+#[doc(no_inline)] pub use Alias as TypeAlias;
+#[doc(no_inline)] pub use Enum::Variant as VariantAlias;
+#[doc(no_inline)] pub use Enum::*;
+"#,
+    )
+    .unwrap();
+    let valid = "use alias::{module::{self}, Enum::self as Renamed, Trait::{self}, ModuleAlias::{self}, EnumAlias::{self}, TraitAlias::{self}};";
+    fs::write(dir.path().join("app/src/lib.rs"), valid).unwrap();
+    let check = || {
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+    };
+    let checked = check();
+    assert!(checked.status.success(), "{checked:?}");
+    let report = success(query(dir.path(), valid, &[]));
+    for text in ["# Module module", "pub enum Enum", "pub trait Trait"] {
+        assert!(report.contains(text), "missing {text}: {report}");
+    }
+    for name in [
+        "Item",
+        "Bits",
+        "Alias",
+        "ItemAlias",
+        "BitsAlias",
+        "TypeAlias",
+        "Enum::Variant",
+        "Variant",
+        "VariantAlias",
+    ] {
+        let import = format!("use alias::{name}::{{self}};");
+        fs::write(dir.path().join("app/src/lib.rs"), &import).unwrap();
+        let checked = check();
+        assert!(!checked.status.success(), "{import}: {checked:?}");
+        assert!(String::from_utf8_lossy(&checked.stderr).contains("E0432"));
+        assert!(failure(query(dir.path(), &import, &[])).contains("self import parent"));
+    }
+    assert!(
+        success(query(
+            dir.path(),
+            "use alias::{Item, Bits, Alias, Enum::Variant};",
+            &[],
+        ))
+        .contains("pub struct Item")
+    );
 }
 
 #[test]
@@ -1189,6 +1461,11 @@ fn git_siblings_keep_resolved_sources_revisions_and_unified_features() {
 fn proc_macro_consumers_query_ordinary_dependencies_in_the_host_context() {
     let dir = project();
     let root = dir.path();
+    let (active, inactive) = if cfg!(windows) {
+        ("windows", "unix")
+    } else {
+        ("unix", "windows")
+    };
     member(
         root,
         "app",
@@ -1198,8 +1475,10 @@ fn proc_macro_consumers_query_ordinary_dependencies_in_the_host_context() {
     member(
         root,
         "macros",
-        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n[dependencies]\nalias = { package = \"api\", path = \"../api\", features = [\"host\"] }\n",
-        "",
+        &format!(
+            "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n[dependencies]\nalias = {{ package = \"api\", path = \"../api\", features = [\"host\"] }}\n[target.'cfg({active})'.dependencies]\nhost_api = {{ package = \"build-api\", path = \"../build-api\", features = [\"enabled\"] }}\n[target.'cfg({inactive})'.dependencies]\nopposite_api = {{ package = \"dev-api\", path = \"../dev-api\", features = [\"enabled\"] }}\n"
+        ),
+        "use host_api::Enabled;",
     );
     member(
         root,
@@ -1232,18 +1511,45 @@ fn proc_macro_consumers_query_ordinary_dependencies_in_the_host_context() {
         vec!["--target", host],
         vec!["--target", other_target],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_excra"))
-            .args(["use alias::Record;", "--root"])
-            .arg(root)
-            .args(["--package", "macros"])
-            .args(flags)
-            .env("CARGO_NET_OFFLINE", "true")
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "macros"])
+            .args(&flags)
+            .current_dir(root)
             .output()
             .unwrap();
-        let report = success(output);
+        assert!(checked.status.success(), "{:?}", checked);
+        let tree = Command::new("cargo")
+            .args(["tree", "--offline", "--locked", "--package", "macros"])
+            .args(&flags)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let tree = success(tree);
+        assert!(tree.contains("build-api"), "{tree}");
+        assert!(!tree.contains("dev-api"), "{tree}");
+        let query_macros = |import| {
+            Command::new(env!("CARGO_BIN_EXE_excra"))
+                .args([import, "--root"])
+                .arg(root)
+                .args(["--package", "macros"])
+                .args(&flags)
+                .env("CARGO_NET_OFFLINE", "true")
+                .output()
+                .unwrap()
+        };
+        let report = success(query_macros("use alias::Record;"));
         assert!(report.contains("dependency: normal\n"), "{report}");
         assert!(report.contains("fn host_only("), "{report}");
         assert!(!report.contains("fn target_only("), "{report}");
+        let report = success(query_macros("use host_api::Enabled;"));
+        assert!(
+            report.contains(&format!("dependency: normal (cfg({active}))\n")),
+            "{report}"
+        );
+        assert!(report.contains("pub struct Enabled"), "{report}");
+        assert!(
+            failure(query_macros("use opposite_api::Enabled;")).contains("not a direct dependency")
+        );
     }
 }
 
