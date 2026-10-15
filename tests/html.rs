@@ -499,6 +499,192 @@ fn explicit_and_cargo_configured_targets_find_the_generated_docs() {
 }
 
 #[test]
+fn included_target_changes_select_the_current_cargo_documentation_artifact() {
+    let dir = project();
+    let root = dir.path();
+    let output = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(output.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    fs::create_dir_all(root.join(".cargo/nested")).unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        "include = ['selection.toml', { path = 'optional.toml', optional = true }]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".cargo/selection.toml"),
+        "include = [{ path = 'nested/target.toml' }]\n",
+    )
+    .unwrap();
+    let config = root.join(".cargo/nested/target.toml");
+    fs::write(&config, "[build]\n").unwrap();
+    let source = root.join("api/src/lib.rs");
+    fs::write(&source, "pub fn item(_: u8) {}").unwrap();
+    let native = success(query(root, "use alias::item;", &[]));
+    assert!(native.contains("pub fn item(_: u8)"), "{native}");
+    let native_page = paths(&native, "source: ")[0].clone();
+    fs::write(&config, format!("[build]\ntarget = '{host}'\n")).unwrap();
+    fs::write(&source, "pub fn item(_: u16) {}").unwrap();
+    let targeted = success(query(root, "use alias::item;", &[]));
+    assert!(targeted.contains("pub fn item(_: u16)"), "{targeted}");
+    let targeted_page = paths(&targeted, "source: ")[0].clone();
+    assert!(targeted_page.ends_with(Path::new(host).join("doc/api/fn.item.html")));
+    let generation = |page: &Path| {
+        page.ancestors()
+            .find(|directory| directory.join(".lock").is_file())
+            .unwrap()
+            .to_path_buf()
+    };
+    assert_ne!(generation(&native_page), generation(&targeted_page));
+
+    // A stale native output must not outrank the current Cargo artifact,
+    // including when Cargo reuses an already generated target page.
+    let stale_page = generation(&targeted_page).join("build/doc/api/fn.item.html");
+    fs::create_dir_all(stale_page.parent().unwrap()).unwrap();
+    fs::copy(&native_page, &stale_page).unwrap();
+    let cached = success(query(root, "use alias::item;", &[]));
+    assert!(cached.contains("pub fn item(_: u16)"), "{cached}");
+    assert_eq!(paths(&cached, "source: ")[0], targeted_page);
+
+    fs::write(&config, "[build]\n").unwrap();
+    fs::write(&source, "pub fn item(_: u32) {}").unwrap();
+    let native_again = success(query(root, "use alias::item;", &[]));
+    assert!(
+        native_again.contains("pub fn item(_: u32)"),
+        "{native_again}"
+    );
+    assert_eq!(paths(&native_again, "source: ")[0], native_page);
+}
+
+#[test]
+fn host_documentation_preserves_compiler_flag_routing() {
+    let output = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(output.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let target_flags = format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        host.replace('-', "_").to_uppercase()
+    );
+    for source in [
+        "plain",
+        "encoded",
+        "build-env",
+        "target-env",
+        "build",
+        "triple",
+        "cfg",
+    ] {
+        let dir = project();
+        let root = dir.path();
+        member(
+            root,
+            "app",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[build-dependencies]\nalias = { package = \"api\", path = \"../api\" }\n",
+            "",
+        );
+        member(
+            root,
+            "api",
+            "[package]\nname = \"api\"\nversion = \"1.2.3\"\nedition = \"2024\"\n[dependencies]\ninner = { path = \"../inner\" }\n[build-dependencies]\ninner = { path = \"../inner\" }\n",
+            "pub use inner::Kind;",
+        );
+        member(
+            root,
+            "inner",
+            "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            "#![allow(unexpected_cfgs)]\npub enum Kind { Base, #[cfg(host_flag)] Flagged }",
+        );
+        success(
+            Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        fs::create_dir(root.join(".cargo")).unwrap();
+        for selection in ["native", "cli", "config", "env"] {
+            let mut config = match source {
+                "build" => "[build]\nrustflags = ['--cfg', 'host_flag']\n".to_string(),
+                "triple" => format!("[target.{host}]\nrustflags = ['--cfg', 'host_flag']\n"),
+                "cfg" => "[target.'cfg(all())']\nrustflags = ['--cfg', 'host_flag']\n".to_string(),
+                _ => String::new(),
+            };
+            if selection == "config" {
+                if source != "build" {
+                    config.push_str("[build]\n");
+                }
+                config.push_str(&format!("target = '{host}'\n"));
+            }
+            fs::write(root.join(".cargo/config.toml"), config).unwrap();
+            let build = if selection == "native" {
+                "fn main() { let _ = inner::Kind::Flagged; }"
+            } else {
+                "fn main() { match inner::Kind::Base { inner::Kind::Base => () } }"
+            };
+            fs::write(root.join("api/build.rs"), build).unwrap();
+            fs::write(
+                root.join("app/build.rs"),
+                build.replace("inner::", "alias::"),
+            )
+            .unwrap();
+            let mut check = Command::new("cargo");
+            check
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root);
+            let mut query = query_command(root, "use alias::Kind;", &["--include-build"]);
+            for command in [&mut check, &mut query] {
+                for name in [
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    "CARGO_BUILD_RUSTFLAGS",
+                    "CARGO_BUILD_TARGET",
+                    &target_flags,
+                ] {
+                    command.env_remove(name);
+                }
+                match source {
+                    "plain" => {
+                        command.env("RUSTFLAGS", "--cfg host_flag");
+                    }
+                    "encoded" => {
+                        command.env("CARGO_ENCODED_RUSTFLAGS", "--cfg\x1fhost_flag");
+                    }
+                    "build-env" => {
+                        command.env("CARGO_BUILD_RUSTFLAGS", "--cfg host_flag");
+                    }
+                    "target-env" => {
+                        command.env(&target_flags, "--cfg host_flag");
+                    }
+                    _ => {}
+                }
+                if selection == "cli" {
+                    command.args(["--target", host]);
+                } else if selection == "env" {
+                    command.env("CARGO_BUILD_TARGET", host);
+                }
+            }
+            success(check.output().unwrap());
+            let report = success(query.output().unwrap());
+            assert!(
+                report.contains("pub enum Kind"),
+                "{source}/{selection}: {report}"
+            );
+            assert_eq!(
+                report.contains("Flagged"),
+                selection == "native",
+                "{source}/{selection}: {report}"
+            );
+        }
+    }
+}
+
+#[test]
 fn documentation_honors_default_and_custom_cargo_home_configuration() {
     let dir = project();
     let mut command = Command::new(env!("CARGO_BIN_EXE_excra"));
@@ -735,6 +921,62 @@ pub mod concat { pub struct Item; }
 }
 
 #[test]
+fn unavailable_globs_do_not_block_independent_local_bindings() {
+    for (source, external) in [("std::fmt", "Formatter"), ("inner", "Kind")] {
+        for nested in [false, true] {
+            let dir = project();
+            let root = dir.path();
+            if source == "inner" {
+                let inner = root.join("inner/src/lib.rs");
+                fs::write(
+                    &inner,
+                    "#![doc(html_root_url = \"https://example.invalid/inner/\")]\n".to_string()
+                        + &fs::read_to_string(&inner).unwrap(),
+                )
+                .unwrap();
+            }
+            let glob = format!("#[doc(no_inline)] pub use {source}::*;");
+            let glob = if nested {
+                format!("pub mod exports {{ {glob} }}\n#[doc(no_inline)] pub use exports::*;")
+            } else {
+                glob
+            };
+            let source = format!(
+                "{glob}\npub struct Local {{ pub value: u8 }}\npub mod nested {{ pub struct Item; }}"
+            );
+            fs::write(root.join("api/src/lib.rs"), &source).unwrap();
+            fs::write(
+                root.join("app/src/lib.rs"),
+                "use alias::{Local, nested::Item};",
+            )
+            .unwrap();
+            success(
+                Command::new("cargo")
+                    .args(["check", "--offline", "--locked", "--package", "app"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            let report = success(query(root, "use alias::{Local, nested::Item};", &[]));
+            assert!(report.contains("pub struct Local"), "{report}");
+            assert!(report.contains("pub struct Item"), "{report}");
+            let error = failure(query(root, &format!("use alias::{external};"), &[]));
+            assert!(
+                error.contains("rustdoc link") && error.contains("is unavailable"),
+                "{error}"
+            );
+
+            fs::write(
+                root.join("api/src/lib.rs"),
+                source + "\npub mod values { pub fn Local() {} }\n#[doc(no_inline)] pub use values::*;",
+            )
+            .unwrap();
+            assert!(failure(query(root, "use alias::Local;", &[])).contains("ambiguous"));
+        }
+    }
+}
+
+#[test]
 fn local_non_inlined_globs_resolve_concrete_names_and_preserve_precedence() {
     let dir = project();
     fs::write(
@@ -796,6 +1038,96 @@ pub mod Shared { pub struct Nested; }
     }
     assert!(failure(query(dir.path(), "use alias::Missing;", &[])).contains("not found"));
     assert!(failure(query(dir.path(), "use alias::*;", &[])).contains("glob imports"));
+}
+
+#[test]
+fn deeply_layered_glob_reexports_resolve_to_one_item() {
+    let dir = project();
+    let levels = 30;
+    let mut source = "pub mod leaf { pub struct Item; }\n".to_string();
+    for level in 0..levels {
+        let previous = if level == 0 {
+            vec!["leaf".to_string()]
+        } else {
+            vec![format!("a{}", level - 1), format!("b{}", level - 1)]
+        };
+        let exports = previous
+            .iter()
+            .map(|name| format!("#[doc(no_inline)] pub use crate::{name}::*;"))
+            .collect::<String>();
+        for side in ["a", "b"] {
+            source.push_str(&format!("pub mod {side}{level} {{ {exports} }}\n"));
+        }
+    }
+    source.push_str(&format!(
+        "#[doc(no_inline)] pub use a{}::*;\n#[doc(no_inline)] pub use b{}::*;",
+        levels - 1,
+        levels - 1
+    ));
+    fs::write(dir.path().join("api/src/lib.rs"), source).unwrap();
+    let report = success(query(dir.path(), "use alias::Item;", &[]));
+    assert_eq!(paths(&report, "source: ").len(), 1);
+    assert!(report.contains("pub struct Item"), "{report}");
+}
+
+#[test]
+fn inlined_reexport_pages_share_item_identity_without_hiding_real_conflicts() {
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        r#"
+pub mod a {
+    pub struct Item;
+    pub enum Choice { First, Second }
+    pub trait Trait {}
+    pub type Alias = u8;
+    pub fn function() {}
+    pub const VALUE: u8 = 1;
+    pub static STATIC: u8 = 1;
+    pub mod nested { pub struct Nested; }
+    #[doc(inline)] pub use Item as Renamed;
+}
+pub mod b { #[doc(inline)] pub use crate::a::*; }
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+pub mod one { pub struct Clash; pub fn conflict() {} pub const CONSTANT: u8 = 1; }
+pub mod two { pub struct Clash; pub fn conflict() {} pub const CONSTANT: u8 = 1; }
+pub mod same_line { pub mod one { pub struct Same; pub fn same() {} } pub mod two { pub struct Same; pub fn same() {} } #[doc(no_inline)] pub use one::*; #[doc(no_inline)] pub use two::*; }
+#[doc(no_inline)] pub use one::*;
+#[doc(no_inline)] pub use two::*;
+pub mod first { #[doc(no_inline)] pub use crate::a::Choice::First as Variant; }
+pub mod second { #[doc(no_inline)] pub use crate::a::Choice::Second as Variant; }
+#[doc(no_inline)] pub use first::*;
+#[doc(no_inline)] pub use second::*;
+pub struct Namespace;
+#[macro_export] macro_rules! Namespace { () => { 1 }; }
+"#,
+    )
+    .unwrap();
+    let import = "use alias::{Item, Renamed, Choice::{self, First}, Trait, Alias, function, VALUE, STATIC, nested::Nested};";
+    fs::write(root.join("app/src/lib.rs"), import).unwrap();
+    success(
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    );
+    let report = success(query(root, import, &[]));
+    assert_eq!(paths(&report, "source: ").len(), 10, "{report}");
+    for name in [
+        "Clash",
+        "conflict",
+        "CONSTANT",
+        "same_line::Same",
+        "same_line::same",
+        "Variant",
+        "Namespace",
+    ] {
+        let error = failure(query(root, &format!("use alias::{name};"), &[]));
+        assert!(error.contains("ambiguous"), "{name}: {error}");
+    }
 }
 
 #[test]

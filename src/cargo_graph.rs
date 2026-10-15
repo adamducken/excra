@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub(crate) struct TargetPlatform {
-    name: String,
+    pub(crate) name: String,
     cfg: Vec<Cfg>,
 }
 

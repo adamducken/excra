@@ -144,15 +144,10 @@ fn run() -> Result<(), String> {
         for (unit, queries) in by_unit {
             let (_, (_, dependency, _)) = queries[0];
             let host_context = unit.1;
-            let target = if host_context {
-                Some(host.as_str())
-            } else {
-                args.target.as_deref()
-            };
             let docs = rustdoc_html::generate(
                 &manifest,
                 &metadata,
-                target,
+                args.target.as_deref(),
                 dependency,
                 &feature_graph,
                 host_context,

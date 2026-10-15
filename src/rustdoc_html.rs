@@ -5,7 +5,7 @@ use crate::resolver::{ResolvedDependency, package_spec};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
 use html_to_markdown_rs::{CodeBlockStyle, ConversionOptions, HeadingStyle, convert};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
@@ -27,6 +27,27 @@ pub(crate) fn generate(
     host_context: bool,
 ) -> Result<Documentation, String> {
     let package = dependency.package;
+    let configuration = cargo_configuration(manifest)?;
+    let targeted = target.is_some()
+        || std::env::var_os("CARGO_BUILD_TARGET").is_some()
+        || configuration.iter().any(|(_, contents)| {
+            contents
+                .parse::<toml::Table>()
+                .ok()
+                .and_then(|config| config.get("build")?.get("target").cloned())
+                .is_some_and(|target| match target {
+                    toml::Value::Array(targets) => !targets.is_empty(),
+                    _ => true,
+                })
+        });
+    let host = if host_context && targeted {
+        Some(cargo_graph::host_triple(manifest, metadata)?)
+    } else {
+        None
+    };
+    let target = host.as_deref().or(target);
+    let suppress_target_flags = host_context && targeted;
+    let effective_target = cargo_graph::platform(manifest, metadata, target)?;
     let contents = documentation_manifest(metadata, graph, package, host_context)?;
     let lock = fs::read(metadata.workspace_root.join("Cargo.lock"))
         .map_err(|error| format!("cannot read workspace Cargo.lock: {error}"))?;
@@ -37,6 +58,9 @@ pub(crate) fn generate(
     package.manifest_path.hash(&mut identity);
     contents.hash(&mut identity);
     target.hash(&mut identity);
+    effective_target.name.hash(&mut identity);
+    targeted.hash(&mut identity);
+    suppress_target_flags.hash(&mut identity);
     for name in [
         "CARGO_BUILD_TARGET",
         "RUSTFLAGS",
@@ -67,27 +91,7 @@ pub(crate) fn generate(
     target_flags.sort();
     target_flags.hash(&mut identity);
     lock.hash(&mut identity);
-    let mut configuration = manifest
-        .parent()
-        .expect("manifest has a parent")
-        .ancestors()
-        .map(|directory| directory.join(".cargo"))
-        .collect::<Vec<_>>();
-    if let Some(home) = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-    {
-        configuration.push(home);
-    }
-    for directory in configuration {
-        for name in ["config", "config.toml"] {
-            let path = directory.join(name);
-            if let Ok(contents) = fs::read(&path) {
-                path.hash(&mut identity);
-                contents.hash(&mut identity);
-            }
-        }
-    }
+    configuration.hash(&mut identity);
     let generation = metadata.target_directory.join("excra").join(format!(
         "docs-{}-{:016x}",
         package.name,
@@ -148,7 +152,14 @@ pub(crate) fn generate(
     let expected = graph
         .closure((package.id.clone(), host_context))?
         .into_iter()
-        .map(|unit| (unit.package.clone(), unit.host, unit.features.clone()))
+        .map(|unit| {
+            (
+                unit.package.clone(),
+                unit.host,
+                unit.features.clone(),
+                !targeted || !unit.host,
+            )
+        })
         .collect::<HashSet<_>>();
     let proc_macro = dependency
         .target
@@ -163,12 +174,13 @@ pub(crate) fn generate(
                 unit.package.clone(),
                 host_context || unit.host,
                 unit.features.clone(),
+                !suppress_target_flags && (!targeted || !unit.host),
             )
         })
         .collect::<HashSet<_>>();
     if actual != expected {
         return Err(format!(
-            "documentation graph changed Cargo package, host, or feature context for {}",
+            "documentation graph changed Cargo package, host, feature, or compiler flag context for {}",
             package.id
         ));
     }
@@ -181,6 +193,7 @@ pub(crate) fn generate(
             "--locked",
             "--no-deps",
             "--lib",
+            "--message-format=json-render-diagnostics",
             "--manifest-path",
         ])
         .arg(&generated_manifest);
@@ -190,23 +203,102 @@ pub(crate) fn generate(
     if let Some(target) = target {
         command.args(["--target", target]);
     }
-    let status = command
-        .stdout(Stdio::null())
+    if suppress_target_flags {
+        // The selected host package is a target unit in the isolated manifest.
+        // An empty encoded value overrides every source of target Rust flags.
+        command.env("CARGO_ENCODED_RUSTFLAGS", "");
+    }
+    let output = command
         .stderr(Stdio::inherit())
-        .status()
+        .output()
         .map_err(|error| format!("cannot run cargo doc: {error}"))?;
-    if !status.success() {
+    if !output.status.success() {
         return Err(format!(
             "cargo doc failed for {} {}",
             package.name, package.version
         ));
     }
-    let docs = documentation_dir(generation.join("build").as_std_path())?;
+    let docs = documentation_dir(
+        &String::from_utf8_lossy(&output.stdout),
+        &documented.id.repr,
+    )?;
     convert_crate(&docs, &docs.join(dependency.target.name.replace('-', "_")))?;
     Ok(Documentation {
         directory: docs,
         _generation_lock: generation_lock,
     })
+}
+
+fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    let mut directories = manifest
+        .parent()
+        .expect("manifest has a parent")
+        .ancestors()
+        .map(|directory| directory.join(".cargo"))
+        .collect::<Vec<_>>();
+    if let Some(home) = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+    {
+        directories.push(home);
+    }
+    let mut configuration = Vec::new();
+    let mut visited = HashSet::new();
+    for directory in directories {
+        let legacy = directory.join("config");
+        let path = if legacy.is_file() {
+            legacy
+        } else {
+            directory.join("config.toml")
+        };
+        read_configuration(&path, true, &mut visited, &mut configuration)?;
+    }
+    Ok(configuration)
+}
+
+fn read_configuration(
+    path: &Path,
+    optional: bool,
+    visited: &mut HashSet<PathBuf>,
+    configuration: &mut Vec<(PathBuf, String)>,
+) -> Result<(), String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if optional && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+    let table = contents
+        .parse::<toml::Table>()
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    if let Some(includes) = table.get("include").and_then(toml::Value::as_array) {
+        for include in includes {
+            let name = include
+                .as_str()
+                .or_else(|| include.get("path").and_then(toml::Value::as_str))
+                .ok_or_else(|| {
+                    format!("invalid Cargo configuration include in {}", path.display())
+                })?;
+            let optional = include
+                .get("optional")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            read_configuration(
+                &path
+                    .parent()
+                    .expect("configuration has a parent")
+                    .join(name),
+                optional,
+                visited,
+                configuration,
+            )?;
+        }
+    }
+    configuration.push((path.to_path_buf(), contents));
+    Ok(())
 }
 
 fn documentation_manifest(
@@ -369,33 +461,161 @@ fn convert_crate(docs: &Path, directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn documentation_dir(generation: &Path) -> Result<PathBuf, String> {
-    let generation = generation
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    if generation.join("doc").is_dir() {
-        return Ok(generation.join("doc"));
-    }
-    let entries = fs::read_dir(&generation)
-        .map_err(|error| format!("cannot read {}: {error}", generation.display()))?;
+fn documentation_dir(output: &str, package: &str) -> Result<PathBuf, String> {
     let mut directories = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let docs = entry.path().join("doc");
-        if docs.is_dir() {
-            directories.push(docs);
+    for line in output.lines() {
+        let artifact: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("cannot read Cargo documentation artifact: {error}"))?;
+        if artifact["reason"] != "compiler-artifact" || artifact["package_id"] != package {
+            continue;
+        }
+        if let Some(files) = artifact["filenames"].as_array() {
+            for path in files.iter().filter_map(serde_json::Value::as_str) {
+                let path = Path::new(path);
+                if path.file_name().is_some_and(|name| name == "index.html") {
+                    directories.push(
+                        path.parent()
+                            .and_then(Path::parent)
+                            .ok_or_else(|| {
+                                format!("invalid documentation artifact: {}", path.display())
+                            })?
+                            .canonicalize()
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            }
         }
     }
+    directories.sort();
+    directories.dedup();
     match directories.as_slice() {
         [docs] => Ok(docs.clone()),
         _ => Err("expected one rustdoc HTML output directory; use --target for one target".into()),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct HtmlItem {
     page: PathBuf,
     fragment: Option<String>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum ItemIdentity {
+    Page(HtmlItem),
+    Source(HtmlItem, String, Option<String>),
+}
+
+fn item_identity(docs: &Path, item: &HtmlItem) -> Result<ItemIdentity, String> {
+    let html = read_html(&item.page)?;
+    let directory = item.page.parent().expect("page has a parent");
+    let kind = page_kind(&item.page).unwrap_or_default();
+    // Inlined nominal types keep their canonical self-type links in auto impls.
+    if let Some((_, implementations)) = html.split_once("id=\"synthetic-implementations-list\"") {
+        for link in implementations
+            .split("</div>")
+            .next()
+            .unwrap_or_default()
+            .split("<a ")
+            .skip(1)
+        {
+            let tag = link.split('>').next().unwrap_or_default();
+            if attribute(tag, "class") == Some(kind)
+                && let Some(href) = attribute(tag, "href")
+                && let Ok(mut definition) = local_link(docs, directory, href)
+            {
+                definition.fragment = item.fragment.clone();
+                return Ok(ItemIdentity::Page(definition));
+            }
+        }
+    }
+    // Trait implementation scripts likewise belong to the definition's path.
+    if kind == "trait" {
+        for script in html.split("<script ").skip(1) {
+            let tag = script.split('>').next().unwrap_or_default();
+            if let Some(src) = attribute(tag, "src")
+                && (src.contains("/trait.impl/") || src.contains("/implementors/"))
+                && let Ok(definition) = local_link(docs, directory, src)
+            {
+                return Ok(ItemIdentity::Page(definition));
+            }
+        }
+    }
+    for link in html.split("<a ").skip(1) {
+        let tag = link.split('>').next().unwrap_or_default();
+        if attribute(tag, "class") == Some("src")
+            && let Some(href) = attribute(tag, "href")
+            && let Ok(source) = local_link(docs, directory, href)
+            && unique_source_definition(&source, kind) == Some(true)
+        {
+            return Ok(ItemIdentity::Source(
+                source,
+                kind.to_string(),
+                item.fragment.clone(),
+            ));
+        }
+    }
+    Ok(ItemIdentity::Page(item.clone()))
+}
+
+fn unique_source_definition(source: &HtmlItem, kind: &str) -> Option<bool> {
+    let range = source.fragment.as_deref()?;
+    let (start, end) = range.split_once('-').unwrap_or((range, range));
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    let html = read_html(&source.page).ok()?;
+    let code = html.split_once("<code>")?.1.split_once("</code>")?.0;
+    let snippet = code
+        .lines()
+        .skip(start.checked_sub(1)?)
+        .take(end.checked_sub(start)?.checked_add(1)?)
+        .map(|line| line.split_once("</a>").map_or(line, |(_, code)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let markdown = convert(
+        &format!("<pre><code>{snippet}</code></pre>"),
+        ConversionOptions {
+            code_block_style: CodeBlockStyle::Backticks,
+            visitor: Some(Arc::new(Mutex::new(CodeLinks::default()))),
+            ..Default::default()
+        },
+    )
+    .ok()?
+    .content?;
+    let code = markdown.trim().strip_prefix("```")?.split_once('\n')?.1;
+    let code = code.strip_suffix("```")?;
+    let syntax = syn::parse_file(code).ok()?;
+    Some(source_definition_count(&syntax.items, kind) == 1)
+}
+
+fn source_definition_count(items: &[syn::Item], kind: &str) -> usize {
+    items
+        .iter()
+        .map(|item| {
+            let matches = matches!(
+                (kind, item),
+                ("constant", syn::Item::Const(_))
+                    | ("enum", syn::Item::Enum(_))
+                    | ("fn" | "attr" | "derive", syn::Item::Fn(_))
+                    | ("index", syn::Item::Mod(_))
+                    | ("static", syn::Item::Static(_))
+                    | ("struct", syn::Item::Struct(_))
+                    | ("trait", syn::Item::Trait(_))
+                    | ("traitalias", syn::Item::TraitAlias(_))
+                    | ("type", syn::Item::Type(_))
+                    | ("union", syn::Item::Union(_))
+            ) || matches!((kind, item), ("macro", syn::Item::Macro(item)) if item.ident.is_some());
+            let nested = if let syn::Item::Mod(module) = item {
+                module
+                    .content
+                    .as_ref()
+                    .map_or(0, |(_, items)| source_definition_count(items, kind))
+            } else {
+                0
+            };
+            usize::from(matches) + nested
+        })
+        .sum()
 }
 
 impl HtmlItem {
@@ -419,6 +639,7 @@ pub(crate) fn find_page(
     crate_name: &str,
     import: &ImportPath,
 ) -> Result<PathBuf, String> {
+    let mut lookup = HtmlLookup::new(docs);
     let mut item = HtmlItem::new(docs.join(crate_name).join("index.html"));
     for (index, name) in import
         .segments
@@ -426,7 +647,7 @@ pub(crate) fn find_page(
         .chain(std::iter::once(&import.item))
         .enumerate()
     {
-        item = follow_item_redirect(docs, &item)?;
+        item = lookup.follow_redirect(&item)?;
         let name = identifier_key(name);
         if item.fragment.is_some() || !matches!(item.kind(), Some("index" | "enum")) {
             return Err(format!(
@@ -435,9 +656,7 @@ pub(crate) fn find_page(
             ));
         }
         let type_only = index < import.segments.len() || import.self_parent;
-        let mut candidates = find_candidates(docs, &item, name, type_only, &mut HashSet::new())?;
-        candidates.sort();
-        candidates.dedup();
+        let candidates = lookup.candidates(&item, name, type_only)?;
         item = match candidates.as_slice() {
             [item] => item.clone(),
             [] => {
@@ -454,7 +673,7 @@ pub(crate) fn find_page(
             }
         };
     }
-    let item = follow_item_redirect(docs, &item)?;
+    let item = lookup.follow_redirect(&item)?;
     if import.self_parent && !matches!(item.kind(), Some("index" | "enum" | "trait")) {
         return Err(format!(
             "item '{}' cannot be a self import parent; expected a module, enum, or trait",
@@ -464,125 +683,295 @@ pub(crate) fn find_page(
     Ok(item.page)
 }
 
-fn find_candidates(
-    docs: &Path,
-    item: &HtmlItem,
-    name: &str,
-    type_only: bool,
-    visiting: &mut HashSet<PathBuf>,
-) -> Result<Vec<HtmlItem>, String> {
-    let item = follow_item_redirect(docs, item)?;
-    if item.fragment.is_some() {
-        return Ok(Vec::new());
-    }
-    let page = item.page;
-    if !visiting.insert(page.clone()) {
-        return Ok(Vec::new());
-    }
-    let html = read_html(&page)?;
-    if page_kind(&page) == Some("enum") {
-        visiting.remove(&page);
-        return Ok(if html.contains(&format!("id=\"variant.{name}\"")) {
-            vec![HtmlItem {
-                page,
-                fragment: Some(format!("variant.{name}")),
-            }]
-        } else {
-            Vec::new()
-        });
-    }
-    let directory = page.parent().expect("page has a parent");
-    let mut candidates = Vec::new();
-    let module = directory.join(name).join("index.html");
-    if module.is_file() && html.contains(&format!("href=\"{name}/index.html\"")) {
-        candidates.push(HtmlItem::new(module));
-    }
-    for kind in [
-        "struct",
-        "enum",
-        "union",
-        "trait",
-        "type",
-        "traitalias",
-        "fn",
-        "constant",
-        "static",
-        "macro",
-        "attr",
-        "derive",
-        "primitive",
-    ] {
-        if type_only && !type_kind(kind) {
-            continue;
-        }
-        let candidate = directory.join(format!("{kind}.{name}.html"));
-        if candidate.is_file() && html.contains(&format!("href=\"{kind}.{name}.html\"")) {
-            candidates.push(HtmlItem::new(candidate));
-        }
-    }
-    let reexport_id = format!("reexport.{name}");
-    let mut globs = Vec::new();
-    for row in html.split("<dt").skip(1) {
-        if !row.starts_with([' ', '>']) {
-            continue;
-        }
-        let row = row.split("</dt>").next().unwrap_or(row);
-        let Some(href) = attribute(row, "href") else {
-            continue;
-        };
-        if row.contains("::*;") {
-            globs.push(href);
-            continue;
-        }
-        let Some(id) = attribute(row, "id") else {
-            continue;
-        };
-        if id != reexport_id
-            && !id
-                .strip_prefix(&format!("{reexport_id}-"))
-                .is_some_and(|suffix| {
-                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                })
-        {
-            continue;
-        }
-        let kind = page_kind(Path::new(href.split('#').next().unwrap_or(href)));
-        if type_only && kind.is_some_and(|kind| !type_kind(kind)) {
-            continue;
-        }
-        candidates.push(local_link(docs, directory, href)?);
-    }
-    let mut candidates = candidates
-        .iter()
-        .map(|candidate| follow_item_redirect(docs, candidate))
-        .collect::<Result<Vec<_>, _>>()?;
-    candidates.retain(|candidate| !type_only || candidate.kind().is_some_and(type_kind));
-    if type_only && !candidates.is_empty() {
-        visiting.remove(&page);
-        return Ok(candidates);
-    }
-    let mut glob_candidates = Vec::new();
-    for href in globs {
-        let page = local_link(docs, directory, href)?;
-        glob_candidates.extend(find_candidates(docs, &page, name, type_only, visiting)?);
-    }
-    // Keep any glob binding whose namespace is not shadowed by explicit names.
-    let explicit_namespaces = candidates.iter().try_fold(0, |namespaces, item| {
-        Ok::<_, String>(namespaces | item_namespaces(item)?)
-    })?;
-    for glob in glob_candidates {
-        if explicit_namespaces == 0 || item_namespaces(&glob)? & !explicit_namespaces != 0 {
-            candidates.push(glob);
-        }
-    }
-    visiting.remove(&page);
-    Ok(candidates)
+struct ParsedPage {
+    html: String,
+    links: HashSet<String>,
+    reexports: Vec<(String, String)>,
+    globs: Vec<String>,
 }
 
-fn item_namespaces(item: &HtmlItem) -> Result<u8, String> {
+struct Bindings {
+    explicit: Vec<(HtmlItem, u8)>,
+    globs: Vec<String>,
+}
+
+impl ParsedPage {
+    fn new(html: String) -> Self {
+        let links = html
+            .split("href=\"")
+            .skip(1)
+            .filter_map(|tail| tail.split('"').next().map(str::to_string))
+            .collect();
+        let mut reexports = Vec::new();
+        let mut globs = Vec::new();
+        for row in html.split("<dt").skip(1) {
+            if !row.starts_with([' ', '>']) {
+                continue;
+            }
+            let row = row.split("</dt>").next().unwrap_or(row);
+            let Some(href) = attribute(row, "href") else {
+                continue;
+            };
+            if row.contains("::*;") {
+                globs.push(href.to_string());
+            } else if let Some(id) = attribute(row, "id") {
+                reexports.push((id.to_string(), href.to_string()));
+            }
+        }
+        Self {
+            html,
+            links,
+            reexports,
+            globs,
+        }
+    }
+}
+
+struct HtmlLookup<'a> {
+    docs: &'a Path,
+    pages: HashMap<PathBuf, ParsedPage>,
+    completed: HashMap<(HtmlItem, String, bool), Result<Vec<HtmlItem>, String>>,
+    #[cfg(test)]
+    expansions: usize,
+}
+
+impl<'a> HtmlLookup<'a> {
+    fn new(docs: &'a Path) -> Self {
+        Self {
+            docs,
+            pages: HashMap::new(),
+            completed: HashMap::new(),
+            #[cfg(test)]
+            expansions: 0,
+        }
+    }
+
+    fn page(&mut self, path: &Path) -> Result<&ParsedPage, String> {
+        if !self.pages.contains_key(path) {
+            self.pages
+                .insert(path.to_path_buf(), ParsedPage::new(read_html(path)?));
+        }
+        Ok(&self.pages[path])
+    }
+
+    fn follow_redirect(&mut self, item: &HtmlItem) -> Result<HtmlItem, String> {
+        let mut item = item.clone();
+        let mut visited = HashSet::new();
+        loop {
+            let page = self.page(&item.page)?;
+            if page.html.contains("<main") {
+                return Ok(item);
+            }
+            if !visited.insert(item.page.clone()) {
+                return Err("cycle in rustdoc HTML redirects".into());
+            }
+            let href = page
+                .html
+                .split_once("URL=")
+                .and_then(|(_, tail)| tail.split('"').next())
+                .ok_or_else(|| format!("{} is not a rustdoc HTML page", item.page.display()))?
+                .to_string();
+            let next = local_link(
+                self.docs,
+                item.page.parent().expect("page has a parent"),
+                &href,
+            )?;
+            item = HtmlItem {
+                page: next.page,
+                fragment: next.fragment.or(item.fragment),
+            };
+        }
+    }
+
+    fn candidates(
+        &mut self,
+        item: &HtmlItem,
+        name: &str,
+        type_only: bool,
+    ) -> Result<Vec<HtmlItem>, String> {
+        let item = self.follow_redirect(item)?;
+        let key = (item.clone(), name.to_string(), type_only);
+        if let Some(result) = self.completed.get(&key) {
+            return result.clone();
+        }
+        let result = self
+            .collect_candidates(&item, name, type_only)
+            .and_then(|mut items| {
+                items.sort();
+                if items.len() > 1 {
+                    let mut identities = HashSet::new();
+                    let mut distinct = Vec::new();
+                    for item in items {
+                        if identities.insert(item_identity(self.docs, &item)?) {
+                            distinct.push(item);
+                        }
+                    }
+                    items = distinct;
+                }
+                Ok(items)
+            });
+        self.completed.insert(key, result.clone());
+        result
+    }
+
+    fn collect_candidates(
+        &mut self,
+        root: &HtmlItem,
+        name: &str,
+        type_only: bool,
+    ) -> Result<Vec<HtmlItem>, String> {
+        let mut pending = vec![(root.clone(), if type_only { 1 } else { 1 | 2 | 4 })];
+        let mut visited: HashMap<PathBuf, u8> = HashMap::new();
+        let mut candidates = HashSet::new();
+        let mut unavailable = None;
+        while let Some((item, namespaces)) = pending.pop() {
+            let item = match self.follow_redirect(&item) {
+                Ok(item) => item,
+                Err(error) => {
+                    unavailable.get_or_insert(error);
+                    continue;
+                }
+            };
+            if item.fragment.is_some() {
+                continue;
+            }
+            let seen = visited.entry(item.page.clone()).or_default();
+            let namespaces = namespaces & !*seen;
+            if namespaces == 0 {
+                continue;
+            }
+            *seen |= namespaces;
+            #[cfg(test)]
+            {
+                self.expansions += 1;
+            }
+            let Bindings { explicit, globs } = match self.bindings(&item, name, type_only) {
+                Ok(bindings) => bindings,
+                Err(error) if item == *root => return Err(error),
+                Err(error) => {
+                    unavailable.get_or_insert(error);
+                    continue;
+                }
+            };
+            let mut shadowed = 0;
+            for (item, binding_namespaces) in explicit {
+                shadowed |= binding_namespaces;
+                if binding_namespaces & namespaces != 0 {
+                    candidates.insert(item);
+                }
+            }
+            let remaining = namespaces & !shadowed;
+            if remaining == 0 {
+                continue;
+            }
+            for href in globs {
+                match local_link(
+                    self.docs,
+                    item.page.parent().expect("page has a parent"),
+                    &href,
+                ) {
+                    Ok(page) => pending.push((page, remaining)),
+                    Err(error) => {
+                        unavailable.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        if candidates.is_empty()
+            && let Some(error) = unavailable
+        {
+            return Err(error);
+        }
+        Ok(candidates.into_iter().collect())
+    }
+
+    fn bindings(
+        &mut self,
+        item: &HtmlItem,
+        name: &str,
+        type_only: bool,
+    ) -> Result<Bindings, String> {
+        let docs = self.docs;
+        let page = self.page(&item.page)?;
+        let directory = item.page.parent().expect("page has a parent");
+        let mut candidates = Vec::new();
+        if page_kind(&item.page) == Some("enum") {
+            if page.html.contains(&format!("id=\"variant.{name}\"")) {
+                candidates.push(HtmlItem {
+                    page: item.page.clone(),
+                    fragment: Some(format!("variant.{name}")),
+                });
+            }
+        } else {
+            let module = directory.join(name).join("index.html");
+            if module.is_file() && page.links.contains(&format!("{name}/index.html")) {
+                candidates.push(HtmlItem::new(module));
+            }
+            for kind in [
+                "struct",
+                "enum",
+                "union",
+                "trait",
+                "type",
+                "traitalias",
+                "fn",
+                "constant",
+                "static",
+                "macro",
+                "attr",
+                "derive",
+                "primitive",
+            ] {
+                if type_only && !type_kind(kind) {
+                    continue;
+                }
+                let file = format!("{kind}.{name}.html");
+                let candidate = directory.join(&file);
+                if candidate.is_file() && page.links.contains(&file) {
+                    candidates.push(HtmlItem::new(candidate));
+                }
+            }
+            let reexport_id = format!("reexport.{name}");
+            for (id, href) in &page.reexports {
+                if id != &reexport_id
+                    && !id
+                        .strip_prefix(&format!("{reexport_id}-"))
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                {
+                    continue;
+                }
+                let kind = page_kind(Path::new(href.split('#').next().unwrap_or(href)));
+                if type_only && kind.is_some_and(|kind| !type_kind(kind)) {
+                    continue;
+                }
+                candidates.push(local_link(docs, directory, href)?);
+            }
+        }
+        let globs = page.globs.clone();
+        let mut bindings = Vec::new();
+        for candidate in candidates {
+            let candidate = self.follow_redirect(&candidate)?;
+            if !type_only || candidate.kind().is_some_and(type_kind) {
+                let namespaces = if matches!(candidate.kind(), Some("struct" | "variant")) {
+                    item_namespaces(&candidate, &self.page(&candidate.page)?.html)
+                } else {
+                    item_namespaces(&candidate, "")
+                };
+                bindings.push((candidate, namespaces));
+            }
+        }
+        Ok(Bindings {
+            explicit: bindings,
+            globs,
+        })
+    }
+}
+
+fn item_namespaces(item: &HtmlItem, html: &str) -> u8 {
     match item.kind() {
         Some("struct" | "variant") => {
-            let html = read_html(&item.page)?;
             let declaration = html
                 .split_once("<pre class=\"rust item-decl\">")
                 .and_then(|(_, declaration)| declaration.split_once("</pre>"))
@@ -599,11 +988,11 @@ fn item_namespaces(item: &HtmlItem) -> Result<u8, String> {
                 declaration.trim_end().ends_with(";</code>")
             };
             // Unit and tuple constructors also occupy the value namespace.
-            Ok(if constructor { 1 | 2 } else { 1 })
+            if constructor { 1 | 2 } else { 1 }
         }
-        Some(kind) if type_kind(kind) => Ok(1),
-        Some("macro" | "attr" | "derive") => Ok(4),
-        _ => Ok(2),
+        Some(kind) if type_kind(kind) => 1,
+        Some("macro" | "attr" | "derive") => 4,
+        _ => 2,
     }
 }
 
@@ -829,6 +1218,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_glob_graphs_expand_each_page_once_and_reuse_completed_lookups() {
+        for levels in [15, 30, 60] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let docs = dir.path();
+            let write_module = |name: &str, body: String| {
+                let directory = docs.join(name);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join("index.html"), format!("<main>{body}</main>")).unwrap();
+            };
+            let glob = |href: &str| format!("<dt><a href=\"{href}\">module</a>::*;</dt>");
+            write_module(
+                "leaf",
+                "<a href=\"struct.Item.html\">Item</a>".to_string() + &glob("../index.html"),
+            );
+            let definition = docs.join("leaf/struct.Item.html");
+            fs::write(
+                &definition,
+                "<main><pre class=\"rust item-decl\"><code>pub struct Item;</code></pre></main>",
+            )
+            .unwrap();
+            for level in 0..levels {
+                let previous = if level == 0 {
+                    vec!["leaf".to_string()]
+                } else {
+                    vec![format!("a{}", level - 1), format!("b{}", level - 1)]
+                };
+                let exports = previous
+                    .iter()
+                    .map(|name| glob(&format!("../{name}/index.html")))
+                    .collect::<String>();
+                for side in ["a", "b"] {
+                    write_module(&format!("{side}{level}"), exports.clone());
+                }
+            }
+            write_module(
+                "",
+                glob(&format!("a{}/index.html", levels - 1))
+                    + &glob(&format!("b{}/index.html", levels - 1)),
+            );
+            let root = HtmlItem::new(docs.join("index.html"));
+            let mut lookup = HtmlLookup::new(docs);
+            let result = lookup.candidates(&root, "Item", false).unwrap();
+            assert_eq!(result, vec![HtmlItem::new(definition)]);
+            assert_eq!(lookup.expansions, 2 * levels + 2);
+            let parsed = lookup.pages.len();
+            assert_eq!(parsed, 2 * levels + 3);
+            assert_eq!(lookup.candidates(&root, "Item", false).unwrap(), result);
+            assert_eq!(lookup.expansions, 2 * levels + 2);
+            assert_eq!(lookup.candidates(&root, "Item", true).unwrap(), result);
+            assert_eq!(lookup.expansions, 2 * (2 * levels + 2));
+            assert!(
+                lookup
+                    .candidates(&root, "Missing", false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(lookup.expansions, 3 * (2 * levels + 2));
+            assert_eq!(lookup.pages.len(), parsed);
+        }
+    }
+
+    #[test]
     fn variant_fragments_survive_rustdoc_redirects() {
         let dir = tempfile::TempDir::new().unwrap();
         let docs = dir.path();
@@ -993,7 +1444,7 @@ mod tests {
                 .unwrap_err()
                 .contains("cannot read")
         );
-        assert!(documentation_dir(&docs.join("missing")).is_err());
+        assert!(documentation_dir("", "missing").is_err());
     }
 
     #[test]
