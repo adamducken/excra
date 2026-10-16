@@ -4,7 +4,7 @@ use cargo_metadata::{DependencyKind, Metadata, Package, PackageId};
 use cargo_platform::{Cfg, Platform};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) struct TargetPlatform {
@@ -27,22 +27,57 @@ pub(crate) fn platform(
         manifest,
         metadata,
         target,
+        false,
         &["--print", "cfg", "--print", "target-libdir"],
     )?)
 }
 
 pub(crate) fn host_triple(manifest: &Path, metadata: &Metadata) -> Result<String, String> {
-    probe(manifest, metadata, None, &["-vV"])?
+    probe(manifest, metadata, None, false, &["-vV"])?
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .map(str::to_string)
         .ok_or_else(|| "Cargo's compiler did not report a host target".into())
 }
 
+pub(crate) fn host_platform(
+    manifest: &Path,
+    metadata: &Metadata,
+    target: Option<&str>,
+) -> Result<TargetPlatform, String> {
+    if !targeted(target, &cargo_configuration(manifest)?) {
+        return platform(manifest, metadata, None);
+    }
+    let host = host_triple(manifest, metadata)?;
+    parse_platform(&probe(
+        manifest,
+        metadata,
+        Some(&host),
+        true,
+        &["--print", "cfg", "--print", "target-libdir"],
+    )?)
+}
+
+pub(crate) fn targeted(target: Option<&str>, configuration: &[(PathBuf, String)]) -> bool {
+    target.is_some()
+        || std::env::var_os("CARGO_BUILD_TARGET").is_some()
+        || configuration.iter().any(|(_, contents)| {
+            contents
+                .parse::<toml::Table>()
+                .ok()
+                .and_then(|config| config.get("build")?.get("target").cloned())
+                .is_some_and(|target| match target {
+                    toml::Value::Array(targets) => !targets.is_empty(),
+                    _ => true,
+                })
+        })
+}
+
 fn probe(
     manifest: &Path,
     metadata: &Metadata,
     target: Option<&str>,
+    suppress_target_flags: bool,
     rustc_args: &[&str],
 ) -> Result<String, String> {
     let directory = metadata.target_directory.join("excra");
@@ -66,6 +101,9 @@ fn probe(
     if let Some(target) = target {
         command.args(["--target", target]);
     }
+    if suppress_target_flags {
+        command.env("CARGO_ENCODED_RUSTFLAGS", "");
+    }
     let output = command
         .arg("--")
         .args(rustc_args)
@@ -80,8 +118,81 @@ fn probe(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    let mut directories = manifest
+        .parent()
+        .expect("manifest has a parent")
+        .ancestors()
+        .map(|directory| directory.join(".cargo"))
+        .collect::<Vec<_>>();
+    if let Some(home) = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+    {
+        directories.push(home);
+    }
+    let mut configuration = Vec::new();
+    let mut visited = HashSet::new();
+    for directory in directories {
+        let legacy = directory.join("config");
+        let path = if legacy.is_file() {
+            legacy
+        } else {
+            directory.join("config.toml")
+        };
+        read_configuration(&path, true, &mut visited, &mut configuration)?;
+    }
+    Ok(configuration)
+}
+
+fn read_configuration(
+    path: &Path,
+    optional: bool,
+    visited: &mut HashSet<PathBuf>,
+    configuration: &mut Vec<(PathBuf, String)>,
+) -> Result<(), String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+    let table = contents
+        .parse::<toml::Table>()
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    if let Some(includes) = table.get("include").and_then(toml::Value::as_array) {
+        for include in includes {
+            let name = include
+                .as_str()
+                .or_else(|| include.get("path").and_then(toml::Value::as_str))
+                .ok_or_else(|| {
+                    format!("invalid Cargo configuration include in {}", path.display())
+                })?;
+            let optional = include
+                .get("optional")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            read_configuration(
+                &path
+                    .parent()
+                    .expect("configuration has a parent")
+                    .join(name),
+                optional,
+                visited,
+                configuration,
+            )?;
+        }
+    }
+    configuration.push((path.to_path_buf(), contents));
+    Ok(())
+}
+
 pub(crate) type UnitKey = (PackageId, bool);
 
+#[derive(Clone)]
 pub(crate) struct Unit {
     pub(crate) package: PackageId,
     pub(crate) host: bool,
@@ -151,12 +262,6 @@ pub(crate) fn features(
     target: Option<&str>,
     include_dev: bool,
 ) -> Result<FeatureGraph, String> {
-    // An explicit target keeps Cargo's host and target nodes distinct even when
-    // their own features match. Otherwise Cargo may deduplicate across contexts.
-    let target = match target {
-        Some(target) => target.to_string(),
-        None => platform(manifest, metadata, None)?.name,
-    };
     let command = || {
         let mut command = Command::new("cargo");
         command
@@ -176,8 +281,10 @@ pub(crate) fn features(
             } else {
                 "normal,build"
             })
-            .args(selection.cargo_args())
-            .args(["--target", &target]);
+            .args(selection.cargo_args());
+        if let Some(target) = target {
+            command.args(["--target", target]);
+        }
         command
     };
     // Repeated rows still carry edges and features; expand each Cargo unit once.
@@ -244,6 +351,7 @@ fn parse_tree(output: &str, labels: &HashMap<String, &Package>) -> Result<Featur
     let mut units: HashMap<UnitKey, Unit> = HashMap::new();
     let mut stack: Vec<UnitKey> = Vec::new();
     let mut kinds = Vec::new();
+    let mut repeated = Vec::new();
     let mut root = None;
     for line in output.lines() {
         let Some((prefix, body)) = line.split_once('\t') else {
@@ -273,13 +381,19 @@ fn parse_tree(output: &str, labels: &HashMap<String, &Package>) -> Result<Featur
             .get(label)
             .ok_or_else(|| format!("cannot identify Cargo package '{label}'"))?;
         let kind = kinds.last().copied().unwrap_or(DependencyKind::Normal);
-        let host = stack.last().is_some_and(|(_, host)| *host)
+        let host = (kind != DependencyKind::Development
+            && stack.last().is_some_and(|(_, host)| *host))
             || kind == DependencyKind::Build
             || package
                 .targets
                 .iter()
                 .any(|target| target.kind.iter().any(|kind| kind == "proc-macro"));
         let key = (package.id.clone(), host);
+        // Cargo can deduplicate a proc-macro root's normal/dev subtree even
+        // across host/target units. Replay its edges in the consuming context.
+        if feature_names.ends_with(" (*)") && !units.contains_key(&key) {
+            repeated.push(((package.id.clone(), !host), key.clone()));
+        }
         let features = feature_names
             .strip_suffix(" (*)")
             .unwrap_or(feature_names)
@@ -312,6 +426,30 @@ fn parse_tree(output: &str, labels: &HashMap<String, &Package>) -> Result<Featur
         }
         stack.push(key);
         kinds.push(DependencyKind::Normal);
+    }
+    while let Some((source, destination)) = repeated.pop() {
+        let mut unit = units
+            .get(&source)
+            .ok_or_else(|| format!("missing repeated Cargo feature context for {}", source.0))?
+            .clone();
+        unit.host = destination.1;
+        for (kind, child) in &mut unit.dependencies {
+            let source_child = child.clone();
+            let proc_macro = labels.values().any(|package| {
+                package.id == child.0
+                    && package
+                        .targets
+                        .iter()
+                        .any(|target| target.kind.iter().any(|kind| kind == "proc-macro"))
+            });
+            child.1 = (unit.host && *kind != DependencyKind::Development)
+                || *kind == DependencyKind::Build
+                || proc_macro;
+            if !units.contains_key(child) {
+                repeated.push((source_child, child.clone()));
+            }
+        }
+        units.insert(destination, unit);
     }
     Ok(FeatureGraph {
         root: root.ok_or_else(|| "Cargo tree did not report a selected package".to_string())?,

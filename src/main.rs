@@ -61,8 +61,7 @@ fn run() -> Result<(), String> {
     )?;
     let root = select_package(&metadata, &manifest, args.package.as_deref())?;
     let target_platform = cargo_graph::platform(&manifest, &metadata, args.target.as_deref())?;
-    let host = cargo_graph::host_triple(&manifest, &metadata)?;
-    let host_platform = cargo_graph::platform(&manifest, &metadata, Some(&host))?;
+    let host_platform = cargo_graph::host_platform(&manifest, &metadata, args.target.as_deref())?;
     let feature_graph = cargo_graph::features(
         &manifest,
         &metadata,
@@ -83,47 +82,37 @@ fn run() -> Result<(), String> {
         &feature_graph,
     );
 
-    let queries = imports
-        .iter()
-        .map(|import| {
+    let mut queries = Vec::new();
+    for import in &imports {
+        for dependency in
             resolver::resolve_dependency(&metadata.packages, &dependencies, &import.crate_name)
-                .map(|resolved| {
-                    resolved
-                        .into_iter()
-                        .flat_map(|dep| {
-                            [false, true].into_iter().filter_map(move |build| {
-                                let contexts = dep
-                                    .contexts
-                                    .iter()
-                                    .filter(|context| {
-                                        (context.kind == DependencyKind::Build) == build
-                                    })
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                (!contexts.is_empty()).then_some((
-                                    import,
-                                    ResolvedDependency {
-                                        package: dep.package,
-                                        target: dep.target,
-                                        contexts,
-                                    },
-                                ))
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .map(|(import, dependency)| {
-            let unit = feature_graph
-                .direct_dependency(&dependency.package.id, dependency.contexts[0].kind)
-                .expect("dependency contexts were filtered against the feature graph");
-            (import, dependency, unit)
-        })
-        .collect::<Vec<_>>();
+                .map_err(|error| error.to_string())?
+        {
+            let mut by_unit: Vec<(cargo_graph::UnitKey, ResolvedDependency<'_>)> = Vec::new();
+            for context in dependency.contexts {
+                let unit = feature_graph
+                    .direct_dependency(&dependency.package.id, context.kind)
+                    .expect("dependency contexts were filtered against the feature graph");
+                if let Some((_, resolved)) = by_unit.iter_mut().find(|(key, resolved)| {
+                    key == &unit
+                        && (resolved.contexts[0].kind == DependencyKind::Build)
+                            == (context.kind == DependencyKind::Build)
+                }) {
+                    resolved.contexts.push(context);
+                } else {
+                    by_unit.push((
+                        unit,
+                        ResolvedDependency {
+                            package: dependency.package,
+                            target: dependency.target,
+                            contexts: vec![context],
+                        },
+                    ));
+                }
+            }
+            queries.extend(by_unit.into_iter().map(|(unit, dep)| (import, dep, unit)));
+        }
+    }
     let mut reports = Vec::new();
     for build in [false, true] {
         let group = queries
@@ -155,7 +144,7 @@ fn run() -> Result<(), String> {
             // Keep only one crate lock at a time, through every page read.
             for (index, (import, dependency, _)) in queries {
                 let page = rustdoc_html::find_page(
-                    &docs.directory,
+                    &docs,
                     &dependency.target.name.replace('-', "_"),
                     import,
                 )?;
@@ -214,6 +203,7 @@ fn metadata_for(
     no_dependencies: bool,
 ) -> Result<Metadata, String> {
     let mut command = MetadataCommand::new();
+    command.cargo_path("cargo");
     command.manifest_path(manifest);
     command.current_dir(invocation_manifest.parent().expect("manifest has a parent"));
     if no_dependencies {

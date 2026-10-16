@@ -78,8 +78,10 @@ closure, and a copy of the project's lockfile. It verifies the isolated package,
 host/target, and feature contexts before documentation, including locked Git revisions.
 Only that crate is documented. Its required dependencies may be compiled;
 the consuming application and unrelated dependencies are not built or documented.
-Cargo runs from the queried project's directory, using its installed toolchain
-and Cargo configuration. With no `--target`, Cargo handles its configured target.
+Every subprocess uses `cargo` from `PATH`, including metadata; the `CARGO`
+environment variable does not select the executable. Cargo runs from the queried
+project's directory, using its installed toolchain and Cargo configuration.
+With no `--target`, Cargo handles its configured target.
 The isolated manifest uses its default development profile; root manifest
 profile and patch overrides are not copied.
 

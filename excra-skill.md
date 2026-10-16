@@ -50,9 +50,10 @@ project's lockfile, running `cargo doc --offline --no-deps --lib`. Required crat
 dependencies may compile; the consuming app and unrelated dependencies are not
 built or documented.
 
-Stable Rust 1.89 or newer suffices. Cargo uses the queried project's toolchain
-and configuration; documentation uses the isolated manifest's default development
-profile; root manifest profile and patch overrides are not copied.
+Stable Rust 1.89 or newer suffices. Every subprocess uses `cargo` from `PATH`,
+including metadata; `CARGO` does not select the executable. Cargo uses the queried
+project's toolchain and configuration; documentation uses the isolated manifest's
+default development profile; root manifest profile and patch overrides are not copied.
 Generated HTML, Markdown, and build artifacts remain under Cargo's
 `target/excra/docs-*`. Matching selections reuse build artifacts and unchanged
 Markdown. Cargo progress appears on stderr.

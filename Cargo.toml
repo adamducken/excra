@@ -19,6 +19,7 @@ path = "src/main.rs"
 cargo-platform = "0.1"
 cargo_metadata = "0.18"
 html-to-markdown-rs = { version = "3", default-features = false, features = ["visitor"] }
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 serde_json = "1"
 syn = { version = "2", default-features = false, features = ["full", "parsing"] }
 tempfile = "3"

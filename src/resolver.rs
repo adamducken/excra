@@ -142,7 +142,7 @@ fn dependency_kind_order(kind: DependencyKind) -> u8 {
 
 pub(crate) fn is_rust_library_crate(crate_name: &str) -> bool {
     matches!(
-        crate::imports::identifier_key(crate_name),
+        crate::imports::identifier_key(crate_name).as_ref(),
         "std" | "core" | "alloc"
     )
 }
@@ -221,12 +221,12 @@ pub(crate) fn package_dependencies_for_platform(
     host: &crate::cargo_graph::TargetPlatform,
     features: &crate::cargo_graph::FeatureGraph,
 ) -> DependencyIndex {
-    let platform = if features.root_is_host() {
-        host
-    } else {
-        platform
-    };
-    let mut dependencies = index_dependencies(metadata, package_id, filter, Some((platform, host)));
+    let mut dependencies = index_dependencies(
+        metadata,
+        package_id,
+        filter,
+        Some((platform, host, features.root_is_host())),
+    );
     dependencies.entries.retain(|_, entries| {
         entries.retain_mut(|entry| {
             entry.contexts.retain(|context| {
@@ -248,6 +248,7 @@ fn index_dependencies(
     platform: Option<(
         &crate::cargo_graph::TargetPlatform,
         &crate::cargo_graph::TargetPlatform,
+        bool,
     )>,
 ) -> DependencyIndex {
     let mut deps = DependencyIndex::default();
@@ -256,8 +257,10 @@ fn index_dependencies(
     {
         for dep in &node.deps {
             for dep_kind in &dep.dep_kinds {
-                if platform.is_some_and(|(target, host)| {
-                    let platform = if dep_kind.kind == DependencyKind::Build {
+                if platform.is_some_and(|(target, host, root_is_host)| {
+                    let platform = if dep_kind.kind == DependencyKind::Build
+                        || (root_is_host && dep_kind.kind == DependencyKind::Normal)
+                    {
                         host
                     } else {
                         target
@@ -334,8 +337,8 @@ pub(crate) fn resolve_dependency<'a>(
     crate_name: &str,
 ) -> Result<Vec<ResolvedDependency<'a>>, ResolveError> {
     let crate_name = crate::imports::identifier_key(crate_name);
-    let Some(entries) = dependencies.entries.get(crate_name) else {
-        if let Some(excluded) = dependencies.excluded.get(crate_name) {
+    let Some(entries) = dependencies.entries.get(crate_name.as_ref()) else {
+        if let Some(excluded) = dependencies.excluded.get(crate_name.as_ref()) {
             let mut flags = Vec::new();
             if excluded.dev {
                 flags.push("`--include-dev`");

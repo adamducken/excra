@@ -1,3 +1,5 @@
+use icu_normalizer::ComposingNormalizer;
+use std::borrow::Cow;
 use syn::{ItemUse, UseTree};
 
 #[derive(Debug, Clone)]
@@ -8,8 +10,8 @@ pub(crate) struct ImportPath {
     pub(crate) self_parent: bool,
 }
 
-pub(crate) fn identifier_key(name: &str) -> &str {
-    name.strip_prefix("r#").unwrap_or(name)
+pub(crate) fn identifier_key(name: &str) -> Cow<'_, str> {
+    ComposingNormalizer::new_nfc().normalize(name.strip_prefix("r#").unwrap_or(name))
 }
 
 impl ImportPath {

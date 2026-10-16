@@ -149,6 +149,7 @@ dependencies = [
  "cargo-platform",
  "cargo_metadata",
  "html-to-markdown-rs",
+ "icu_normalizer",
  "serde_json",
  "syn 2.0.117",
  "tempfile",

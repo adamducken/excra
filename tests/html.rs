@@ -249,6 +249,95 @@ fn modules_raw_identifiers_reexports_and_variants_follow_html() {
 }
 
 #[test]
+fn unicode_identifiers_resolve_equivalent_nfc_spellings_and_preserve_reports() {
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        r#"
+pub struct Café;
+pub mod café {
+    pub enum Choix { Café, Autre }
+    pub mod entrée { pub struct Élément; }
+}
+pub mod a { #[doc(inline)] pub use crate::Café as Résumé; }
+pub mod b { #[doc(inline)] pub use crate::Café as Résumé; }
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#,
+    )
+    .unwrap();
+    let composed =
+        "use alias::{Café, café::{self, Choix::Café as Variant, entrée::Élément}, Résumé};";
+    let decomposed = "use alias::{r#Cafe\u{301}, r#cafe\u{301}::{self, Choix::r#Cafe\u{301} as Variant, entre\u{301}e::E\u{301}le\u{301}ment}, Re\u{301}sume\u{301}};";
+    fs::write(root.join("app/src/lib.rs"), decomposed).unwrap();
+    success(
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    );
+    let canonical = success(query(root, composed, &[]));
+    let equivalent = success(query(root, decomposed, &[]));
+    assert_eq!(
+        paths(&canonical, "source: "),
+        paths(&equivalent, "source: ")
+    );
+    assert_eq!(paths(&equivalent, "source: ").len(), 5);
+    assert!(equivalent.contains("import: use alias::r#Cafe\u{301};"));
+    assert!(equivalent.contains("import: use alias::r#cafe\u{301}::{self};"));
+    assert!(equivalent.contains("import: use alias::r#cafe\u{301}::Choix::r#Cafe\u{301};"));
+    assert!(equivalent.contains("import: use alias::Re\u{301}sume\u{301};"));
+}
+
+#[test]
+fn documentation_html_cannot_introduce_reexports_globs_or_variants() {
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        r#"
+//! <dl><dt id="reexport.Ghost"><a href="struct.Real.html">Real</a></dt></dl>
+//! <dl class="item-table reexports"><dt id="reexport.Forged"><code>pub use <a href="struct.Real.html">Real</a> as Forged;</code></dt></dl>
+//! <dl><dt><code>pub use <a href="hidden/index.html">hidden</a>::*;</code></dt></dl>
+pub struct Real;
+pub mod hidden { pub struct Leaked; }
+pub mod exports { pub struct Genuine; }
+#[doc(no_inline)] pub use exports::Genuine as Alias;
+#[doc(no_inline)] pub use exports::*;
+/// <section id="variant.Phantom" class="variant"><h3>Phantom</h3></section>
+pub enum E {
+    /// <section id="variant.Invented" class="variant"><h3>Invented</h3></section>
+    Present,
+}
+"#,
+    )
+    .unwrap();
+    let report = success(query(
+        root,
+        "use alias::{Real, Alias, Genuine, E::Present};",
+        &[],
+    ));
+    assert_eq!(paths(&report, "source: ").len(), 4);
+    for name in ["Ghost", "Forged", "Leaked", "E::Phantom", "E::Invented"] {
+        fs::write(root.join("app/src/lib.rs"), format!("use alias::{name};")).unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success(), "{name}: {checked:?}");
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("unresolved import"),
+            "{name}: {checked:?}"
+        );
+        let error = failure(query(root, &format!("use alias::{name};"), &[]));
+        assert!(error.contains("not found"), "{name}: {error}");
+    }
+}
+
+#[test]
 fn cached_docs_respect_root_features_and_do_not_add_dependency_defaults() {
     let dir = project();
     let report = success(query(
@@ -609,6 +698,14 @@ fn host_documentation_preserves_compiler_flag_routing() {
         );
         fs::create_dir(root.join(".cargo")).unwrap();
         for selection in ["native", "cli", "config", "env"] {
+            let predicate = if selection == "native" {
+                "host_flag"
+            } else {
+                "not(host_flag)"
+            };
+            fs::write(root.join("app/Cargo.toml"), format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[target.'cfg({predicate})'.build-dependencies]\nalias = {{ package = \"api\", path = \"../api\" }}\n"
+            )).unwrap();
             let mut config = match source {
                 "build" => "[build]\nrustflags = ['--cfg', 'host_flag']\n".to_string(),
                 "triple" => format!("[target.{host}]\nrustflags = ['--cfg', 'host_flag']\n"),
@@ -670,7 +767,13 @@ fn host_documentation_preserves_compiler_flag_routing() {
                 }
             }
             success(check.output().unwrap());
-            let report = success(query.output().unwrap());
+            let output = query.output().unwrap();
+            assert!(output.status.success(), "{source}/{selection}: {output:?}");
+            let report = success(output);
+            assert!(
+                report.contains(&format!("dependency: build (cfg({predicate}))\n")),
+                "{report}"
+            );
             assert!(
                 report.contains("pub enum Kind"),
                 "{source}/{selection}: {report}"
@@ -716,6 +819,62 @@ fn documentation_honors_default_and_custom_cargo_home_configuration() {
     assert_ne!(custom_page, default_page);
     assert!(custom_page.to_string_lossy().contains(host));
     assert!(custom_page.with_extension("md").is_file());
+}
+
+#[test]
+#[cfg(unix)]
+fn every_subprocess_uses_path_cargo_even_when_cargo_env_selects_another_wrapper() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        "#![allow(unexpected_cfgs)]\npub struct Record;\nimpl Record {\n#[cfg(path_cargo)] pub fn path_only() {}\n#[cfg(env_cargo)] pub fn env_only() {}\n}",
+    )
+    .unwrap();
+    let bin = root.join("cargo-wrappers");
+    fs::create_dir(&bin).unwrap();
+    for (name, log, flag) in [
+        ("cargo", "EXCRA_PATH_CARGO_LOG", "path_cargo"),
+        ("env-cargo", "EXCRA_ENV_CARGO_LOG", "env_cargo"),
+    ] {
+        let script = bin.join(name);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"${log}\"\nexport RUSTFLAGS='--cfg {flag}'\nexport RUSTDOCFLAGS='--cfg {flag}'\nexec \"$EXCRA_REAL_CARGO\" \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap();
+    let calls = root.join("path-cargo.log");
+    let ignored = root.join("env-cargo.log");
+    let mut command = query_command(root, "use alias::Record;", &[]);
+    command
+        .env(
+            "PATH",
+            std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&path)))
+                .unwrap(),
+        )
+        .env("CARGO", bin.join("env-cargo"))
+        .env("EXCRA_REAL_CARGO", env!("CARGO"))
+        .env("EXCRA_PATH_CARGO_LOG", &calls)
+        .env("EXCRA_ENV_CARGO_LOG", &ignored);
+    let report = success(command.output().unwrap());
+    assert!(report.contains("pub fn path_only()"), "{report}");
+    assert!(!report.contains("env_only"), "{report}");
+    assert!(
+        !ignored.exists(),
+        "CARGO wrapper ran: {:?}",
+        fs::read_to_string(ignored)
+    );
+    let calls = fs::read_to_string(calls).unwrap();
+    for subcommand in ["metadata", "rustc", "tree", "doc"] {
+        assert!(calls.lines().any(|line| line == subcommand), "{calls}");
+    }
 }
 
 #[test]
@@ -1131,6 +1290,216 @@ pub struct Namespace;
 }
 
 #[test]
+fn external_inlined_aliases_share_identity_without_merging_distinct_definitions() {
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("inner/src/lib.rs"),
+        r#"
+pub struct Record;
+pub enum Choice { One, Two }
+pub trait Trait {}
+pub type Alias = u8;
+pub fn function() {}
+pub const VALUE: u8 = 1;
+pub static STATIC: u8 = 1;
+pub mod nested { pub mod deeper { pub struct Nested; } }
+pub fn first() {}
+pub fn second() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        r#"
+pub mod a {
+    #[doc(inline)] pub use inner::*;
+    #[doc(inline)] pub use inner::function as Renamed;
+}
+pub mod b {
+    #[doc(inline)] pub use inner::*;
+    #[doc(inline)] pub use inner::function as Renamed;
+}
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+pub mod first { #[doc(inline)] pub use inner::first as Conflict; }
+pub mod second { #[doc(inline)] pub use inner::second as Conflict; }
+#[doc(no_inline)] pub use first::*;
+#[doc(no_inline)] pub use second::*;
+pub mod local_one {
+    mod inner { pub fn function() {} }
+    #[doc(inline)] pub use inner::function as LocalConflict;
+}
+pub mod local_two {
+    mod inner { pub fn function() {} }
+    #[doc(inline)] pub use inner::function as LocalConflict;
+}
+#[doc(no_inline)] pub use local_one::*;
+#[doc(no_inline)] pub use local_two::*;
+pub mod imported_one {
+    mod hidden { pub mod scope { pub fn function() {} } }
+    use hidden::scope as inner;
+    #[doc(inline)] pub use inner::function as ImportedConflict;
+}
+pub mod imported_two {
+    mod hidden { pub mod scope { pub fn function() {} } }
+    use hidden::scope as inner;
+    #[doc(inline)] pub use inner::function as ImportedConflict;
+}
+#[doc(no_inline)] pub use imported_one::*;
+#[doc(no_inline)] pub use imported_two::*;
+pub mod generated_one {
+    macro_rules! local { () => { mod inner { pub fn function() {} } }; }
+    local!();
+    #[doc(inline)] pub use self::inner::function as GeneratedConflict;
+}
+pub mod generated_two {
+    macro_rules! local { () => { mod inner { pub fn function() {} } }; }
+    local!();
+    #[doc(inline)] pub use self::inner::function as GeneratedConflict;
+}
+#[doc(no_inline)] pub use generated_one::*;
+#[doc(no_inline)] pub use generated_two::*;
+pub mod absolute_one {
+    pub mod inner { pub fn function() {} }
+    #[doc(inline)] pub use ::inner::function as Absolute;
+    #[doc(inline)] pub use ::inner::function as AbsoluteConflict;
+}
+pub mod absolute_two {
+    pub mod inner { pub fn function() {} }
+    #[doc(inline)] pub use ::inner::function as Absolute;
+    #[doc(inline)] pub use crate::absolute_one::inner::function as AbsoluteConflict;
+}
+#[doc(no_inline)] pub use absolute_one::*;
+#[doc(no_inline)] pub use absolute_two::*;
+"#,
+    )
+    .unwrap();
+    let import = "use alias::{Record, Choice::{self, One}, Trait, Alias, function, Renamed, Absolute, VALUE, STATIC, nested::{self, deeper::Nested}};";
+    fs::write(root.join("app/src/lib.rs"), import).unwrap();
+    success(
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    );
+    let report = success(query(root, import, &[]));
+    assert_eq!(paths(&report, "source: ").len(), 12, "{report}");
+    for name in [
+        "Conflict",
+        "LocalConflict",
+        "ImportedConflict",
+        "GeneratedConflict",
+        "AbsoluteConflict",
+    ] {
+        fs::write(root.join("app/src/lib.rs"), format!("use alias::{name};")).unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success(), "{name}: {checked:?}");
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("ambiguous"),
+            "{name}: {checked:?}"
+        );
+        let error = failure(query(root, &format!("use alias::{name};"), &[]));
+        assert!(error.contains("ambiguous"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn inlined_module_aliases_follow_out_of_line_and_nested_sources() {
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        "pub mod a;\npub mod b;\n#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;",
+    )
+    .unwrap();
+    fs::write(
+        root.join("api/src/a.rs"),
+        "pub mod separate;\npub mod nested { pub mod deeper { pub struct Item; } }",
+    )
+    .unwrap();
+    fs::create_dir(root.join("api/src/a")).unwrap();
+    fs::write(
+        root.join("api/src/a/separate.rs"),
+        "pub struct Item;\npub fn function() {}",
+    )
+    .unwrap();
+    fs::write(
+        root.join("api/src/b.rs"),
+        "#[doc(inline)] pub use crate::a::*;",
+    )
+    .unwrap();
+    let import = "use alias::{separate::{self, Item, function}, nested::{self, deeper::{self, Item as Nested}}};";
+    fs::write(root.join("app/src/lib.rs"), import).unwrap();
+    success(
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    );
+    let report = success(query(root, import, &[]));
+    assert_eq!(paths(&report, "source: ").len(), 6, "{report}");
+}
+
+#[test]
+fn macro_definitions_with_shared_source_spans_remain_ambiguous() {
+    let dir = project();
+    let root = dir.path();
+    member(
+        root,
+        "macros",
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n",
+        r#"
+use proc_macro::{Delimiter, Group, TokenStream, TokenTree};
+#[proc_macro_attribute]
+pub fn duplicate(_: TokenStream, item: TokenStream) -> TokenStream {
+    let mut out = TokenStream::new();
+    for name in ["a", "b"] {
+        out.extend(format!("pub mod {name}").parse::<TokenStream>().unwrap());
+        out.extend([TokenTree::Group(Group::new(Delimiter::Brace, item.clone()))]);
+    }
+    out
+}
+"#,
+    );
+    let manifest = root.join("api/Cargo.toml");
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest).unwrap().replace(
+            "[dependencies]",
+            "[dependencies]\nmacros = { path = \"../macros\" }",
+        ),
+    )
+    .unwrap();
+    for source in [
+        "#[macros::duplicate]\npub fn conflict() {}\n#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;",
+        "pub mod a { include!(\"shared.rs\"); }\npub mod b { include!(\"shared.rs\"); }\n#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;",
+    ] {
+        fs::write(root.join("api/src/lib.rs"), source).unwrap();
+        fs::write(root.join("api/src/shared.rs"), "pub fn conflict() {}").unwrap();
+        fs::write(root.join("app/src/lib.rs"), "use alias::conflict;").unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success(), "{checked:?}");
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("ambiguous"),
+            "{checked:?}"
+        );
+        let error = failure(query(root, "use alias::conflict;", &[]));
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+}
+
+#[test]
 fn glob_shadowing_tracks_type_and_value_constructor_namespaces() {
     let dir = project();
     fs::write(
@@ -1146,6 +1515,9 @@ pub mod values {
     pub fn TupleVariant() {}
     pub fn RecordVariant() {}
     pub fn EmptyRecordVariant() {}
+    pub fn AttributedRecord() {}
+    pub fn DeprecatedRecord() {}
+    pub fn r#type() {}
 }
 #[doc(no_inline)] pub use values::*;
 pub struct Unit;
@@ -1154,14 +1526,19 @@ pub mod original { pub struct Unit; }
 #[doc(no_inline)] pub use original::Unit as NamedUnit;
 pub struct Record { pub value: u8 }
 pub struct Combined { pub value: u8 }
-pub enum E { UnitVariant, TupleVariant(u8), RecordVariant { value: u8 }, EmptyRecordVariant {} }
-#[doc(no_inline)] pub use E::{UnitVariant, TupleVariant, RecordVariant, EmptyRecordVariant};
+pub enum E {
+    UnitVariant, TupleVariant(u8), RecordVariant { value: u8 }, EmptyRecordVariant {},
+    #[non_exhaustive] AttributedRecord { value: u8 },
+    #[deprecated] DeprecatedRecord { value: u8 },
+    #[non_exhaustive] r#type { value: u8 },
+}
+#[doc(no_inline)] pub use E::{UnitVariant, TupleVariant, RecordVariant, EmptyRecordVariant, AttributedRecord, DeprecatedRecord, r#type};
 "#,
     )
     .unwrap();
     fs::write(
         dir.path().join("app/src/lib.rs"),
-        "use alias::{Unit, Tuple, NamedUnit, Record, Combined, UnitVariant, TupleVariant, RecordVariant, EmptyRecordVariant};\nfn probe() { let _: Unit = Unit; let _: Tuple = Tuple(0); let _: NamedUnit = NamedUnit; Record(); Combined(0); RecordVariant(); EmptyRecordVariant(); }",
+        "use alias::{Unit, Tuple, NamedUnit, Record, Combined, UnitVariant, TupleVariant, RecordVariant, EmptyRecordVariant, AttributedRecord, DeprecatedRecord, r#type};\nfn probe() { let _: Unit = Unit; let _: Tuple = Tuple(0); let _: NamedUnit = NamedUnit; Record(); Combined(0); RecordVariant(); EmptyRecordVariant(); AttributedRecord(); DeprecatedRecord(); r#type(); }",
     )
     .unwrap();
     let checked = Command::new("cargo")
@@ -1178,7 +1555,15 @@ pub enum E { UnitVariant, TupleVariant(u8), RecordVariant { value: u8 }, EmptyRe
     assert!(report.contains("pub struct Unit"), "{report}");
     assert!(report.contains("pub struct Tuple"), "{report}");
     assert!(report.contains("pub enum E"), "{report}");
-    for name in ["Record", "Combined", "RecordVariant", "EmptyRecordVariant"] {
+    for name in [
+        "Record",
+        "Combined",
+        "RecordVariant",
+        "EmptyRecordVariant",
+        "AttributedRecord",
+        "DeprecatedRecord",
+        "r#type",
+    ] {
         let error = failure(query(dir.path(), &format!("use alias::{name};"), &[]));
         assert!(error.contains("ambiguous"), "{name}: {error}");
     }
@@ -1882,6 +2267,95 @@ fn proc_macro_consumers_query_ordinary_dependencies_in_the_host_context() {
         assert!(
             failure(query_macros("use opposite_api::Enabled;")).contains("not a direct dependency")
         );
+    }
+}
+
+#[test]
+fn proc_macro_dev_dependencies_keep_target_units_separate_from_normal_units() {
+    let dir = project();
+    let root = dir.path();
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    member(
+        root,
+        "api",
+        "[package]\nname = \"api\"\nversion = \"1.2.3\"\nedition = \"2024\"\n[dependencies]\ninner = { path = \"../inner\" }\n[features]\nhost = [\"inner/host\"]\ndev = [\"inner/dev\"]\n",
+        "#[doc(inline)] pub use inner::Item;",
+    );
+    member(
+        root,
+        "inner",
+        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\nhost = []\ndev = []\n",
+        "#![allow(unexpected_cfgs)]\npub struct Item;\nimpl Item {\n#[cfg(target_unit)] pub fn target_only() {}\n#[cfg(feature = \"host\")] pub fn host_feature() {}\n#[cfg(feature = \"dev\")] pub fn dev_feature() {}\n}",
+    );
+    fs::create_dir_all(root.join("app/tests")).unwrap();
+    fs::write(
+        root.join("app/tests/target.rs"),
+        "#[test] fn target() { alias::Item::target_only(); }",
+    )
+    .unwrap();
+    for normal in [false, true] {
+        let normal_dependency = if normal {
+            "[dependencies]\nalias = { package = \"api\", path = \"../api\", features = [\"host\"] }\n"
+        } else {
+            ""
+        };
+        member(
+            root,
+            "app",
+            &format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n{normal_dependency}[target.'{host}'.dev-dependencies]\nalias = {{ package = \"api\", path = \"../api\", features = [\"dev\"] }}\n"
+            ),
+            "",
+        );
+        success(
+            Command::new("cargo")
+                .args([
+                    "check",
+                    "--offline",
+                    "--package",
+                    "app",
+                    "--tests",
+                    "--target",
+                    host,
+                ])
+                .env("RUSTFLAGS", "--cfg target_unit")
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let report = success(
+            query_command(
+                root,
+                "use alias::Item;",
+                &["--include-dev", "--target", host],
+            )
+            .env("RUSTFLAGS", "--cfg target_unit")
+            .output()
+            .unwrap(),
+        );
+        let reports = report.split("crate: api\n").skip(1).collect::<Vec<_>>();
+        assert_eq!(reports.len(), if normal { 2 } else { 1 }, "{report}");
+        let dev = reports
+            .iter()
+            .find(|text| text.contains("dependency: dev ("))
+            .unwrap();
+        assert!(dev.contains("fn target_only("), "{report}");
+        assert!(dev.contains("fn dev_feature("), "{report}");
+        assert_eq!(dev.contains("fn host_feature("), normal, "{report}");
+        if normal {
+            let normal = reports
+                .iter()
+                .find(|text| text.contains("dependency: normal\n"))
+                .unwrap();
+            assert!(normal.contains("fn host_feature("), "{report}");
+            assert!(!normal.contains("fn target_only("), "{report}");
+            assert!(normal.contains("fn dev_feature("), "{report}");
+        }
     }
 }
 

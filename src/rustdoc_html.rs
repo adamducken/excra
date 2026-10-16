@@ -2,7 +2,7 @@ use crate::cargo_graph::{self, FeatureGraph};
 use crate::cli::FeatureSelection;
 use crate::imports::{ImportPath, identifier_key};
 use crate::resolver::{ResolvedDependency, package_spec};
-use cargo_metadata::{Metadata, MetadataCommand, Package};
+use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, NodeDep, Package, PackageId};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
 use html_to_markdown_rs::{CodeBlockStyle, ConversionOptions, HeadingStyle, convert};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) struct Documentation {
     pub(crate) directory: PathBuf,
+    external_crates: Vec<NodeDep>,
     _generation_lock: fs::File,
 }
 
@@ -27,19 +28,8 @@ pub(crate) fn generate(
     host_context: bool,
 ) -> Result<Documentation, String> {
     let package = dependency.package;
-    let configuration = cargo_configuration(manifest)?;
-    let targeted = target.is_some()
-        || std::env::var_os("CARGO_BUILD_TARGET").is_some()
-        || configuration.iter().any(|(_, contents)| {
-            contents
-                .parse::<toml::Table>()
-                .ok()
-                .and_then(|config| config.get("build")?.get("target").cloned())
-                .is_some_and(|target| match target {
-                    toml::Value::Array(targets) => !targets.is_empty(),
-                    _ => true,
-                })
-        });
+    let configuration = cargo_graph::cargo_configuration(manifest)?;
+    let targeted = cargo_graph::targeted(target, &configuration);
     let host = if host_context && targeted {
         Some(cargo_graph::host_triple(manifest, metadata)?)
     } else {
@@ -124,6 +114,7 @@ pub(crate) fn generate(
     }
     // The copied lockfile pins the original registry versions and Git revisions.
     let generated_metadata = MetadataCommand::new()
+        .cargo_path("cargo")
         .manifest_path(&generated_manifest)
         .current_dir(manifest.parent().expect("manifest has a parent"))
         .other_options(vec!["--offline".into()])
@@ -225,80 +216,14 @@ pub(crate) fn generate(
     convert_crate(&docs, &docs.join(dependency.target.name.replace('-', "_")))?;
     Ok(Documentation {
         directory: docs,
+        external_crates: generated_metadata
+            .resolve
+            .as_ref()
+            .and_then(|resolve| resolve.nodes.iter().find(|node| node.id == documented.id))
+            .map(|node| node.deps.clone())
+            .unwrap_or_default(),
         _generation_lock: generation_lock,
     })
-}
-
-fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    let mut directories = manifest
-        .parent()
-        .expect("manifest has a parent")
-        .ancestors()
-        .map(|directory| directory.join(".cargo"))
-        .collect::<Vec<_>>();
-    if let Some(home) = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-    {
-        directories.push(home);
-    }
-    let mut configuration = Vec::new();
-    let mut visited = HashSet::new();
-    for directory in directories {
-        let legacy = directory.join("config");
-        let path = if legacy.is_file() {
-            legacy
-        } else {
-            directory.join("config.toml")
-        };
-        read_configuration(&path, true, &mut visited, &mut configuration)?;
-    }
-    Ok(configuration)
-}
-
-fn read_configuration(
-    path: &Path,
-    optional: bool,
-    visited: &mut HashSet<PathBuf>,
-    configuration: &mut Vec<(PathBuf, String)>,
-) -> Result<(), String> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if optional && error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
-    };
-    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
-    if !visited.insert(canonical) {
-        return Ok(());
-    }
-    let table = contents
-        .parse::<toml::Table>()
-        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-    if let Some(includes) = table.get("include").and_then(toml::Value::as_array) {
-        for include in includes {
-            let name = include
-                .as_str()
-                .or_else(|| include.get("path").and_then(toml::Value::as_str))
-                .ok_or_else(|| {
-                    format!("invalid Cargo configuration include in {}", path.display())
-                })?;
-            let optional = include
-                .get("optional")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
-            read_configuration(
-                &path
-                    .parent()
-                    .expect("configuration has a parent")
-                    .join(name),
-                optional,
-                visited,
-                configuration,
-            )?;
-        }
-    }
-    configuration.push((path.to_path_buf(), contents));
-    Ok(())
 }
 
 fn documentation_manifest(
@@ -500,13 +425,26 @@ struct HtmlItem {
     fragment: Option<String>,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum ItemIdentity {
     Page(HtmlItem),
-    Source(HtmlItem, String, Option<String>),
+    External {
+        package: PackageId,
+        path: Vec<String>,
+        kind: String,
+        fragment: Option<String>,
+    },
 }
 
-fn item_identity(docs: &Path, item: &HtmlItem) -> Result<ItemIdentity, String> {
+fn item_identity(
+    docs: &Path,
+    external_crates: &[NodeDep],
+    item: &HtmlItem,
+    visited: &mut HashSet<HtmlItem>,
+) -> Result<ItemIdentity, String> {
+    if !visited.insert(item.clone()) {
+        return Ok(ItemIdentity::Page(item.clone()));
+    }
     let html = read_html(&item.page)?;
     let directory = item.page.parent().expect("page has a parent");
     let kind = page_kind(&item.page).unwrap_or_default();
@@ -541,39 +479,45 @@ fn item_identity(docs: &Path, item: &HtmlItem) -> Result<ItemIdentity, String> {
             }
         }
     }
-    for link in html.split("<a ").skip(1) {
-        let tag = link.split('>').next().unwrap_or_default();
-        if attribute(tag, "class") == Some("src")
-            && let Some(href) = attribute(tag, "href")
-            && let Ok(source) = local_link(docs, directory, href)
-            && unique_source_definition(&source, kind) == Some(true)
-        {
-            return Ok(ItemIdentity::Source(
-                source,
-                kind.to_string(),
-                item.fragment.clone(),
-            ));
-        }
+    if let Some(definition) = declared_reexport(docs, external_crates, item) {
+        return match definition {
+            ItemIdentity::Page(definition) => {
+                item_identity(docs, external_crates, &definition, visited)
+            }
+            external => Ok(external),
+        };
     }
     Ok(ItemIdentity::Page(item.clone()))
 }
 
-fn unique_source_definition(source: &HtmlItem, kind: &str) -> Option<bool> {
-    let range = source.fragment.as_deref()?;
-    let (start, end) = range.split_once('-').unwrap_or((range, range));
-    let start = start.parse::<usize>().ok()?;
-    let end = end.parse::<usize>().ok()?;
-    let html = read_html(&source.page).ok()?;
+fn source_link(docs: &Path, page: &Path) -> Option<HtmlItem> {
+    let html = read_html(page).ok()?;
+    for link in html.split("<a ").skip(1) {
+        let tag = link.split('>').next().unwrap_or_default();
+        if attribute(tag, "class") == Some("src")
+            && let Some(href) = attribute(tag, "href")
+            && let Ok(source) = local_link(docs, page.parent()?, href)
+        {
+            return Some(source);
+        }
+    }
+    None
+}
+
+fn source_file(page: &Path) -> Option<syn::File> {
+    let html = read_html(page).ok()?;
     let code = html.split_once("<code>")?.1.split_once("</code>")?.0;
     let snippet = code
         .lines()
-        .skip(start.checked_sub(1)?)
-        .take(end.checked_sub(start)?.checked_add(1)?)
         .map(|line| line.split_once("</a>").map_or(line, |(_, code)| code))
         .collect::<Vec<_>>()
         .join("\n");
+    syn::parse_file(&rendered_code(&snippet)?).ok()
+}
+
+fn rendered_code(html: &str) -> Option<String> {
     let markdown = convert(
-        &format!("<pre><code>{snippet}</code></pre>"),
+        &format!("<pre><code>{html}</code></pre>"),
         ConversionOptions {
             code_block_style: CodeBlockStyle::Backticks,
             visitor: Some(Arc::new(Mutex::new(CodeLinks::default()))),
@@ -584,38 +528,280 @@ fn unique_source_definition(source: &HtmlItem, kind: &str) -> Option<bool> {
     .content?;
     let code = markdown.trim().strip_prefix("```")?.split_once('\n')?.1;
     let code = code.strip_suffix("```")?;
-    let syntax = syn::parse_file(code).ok()?;
-    Some(source_definition_count(&syntax.items, kind) == 1)
+    Some(code.to_string())
 }
 
-fn source_definition_count(items: &[syn::Item], kind: &str) -> usize {
-    items
+fn plain_attributes(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().all(|attribute| {
+        [
+            "doc",
+            "cfg",
+            "allow",
+            "warn",
+            "deny",
+            "forbid",
+            "deprecated",
+            "path",
+        ]
         .iter()
-        .map(|item| {
-            let matches = matches!(
-                (kind, item),
-                ("constant", syn::Item::Const(_))
-                    | ("enum", syn::Item::Enum(_))
-                    | ("fn" | "attr" | "derive", syn::Item::Fn(_))
-                    | ("index", syn::Item::Mod(_))
-                    | ("static", syn::Item::Static(_))
-                    | ("struct", syn::Item::Struct(_))
-                    | ("trait", syn::Item::Trait(_))
-                    | ("traitalias", syn::Item::TraitAlias(_))
-                    | ("type", syn::Item::Type(_))
-                    | ("union", syn::Item::Union(_))
-            ) || matches!((kind, item), ("macro", syn::Item::Macro(item)) if item.ident.is_some());
-            let nested = if let syn::Item::Mod(module) = item {
-                module
-                    .content
-                    .as_ref()
-                    .map_or(0, |(_, items)| source_definition_count(items, kind))
-            } else {
-                0
-            };
-            usize::from(matches) + nested
-        })
-        .sum()
+        .any(|name| attribute.path().is_ident(name))
+    })
+}
+
+fn plain_items(items: &[syn::Item]) -> bool {
+    items.iter().all(|item| {
+        let attrs = match item {
+            syn::Item::Const(item) => &item.attrs,
+            syn::Item::Enum(item) => &item.attrs,
+            syn::Item::ExternCrate(item) => &item.attrs,
+            syn::Item::Fn(item) => &item.attrs,
+            syn::Item::ForeignMod(item) => &item.attrs,
+            syn::Item::Impl(item) => &item.attrs,
+            syn::Item::Macro(item) if item.ident.is_some() => &item.attrs,
+            syn::Item::Mod(item) => &item.attrs,
+            syn::Item::Static(item) => &item.attrs,
+            syn::Item::Struct(item) => &item.attrs,
+            syn::Item::Trait(item) => &item.attrs,
+            syn::Item::TraitAlias(item) => &item.attrs,
+            syn::Item::Type(item) => &item.attrs,
+            syn::Item::Union(item) => &item.attrs,
+            syn::Item::Use(item) => &item.attrs,
+            // Macro expansion can introduce bindings absent from this source.
+            _ => return false,
+        };
+        plain_attributes(attrs)
+    })
+}
+
+fn declared_reexport(
+    docs: &Path,
+    external_crates: &[NodeDep],
+    item: &HtmlItem,
+) -> Option<ItemIdentity> {
+    let relative = item.page.strip_prefix(docs).ok()?;
+    let kind = page_kind(&item.page)?;
+    let (module, name) = if kind == "index" {
+        let module = relative.parent()?;
+        (module.parent()?, module.file_name()?.to_str()?)
+    } else {
+        (
+            relative.parent()?,
+            item.page.file_stem()?.to_str()?.split_once('.')?.1,
+        )
+    };
+    let components = module
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let mut directory = docs.join(components.first()?);
+    let source = source_link(docs, &directory.join("index.html"))?;
+    let syntax = source_file(&source.page)?;
+    if !plain_attributes(&syntax.attrs) {
+        return None;
+    }
+    let mut items = syntax.items;
+    for name in &components[1..] {
+        let module = items.into_iter().find_map(|item| match item {
+            syn::Item::Mod(module) if identifier_key(&module.ident.to_string()) == *name => {
+                Some(module)
+            }
+            _ => None,
+        })?;
+        if !plain_attributes(&module.attrs) {
+            return None;
+        }
+        directory.push(name);
+        items = if let Some((_, items)) = module.content {
+            items
+        } else {
+            let source = source_link(docs, &directory.join("index.html"))?;
+            let syntax = source_file(&source.page)?;
+            if !plain_attributes(&syntax.attrs) {
+                return None;
+            }
+            syntax.items
+        };
+    }
+    if !plain_items(&items) {
+        return None;
+    }
+    // A declaration shadows a glob in its own namespace.
+    if items.iter().any(|item| {
+        let ident = match (kind, item) {
+            ("fn" | "attr" | "derive", syn::Item::Fn(item)) => Some(&item.sig.ident),
+            ("struct", syn::Item::Struct(item)) => Some(&item.ident),
+            ("enum", syn::Item::Enum(item)) => Some(&item.ident),
+            ("union", syn::Item::Union(item)) => Some(&item.ident),
+            ("trait", syn::Item::Trait(item)) => Some(&item.ident),
+            ("traitalias", syn::Item::TraitAlias(item)) => Some(&item.ident),
+            ("type", syn::Item::Type(item)) => Some(&item.ident),
+            ("constant", syn::Item::Const(item)) => Some(&item.ident),
+            ("static", syn::Item::Static(item)) => Some(&item.ident),
+            ("index", syn::Item::Mod(item)) => Some(&item.ident),
+            ("macro", syn::Item::Macro(item)) => item.ident.as_ref(),
+            _ => None,
+        };
+        ident.is_some_and(|ident| identifier_key(&ident.to_string()) == name)
+    }) {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for item in &items {
+        if let syn::Item::Use(item) = item
+            && matches!(item.vis, syn::Visibility::Public(_))
+        {
+            let mut origins = Vec::new();
+            reexport_targets(&item.tree, &mut Vec::new(), name, &mut origins);
+            targets.extend(
+                origins
+                    .into_iter()
+                    .map(|(glob, path)| (glob, item.leading_colon.is_some(), path)),
+            );
+        }
+    }
+    let explicit = targets.iter().any(|(glob, _, _)| !glob);
+    let mut definitions = HashSet::new();
+    for (glob, absolute, mut path) in targets {
+        if explicit && glob {
+            continue;
+        }
+        let mut base = components.clone();
+        let external = !matches!(path.first()?.as_str(), "crate" | "self" | "super");
+        let (crate_name, external_path) = path.split_first()?;
+        if external && (absolute || !scope_shadows_external(&items, crate_name)) {
+            // --no-deps can omit the canonical external page and its source.
+            // Resolve the declared path before considering local HTML paths:
+            // an absolute external path bypasses same-named local modules.
+            let mut packages = external_crates
+                .iter()
+                .filter(|dep| {
+                    dep.name.replace('-', "_") == *crate_name
+                        && dep
+                            .dep_kinds
+                            .iter()
+                            .any(|kind| kind.kind == DependencyKind::Normal)
+                })
+                .map(|dep| &dep.pkg);
+            if let Some(package) = packages.next() {
+                if packages.any(|other| other != package) {
+                    return None;
+                }
+                definitions.insert(ItemIdentity::External {
+                    package: package.clone(),
+                    path: external_path.to_vec(),
+                    kind: kind.to_string(),
+                    fragment: item.fragment.clone(),
+                });
+                continue;
+            }
+            if absolute {
+                return None;
+            }
+        }
+        match path.first()?.as_str() {
+            "crate" => {
+                base.truncate(1);
+                path.remove(0);
+            }
+            "self" => {
+                path.remove(0);
+            }
+            "super" => {
+                while path.first().is_some_and(|part| part == "super") {
+                    if base.len() <= 1 {
+                        return None;
+                    }
+                    base.pop();
+                    path.remove(0);
+                }
+            }
+            _ => {}
+        }
+        let mut page = docs.to_path_buf();
+        page.extend(&base);
+        let (name, parents) = path.split_last()?;
+        page.extend(parents);
+        page = if kind == "index" {
+            page.join(name).join("index.html")
+        } else {
+            page.join(format!("{kind}.{name}.html"))
+        };
+        if !page.is_file() {
+            return None;
+        }
+        definitions.insert(ItemIdentity::Page(HtmlItem {
+            page,
+            fragment: item.fragment.clone(),
+        }));
+    }
+    if definitions.len() == 1 {
+        let definition = definitions.into_iter().next()?;
+        if definition != ItemIdentity::Page(item.clone()) {
+            return Some(definition);
+        }
+    }
+    None
+}
+
+fn scope_shadows_external(items: &[syn::Item], name: &str) -> bool {
+    items.iter().any(|item| match item {
+        syn::Item::Mod(item) => identifier_key(&item.ident.to_string()) == name,
+        syn::Item::ExternCrate(item) => {
+            let ident = item.rename.as_ref().map_or(&item.ident, |(_, ident)| ident);
+            identifier_key(&ident.to_string()) == name
+        }
+        syn::Item::Use(item) => {
+            let mut targets = Vec::new();
+            reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
+            targets.iter().any(|(glob, _)| !glob)
+        }
+        _ => false,
+    })
+}
+
+fn reexport_targets(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    name: &str,
+    targets: &mut Vec<(bool, Vec<String>)>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(identifier_key(&path.ident.to_string()).into_owned());
+            reexport_targets(&path.tree, prefix, name, targets);
+            prefix.pop();
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                reexport_targets(tree, prefix, name, targets);
+            }
+        }
+        syn::UseTree::Name(item) => {
+            let ident = item.ident.to_string();
+            let ident = identifier_key(&ident);
+            if ident == name || (ident == "self" && prefix.last().is_some_and(|part| part == name))
+            {
+                let mut path = prefix.clone();
+                if ident != "self" {
+                    path.push(ident.to_string());
+                }
+                targets.push((false, path));
+            }
+        }
+        syn::UseTree::Rename(item) if identifier_key(&item.rename.to_string()) == name => {
+            let mut path = prefix.clone();
+            if item.ident != "self" {
+                path.push(identifier_key(&item.ident.to_string()).into_owned());
+            }
+            targets.push((false, path));
+        }
+        syn::UseTree::Glob(_) => {
+            let mut path = prefix.clone();
+            path.push(name.to_string());
+            targets.push((true, path));
+        }
+        _ => {}
+    }
 }
 
 impl HtmlItem {
@@ -635,11 +821,12 @@ impl HtmlItem {
 }
 
 pub(crate) fn find_page(
-    docs: &Path,
+    documentation: &Documentation,
     crate_name: &str,
     import: &ImportPath,
 ) -> Result<PathBuf, String> {
-    let mut lookup = HtmlLookup::new(docs);
+    let docs = &documentation.directory;
+    let mut lookup = HtmlLookup::new(docs, &documentation.external_crates);
     let mut item = HtmlItem::new(docs.join(crate_name).join("index.html"));
     for (index, name) in import
         .segments
@@ -656,7 +843,7 @@ pub(crate) fn find_page(
             ));
         }
         let type_only = index < import.segments.len() || import.self_parent;
-        let candidates = lookup.candidates(&item, name, type_only)?;
+        let candidates = lookup.candidates(&item, name.as_ref(), type_only)?;
         item = match candidates.as_slice() {
             [item] => item.clone(),
             [] => {
@@ -667,7 +854,7 @@ pub(crate) fn find_page(
             }
             _ => {
                 return Err(format!(
-                    "ambiguous item '{}' has multiple rustdoc HTML matches",
+                    "ambiguous rustdoc HTML matches for item '{}'; cannot establish one canonical definition",
                     import.full_path()
                 ));
             }
@@ -688,6 +875,7 @@ struct ParsedPage {
     links: HashSet<String>,
     reexports: Vec<(String, String)>,
     globs: Vec<String>,
+    variants: HashSet<String>,
 }
 
 struct Bindings {
@@ -696,39 +884,134 @@ struct Bindings {
 }
 
 impl ParsedPage {
-    fn new(html: String) -> Self {
-        let links = html
-            .split("href=\"")
-            .skip(1)
-            .filter_map(|tail| tail.split('"').next().map(str::to_string))
-            .collect();
-        let mut reexports = Vec::new();
-        let mut globs = Vec::new();
-        for row in html.split("<dt").skip(1) {
-            if !row.starts_with([' ', '>']) {
-                continue;
-            }
-            let row = row.split("</dt>").next().unwrap_or(row);
-            let Some(href) = attribute(row, "href") else {
-                continue;
-            };
-            if row.contains("::*;") {
-                globs.push(href.to_string());
-            } else if let Some(id) = attribute(row, "id") {
-                reexports.push((id.to_string(), href.to_string()));
-            }
-        }
-        Self {
+    fn new(html: String) -> Result<Self, String> {
+        let visitor = Arc::new(Mutex::new(ExportBindings::default()));
+        convert(
+            &html,
+            ConversionOptions {
+                visitor: Some(visitor.clone()),
+                ..Default::default()
+            },
+        )
+        .map_err(|error| format!("cannot parse rustdoc bindings: {error}"))?;
+        let bindings = std::mem::take(
+            &mut *visitor
+                .lock()
+                .map_err(|error| format!("cannot read rustdoc bindings: {error}"))?,
+        );
+        Ok(Self {
             html,
-            links,
-            reexports,
-            globs,
+            links: bindings.links,
+            reexports: bindings.reexports,
+            globs: bindings.globs,
+            variants: bindings.variants,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExportBindings {
+    content_depth: Option<usize>,
+    table_depth: Option<usize>,
+    variants_depth: Option<usize>,
+    row_id: Option<String>,
+    row_href: Option<String>,
+    links: HashSet<String>,
+    reexports: Vec<(String, String)>,
+    globs: Vec<String>,
+    variants: HashSet<String>,
+}
+
+impl HtmlVisitor for ExportBindings {
+    fn visit_element_start(&mut self, ctx: &NodeContext<'_>) -> VisitResult {
+        let class = ctx
+            .attributes()
+            .get("class")
+            .map(String::as_str)
+            .unwrap_or("");
+        let has_class = |name| class.split_whitespace().any(|part| part == name);
+        // Documentation may contain arbitrary HTML, including forged tables.
+        if has_class("docblock") || matches!(ctx.tag_name.as_ref(), "dd" | "nav" | "aside") {
+            return VisitResult::Skip;
         }
+        if ctx.tag_name == "section"
+            && ctx
+                .attributes()
+                .get("id")
+                .is_some_and(|id| id == "main-content")
+        {
+            self.content_depth = Some(ctx.depth);
+        } else if self
+            .content_depth
+            .is_some_and(|depth| ctx.depth == depth + 1)
+        {
+            if ctx.tag_name == "dl" && has_class("item-table") {
+                self.table_depth = Some(ctx.depth);
+            } else if ctx.tag_name == "div" && has_class("variants") {
+                self.variants_depth = Some(ctx.depth);
+            }
+        } else if ctx.tag_name == "dt"
+            && self.table_depth.is_some_and(|depth| ctx.depth == depth + 1)
+        {
+            self.row_id = ctx.attributes().get("id").cloned();
+            self.row_href = None;
+        } else if ctx.tag_name == "section"
+            && has_class("variant")
+            && self
+                .variants_depth
+                .is_some_and(|depth| ctx.depth == depth + 1)
+            && let Some(name) = ctx
+                .attributes()
+                .get("id")
+                .and_then(|id| id.strip_prefix("variant."))
+        {
+            self.variants.insert(name.to_string());
+        }
+        VisitResult::Continue
+    }
+
+    fn visit_link(
+        &mut self,
+        ctx: &NodeContext<'_>,
+        href: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> VisitResult {
+        if self.table_depth.is_some_and(|depth| ctx.depth > depth + 1) {
+            self.row_href.get_or_insert_with(|| href.to_string());
+        }
+        VisitResult::Continue
+    }
+
+    fn visit_element_end(&mut self, ctx: &NodeContext<'_>, output: &str) -> VisitResult {
+        if ctx.tag_name == "dt"
+            && self.table_depth.is_some_and(|depth| ctx.depth == depth + 1)
+            && let Some(href) = self.row_href.take()
+        {
+            if output.contains("::*;") {
+                self.globs.push(href);
+            } else if let Some(id) = self.row_id.take().filter(|id| id.starts_with("reexport.")) {
+                self.reexports.push((id, href));
+            } else {
+                self.links.insert(href);
+            }
+        }
+        if self.table_depth == Some(ctx.depth) {
+            self.table_depth = None;
+        }
+        if self.variants_depth == Some(ctx.depth) {
+            self.variants_depth = None;
+        }
+        if self.content_depth == Some(ctx.depth) {
+            self.content_depth = None;
+        }
+        VisitResult::Continue
     }
 }
 
 struct HtmlLookup<'a> {
     docs: &'a Path,
+    external_crates: &'a [NodeDep],
     pages: HashMap<PathBuf, ParsedPage>,
     completed: HashMap<(HtmlItem, String, bool), Result<Vec<HtmlItem>, String>>,
     #[cfg(test)]
@@ -736,9 +1019,10 @@ struct HtmlLookup<'a> {
 }
 
 impl<'a> HtmlLookup<'a> {
-    fn new(docs: &'a Path) -> Self {
+    fn new(docs: &'a Path, external_crates: &'a [NodeDep]) -> Self {
         Self {
             docs,
+            external_crates,
             pages: HashMap::new(),
             completed: HashMap::new(),
             #[cfg(test)]
@@ -749,7 +1033,7 @@ impl<'a> HtmlLookup<'a> {
     fn page(&mut self, path: &Path) -> Result<&ParsedPage, String> {
         if !self.pages.contains_key(path) {
             self.pages
-                .insert(path.to_path_buf(), ParsedPage::new(read_html(path)?));
+                .insert(path.to_path_buf(), ParsedPage::new(read_html(path)?)?);
         }
         Ok(&self.pages[path])
     }
@@ -802,7 +1086,12 @@ impl<'a> HtmlLookup<'a> {
                     let mut identities = HashSet::new();
                     let mut distinct = Vec::new();
                     for item in items {
-                        if identities.insert(item_identity(self.docs, &item)?) {
+                        if identities.insert(item_identity(
+                            self.docs,
+                            self.external_crates,
+                            &item,
+                            &mut HashSet::new(),
+                        )?) {
                             distinct.push(item);
                         }
                     }
@@ -896,7 +1185,7 @@ impl<'a> HtmlLookup<'a> {
         let directory = item.page.parent().expect("page has a parent");
         let mut candidates = Vec::new();
         if page_kind(&item.page) == Some("enum") {
-            if page.html.contains(&format!("id=\"variant.{name}\"")) {
+            if page.variants.contains(name) {
                 candidates.push(HtmlItem {
                     page: item.page.clone(),
                     fragment: Some(format!("variant.{name}")),
@@ -955,9 +1244,9 @@ impl<'a> HtmlLookup<'a> {
             let candidate = self.follow_redirect(&candidate)?;
             if !type_only || candidate.kind().is_some_and(type_kind) {
                 let namespaces = if matches!(candidate.kind(), Some("struct" | "variant")) {
-                    item_namespaces(&candidate, &self.page(&candidate.page)?.html)
+                    item_namespaces(&candidate, &self.page(&candidate.page)?.html)?
                 } else {
-                    item_namespaces(&candidate, "")
+                    item_namespaces(&candidate, "")?
                 };
                 bindings.push((candidate, namespaces));
             }
@@ -969,8 +1258,8 @@ impl<'a> HtmlLookup<'a> {
     }
 }
 
-fn item_namespaces(item: &HtmlItem, html: &str) -> u8 {
-    match item.kind() {
+fn item_namespaces(item: &HtmlItem, html: &str) -> Result<u8, String> {
+    Ok(match item.kind() {
         Some("struct" | "variant") => {
             let declaration = html
                 .split_once("<pre class=\"rust item-decl\">")
@@ -982,8 +1271,27 @@ fn item_namespaces(item: &HtmlItem, html: &str) -> u8 {
                 .as_deref()
                 .and_then(|fragment| fragment.strip_prefix("variant."))
             {
-                !declaration.contains(&format!("\n    {name} {{"))
-                    && !declaration.contains(&format!("\n    r#{name} {{"))
+                let code = rendered_code(
+                    declaration
+                        .trim()
+                        .strip_prefix("<code>")
+                        .and_then(|code| code.strip_suffix("</code>"))
+                        .unwrap_or(declaration),
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "cannot parse rustdoc enum declaration in {}",
+                        item.page.display()
+                    )
+                })?;
+                // Rustdoc may render raw identifiers without `r#`. Attribute
+                // markup is decoded before inspecting the variant's shape.
+                !code.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.strip_prefix(name)
+                        .or_else(|| line.strip_prefix(&format!("r#{name}")))
+                        .is_some_and(|tail| tail.trim_start().starts_with('{'))
+                })
             } else {
                 declaration.trim_end().ends_with(";</code>")
             };
@@ -993,7 +1301,7 @@ fn item_namespaces(item: &HtmlItem, html: &str) -> u8 {
         Some(kind) if type_kind(kind) => 1,
         Some("macro" | "attr" | "derive") => 4,
         _ => 2,
-    }
+    })
 }
 
 fn page_kind(page: &Path) -> Option<&str> {
@@ -1218,6 +1526,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_metadata_excludes_documentation_and_navigation_links() {
+        let page = ParsedPage::new(
+            r#"
+<aside><section id="main-content"><dl class="item-table"><dt><a href="struct.Navigation.html">Navigation</a></dt></dl></section></aside>
+<main><section id="main-content">
+<div class="docblock"><dl class="item-table"><dt><a href="struct.Prose.html">Prose</a></dt></dl><div class="variants"><section class="variant" id="variant.Fake"></section></div></div>
+<dl class="item-table">
+<dt><a href="struct.Real.html">Real</a></dt>
+<dd><dl class="item-table"><dt id="reexport.Fake"><a href="struct.Summary.html">Summary</a></dt></dl></dd>
+<dt id="reexport.Alias"><code>pub use <a href="struct.Other.html">Other</a> as Alias;</code></dt>
+<dt><code>pub use <a href="exports/index.html">exports</a>::*;</code></dt>
+</dl>
+<div class="variants"><section id="variant.Present" class="variant"></section><div class="docblock"><section id="variant.Forged" class="variant"></section></div></div>
+</section></main>
+"#
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(page.links, HashSet::from(["struct.Real.html".to_string()]));
+        assert_eq!(
+            page.reexports,
+            [(
+                "reexport.Alias".to_string(),
+                "struct.Other.html".to_string()
+            )]
+        );
+        assert_eq!(page.globs, ["exports/index.html"]);
+        assert_eq!(page.variants, HashSet::from(["Present".to_string()]));
+    }
+
+    #[test]
     fn shared_glob_graphs_expand_each_page_once_and_reuse_completed_lookups() {
         for levels in [15, 30, 60] {
             let dir = tempfile::TempDir::new().unwrap();
@@ -1225,12 +1564,15 @@ mod tests {
             let write_module = |name: &str, body: String| {
                 let directory = docs.join(name);
                 fs::create_dir_all(&directory).unwrap();
-                fs::write(directory.join("index.html"), format!("<main>{body}</main>")).unwrap();
+                fs::write(directory.join("index.html"), format!("<main><section id=\"main-content\"><dl class=\"item-table\">{body}</dl></section></main>")).unwrap();
             };
-            let glob = |href: &str| format!("<dt><a href=\"{href}\">module</a>::*;</dt>");
+            let glob = |href: &str| {
+                format!("<dt><code>pub use <a href=\"{href}\">module</a>::*;</code></dt>")
+            };
             write_module(
                 "leaf",
-                "<a href=\"struct.Item.html\">Item</a>".to_string() + &glob("../index.html"),
+                "<dt><a href=\"struct.Item.html\">Item</a></dt>".to_string()
+                    + &glob("../index.html"),
             );
             let definition = docs.join("leaf/struct.Item.html");
             fs::write(
@@ -1258,7 +1600,7 @@ mod tests {
                     + &glob(&format!("b{}/index.html", levels - 1)),
             );
             let root = HtmlItem::new(docs.join("index.html"));
-            let mut lookup = HtmlLookup::new(docs);
+            let mut lookup = HtmlLookup::new(docs, &[]);
             let result = lookup.candidates(&root, "Item", false).unwrap();
             assert_eq!(result, vec![HtmlItem::new(definition)]);
             assert_eq!(lookup.expansions, 2 * levels + 2);
@@ -1346,7 +1688,7 @@ mod tests {
         let import = crate::imports::parse_use_lines("use api::item;")
             .unwrap()
             .remove(0);
-        let page = find_page(&docs.directory, "api", &import).unwrap();
+        let page = find_page(&docs, "api", &import).unwrap();
         let lock = docs
             .directory
             .ancestors()
