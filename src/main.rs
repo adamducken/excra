@@ -1,5 +1,6 @@
 mod cargo_graph;
 mod cli;
+mod compiler;
 mod imports;
 mod resolver;
 mod rustdoc_html;
@@ -12,8 +13,13 @@ use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = if compiler::is_wrapper() {
+        compiler::run_wrapper()
+    } else {
+        run().map(|()| ExitCode::SUCCESS)
+    };
+    match result {
+        Ok(code) => code,
         Err(message) => {
             eprintln!("excra: {message}");
             ExitCode::from(2)

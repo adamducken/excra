@@ -1,4 +1,5 @@
 use crate::cli::FeatureSelection;
+use crate::compiler::Context;
 use crate::resolver::package_spec;
 use cargo_metadata::{DependencyKind, Metadata, Package, PackageId};
 use cargo_platform::{Cfg, Platform};
@@ -23,17 +24,26 @@ pub(crate) fn platform(
     metadata: &Metadata,
     target: Option<&str>,
 ) -> Result<TargetPlatform, String> {
+    platform_with_context(manifest, metadata, target, &Context::default())
+}
+
+pub(crate) fn platform_with_context(
+    manifest: &Path,
+    metadata: &Metadata,
+    target: Option<&str>,
+    context: &Context,
+) -> Result<TargetPlatform, String> {
     parse_platform(&probe(
         manifest,
         metadata,
         target,
-        false,
+        context,
         &["--print", "cfg", "--print", "target-libdir"],
     )?)
 }
 
 pub(crate) fn host_triple(manifest: &Path, metadata: &Metadata) -> Result<String, String> {
-    probe(manifest, metadata, None, false, &["-vV"])?
+    probe(manifest, metadata, None, &Context::default(), &["-vV"])?
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .map(str::to_string)
@@ -53,7 +63,7 @@ pub(crate) fn host_platform(
         manifest,
         metadata,
         Some(&host),
-        true,
+        &Context::without_target_flags(),
         &["--print", "cfg", "--print", "target-libdir"],
     )?)
 }
@@ -77,7 +87,7 @@ fn probe(
     manifest: &Path,
     metadata: &Metadata,
     target: Option<&str>,
-    suppress_target_flags: bool,
+    context: &Context,
     rustc_args: &[&str],
 ) -> Result<String, String> {
     let directory = metadata.target_directory.join("excra");
@@ -101,9 +111,7 @@ fn probe(
     if let Some(target) = target {
         command.args(["--target", target]);
     }
-    if suppress_target_flags {
-        command.env("CARGO_ENCODED_RUSTFLAGS", "");
-    }
+    context.apply(&mut command);
     let output = command
         .arg("--")
         .args(rustc_args)
@@ -133,7 +141,8 @@ pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, Strin
     }
     let mut configuration = Vec::new();
     let mut visited = HashSet::new();
-    for directory in directories {
+    // Merge from the least specific directory; each file overrides includes.
+    for directory in directories.into_iter().rev() {
         let legacy = directory.join("config");
         let path = if legacy.is_file() {
             legacy
@@ -262,6 +271,26 @@ pub(crate) fn features(
     target: Option<&str>,
     include_dev: bool,
 ) -> Result<FeatureGraph, String> {
+    features_with_context(
+        manifest,
+        metadata,
+        root,
+        selection,
+        target,
+        include_dev,
+        &Context::default(),
+    )
+}
+
+pub(crate) fn features_with_context(
+    manifest: &Path,
+    metadata: &Metadata,
+    root: &Package,
+    selection: &FeatureSelection,
+    target: Option<&str>,
+    include_dev: bool,
+    context: &Context,
+) -> Result<FeatureGraph, String> {
     let command = || {
         let mut command = Command::new("cargo");
         command
@@ -285,6 +314,7 @@ pub(crate) fn features(
         if let Some(target) = target {
             command.args(["--target", target]);
         }
+        context.apply(&mut command);
         command
     };
     // Repeated rows still carry edges and features; expand each Cargo unit once.

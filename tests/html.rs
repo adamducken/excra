@@ -680,7 +680,7 @@ fn host_documentation_preserves_compiler_flag_routing() {
         member(
             root,
             "api",
-            "[package]\nname = \"api\"\nversion = \"1.2.3\"\nedition = \"2024\"\n[dependencies]\ninner = { path = \"../inner\" }\n[build-dependencies]\ninner = { path = \"../inner\" }\n",
+            "[package]\nname = \"api\"\nversion = \"1.2.3\"\nedition = \"2024\"\n[dependencies]\ninner = { path = \"../inner\" }\n[build-dependencies]\ninner = { path = \"../inner\" }\n[target.'cfg(host_flag)'.dependencies]\npositive = { path = '../positive' }\n[target.'cfg(not(host_flag))'.dependencies]\nnegative = { path = '../negative' }\n",
             "pub use inner::Kind;",
         );
         member(
@@ -689,6 +689,16 @@ fn host_documentation_preserves_compiler_flag_routing() {
             "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
             "#![allow(unexpected_cfgs)]\npub enum Kind { Base, #[cfg(host_flag)] Flagged }",
         );
+        for (name, item) in [("positive", "Positive"), ("negative", "Negative")] {
+            member(
+                root,
+                name,
+                &format!(
+                    "[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2024'\n[workspace]\n"
+                ),
+                &format!("pub struct {item};"),
+            );
+        }
         success(
             Command::new("cargo")
                 .args(["generate-lockfile", "--offline"])
@@ -788,6 +798,96 @@ fn host_documentation_preserves_compiler_flag_routing() {
 }
 
 #[test]
+fn proc_macro_host_graphs_preserve_conditional_transitive_dependencies() {
+    let version = success(Command::new("rustc").arg("-vV").output().unwrap());
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    for flags in ["plain", "encoded", "configured"] {
+        let dir = project();
+        let root = dir.path();
+        member(
+            root,
+            "app",
+            "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[lib]\nproc-macro = true\n[dependencies]\nalias = { package = 'api', path = '../api' }\n",
+            "",
+        );
+        member(
+            root,
+            "api",
+            "[package]\nname = 'api'\nversion = '1.2.3'\nedition = '2024'\n[dependencies]\ninner = { path = '../inner' }\n[target.'cfg(host_flag)'.dependencies]\npositive = { path = '../positive' }\n[target.'cfg(not(host_flag))'.dependencies]\nnegative = { path = '../negative' }\n",
+            "pub use inner::Kind;",
+        );
+        fs::write(root.join("inner/src/lib.rs"), "#![allow(unexpected_cfgs)]\n#[cfg(host_flag)] pub struct Kind { pub target_flag: u8 }\n#[cfg(not(host_flag))] pub struct Kind { pub host_default: u8 }\n").unwrap();
+        for (name, field) in [("positive", "target_flag"), ("negative", "host_default")] {
+            member(
+                root,
+                name,
+                &format!(
+                    "[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2024'\n[workspace]\n"
+                ),
+                &format!("pub struct Kind {{ pub {field}: u8 }}"),
+            );
+        }
+        success(
+            Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        fs::create_dir(root.join(".cargo")).unwrap();
+        for selection in ["native", "cli", "config"] {
+            let mut config = String::from("[build]\n");
+            if flags == "configured" {
+                config.push_str("rustflags = ['--cfg', 'host_flag']\n");
+            }
+            if selection == "config" {
+                config.push_str(&format!("target = '{host}'\n"));
+            }
+            fs::write(root.join(".cargo/config.toml"), config).unwrap();
+            let mut check = Command::new("cargo");
+            check
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root);
+            let mut query = query_command(root, "use alias::Kind;", &[]);
+            for command in [&mut check, &mut query] {
+                for name in [
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    "CARGO_BUILD_RUSTFLAGS",
+                    "CARGO_BUILD_TARGET",
+                ] {
+                    command.env_remove(name);
+                }
+                if flags == "plain" {
+                    command.env("RUSTFLAGS", "--cfg host_flag");
+                }
+                if flags == "encoded" {
+                    command.env("CARGO_ENCODED_RUSTFLAGS", "--cfg\x1fhost_flag");
+                }
+                if selection == "cli" {
+                    command.args(["--target", host]);
+                }
+            }
+            success(check.output().unwrap());
+            let report = success(query.output().unwrap());
+            assert_eq!(
+                report.contains("pub target_flag: u8"),
+                selection == "native",
+                "{flags}/{selection}: {report}"
+            );
+            assert_eq!(
+                report.contains("pub host_default: u8"),
+                selection != "native",
+                "{flags}/{selection}: {report}"
+            );
+        }
+    }
+}
+
+#[test]
 fn documentation_honors_default_and_custom_cargo_home_configuration() {
     let dir = project();
     let mut command = Command::new(env!("CARGO_BIN_EXE_excra"));
@@ -874,6 +974,149 @@ fn every_subprocess_uses_path_cargo_even_when_cargo_env_selects_another_wrapper(
     let calls = fs::read_to_string(calls).unwrap();
     for subcommand in ["metadata", "rustc", "tree", "doc"] {
         assert!(calls.lines().any(|line| line == subcommand), "{calls}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn isolated_docs_preserve_workspace_wrapper_membership_and_composition() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = ['app', 'api', 'inner']\nexclude = ['outside']\nresolver = '3'\n",
+    )
+    .unwrap();
+    fs::write(root.join("app/Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nalias = { package = 'api', path = '../api' }\n").unwrap();
+    fs::write(
+        root.join("app/src/lib.rs"),
+        "pub fn item() -> alias::Item { alias::Item { expected: 1 } }",
+    )
+    .unwrap();
+    fs::write(root.join("api/Cargo.toml"), "[package]\nname = 'api'\nversion = '1.2.3'\nedition = '2024'\n[dependencies]\ninner = { path = '../inner' }\noutside = { path = '../outside' }\n").unwrap();
+    fs::write(
+        root.join("api/src/lib.rs"),
+        "pub use inner::Item; pub use outside::External;",
+    )
+    .unwrap();
+    fs::write(
+        root.join("inner/src/lib.rs"),
+        r#"
+#![allow(unexpected_cfgs)]
+#[cfg(workspace_flag)] pub struct Item { pub expected: u8 }
+#[cfg(not(workspace_flag))] pub struct Item { pub incorrect: u16 }
+"#,
+    )
+    .unwrap();
+    member(
+        root,
+        "outside",
+        "[package]\nname = 'outside'\nversion = '0.1.0'\nedition = '2024'\n",
+        r#"
+#![allow(unexpected_cfgs)]
+#[cfg(workspace_flag)] pub struct External { pub incorrect_external: u16 }
+#[cfg(not(workspace_flag))] pub struct External {
+    pub expected_external: u8,
+    #[cfg(general_flag)] pub general: bool,
+}
+"#,
+    );
+    fs::create_dir(root.join(".cargo")).unwrap();
+    for (name, flag) in [
+        ("workspace-wrapper", "workspace_flag"),
+        ("general-wrapper", "general_flag"),
+    ] {
+        let wrapper = root.join(name);
+        fs::write(&wrapper, format!("#!/bin/sh\nexec \"$@\" --cfg {flag}\n")).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    success(
+        Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    );
+    for mode in [
+        "environment",
+        "composed",
+        "build-environment",
+        "configuration",
+        "included-configuration",
+        "external-request",
+    ] {
+        if mode == "external-request" {
+            fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = ['app', 'inner']\nexclude = ['api', 'outside']\nresolver = '3'\n").unwrap();
+        }
+        let config = root.join(".cargo/config.toml");
+        fs::write(&config, match mode {
+            "configuration" => "[build]\nrustc-workspace-wrapper = 'workspace-wrapper'\nrustc-wrapper = './general-wrapper'\n",
+            "included-configuration" => "include = ['wrappers.toml']\n",
+            _ => "",
+        }).unwrap();
+        fs::write(root.join(".cargo/wrappers.toml"), "[build]\nrustc-workspace-wrapper = './workspace-wrapper'\nrustc-wrapper = './general-wrapper'\n").unwrap();
+        let configure = |command: &mut Command| {
+            for name in [
+                "RUSTC_WRAPPER",
+                "RUSTC_WORKSPACE_WRAPPER",
+                "CARGO_BUILD_RUSTC_WRAPPER",
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            ] {
+                command.env_remove(name);
+            }
+            match mode {
+                "environment" | "composed" | "external-request" => {
+                    command.env("RUSTC_WORKSPACE_WRAPPER", "./workspace-wrapper");
+                }
+                "build-environment" => {
+                    command.env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "./workspace-wrapper");
+                }
+                "configuration" => {
+                    let mut path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                        .collect::<Vec<_>>();
+                    path.insert(0, root.to_path_buf());
+                    command.env("PATH", std::env::join_paths(path).unwrap());
+                }
+                _ => {}
+            }
+            if mode == "composed" || mode == "external-request" {
+                command.env("RUSTC_WRAPPER", "./general-wrapper");
+            }
+            if mode == "build-environment" {
+                command.env("CARGO_BUILD_RUSTC_WRAPPER", "./general-wrapper");
+            }
+            command.current_dir(root);
+        };
+        let mut ordinary = Command::new("cargo");
+        ordinary.args([
+            "doc",
+            "--offline",
+            "--locked",
+            "--no-deps",
+            "--package",
+            "api",
+        ]);
+        configure(&mut ordinary);
+        success(ordinary.output().unwrap());
+        let expected = fs::read_to_string(root.join("target/doc/api/struct.Item.html")).unwrap();
+        assert!(expected.contains("expected"), "{mode}");
+        assert!(!expected.contains("incorrect"), "{mode}");
+        let mut command = query_command(root, "use alias::{Item, External};", &[]);
+        configure(&mut command);
+        let report = success(command.output().unwrap());
+        assert!(report.contains("pub expected: u8"), "{mode}: {report}");
+        assert!(
+            report.contains("pub expected_external: u8"),
+            "{mode}: {report}"
+        );
+        assert!(!report.contains("incorrect"), "{mode}: {report}");
+        assert_eq!(
+            report.contains("pub general: bool"),
+            mode != "environment",
+            "{mode}: {report}"
+        );
     }
 }
 
@@ -1200,6 +1443,55 @@ pub mod Shared { pub struct Nested; }
 }
 
 #[test]
+fn omitted_bindings_shadow_globs_without_substituting_another_definition() {
+    let dir = project();
+    let root = dir.path();
+    for nested in [false, true] {
+        for binding in [
+            "#[doc(hidden)] pub struct Item { pub actual: u64 }",
+            "#[derive(Debug)] #[doc(hidden)] pub struct Item { pub actual: u64 }",
+            "struct Item;",
+            "mod local { pub struct Item; } use local::Item;",
+            "mod local { pub struct Item; } #[doc(hidden)] pub use local::Item;",
+        ] {
+            let source = format!(
+                "pub mod origin {{ pub struct Item {{ pub wrong: u8 }} pub struct Control; }}\n\
+                 #[doc(no_inline)] pub use origin::*;\n{binding}"
+            );
+            let source = if nested {
+                format!("pub mod nested {{ {source} }}")
+            } else {
+                source
+            };
+            fs::write(root.join("api/src/lib.rs"), source).unwrap();
+            let prefix = if nested { "alias::nested" } else { "alias" };
+            let import = format!("use {prefix}::Item;");
+            fs::write(root.join("app/src/lib.rs"), &import).unwrap();
+            let checked = Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert_eq!(
+                checked.status.success(),
+                binding.contains("doc(hidden)"),
+                "{binding}: {checked:?}"
+            );
+            let error = failure(query(root, &import, &[]));
+            assert!(
+                error.contains("no available rustdoc HTML page"),
+                "{binding}: {error}"
+            );
+            let report = success(query(root, &format!("use {prefix}::Control;"), &[]));
+            assert!(
+                paths(&report, "source: ")[0].ends_with("origin/struct.Control.html"),
+                "{report}"
+            );
+        }
+    }
+}
+
+#[test]
 fn deeply_layered_glob_reexports_resolve_to_one_item() {
     let dir = project();
     let levels = 30;
@@ -1290,6 +1582,46 @@ pub struct Namespace;
 }
 
 #[test]
+fn harmless_attributes_do_not_disable_explicit_reexport_identity() {
+    let dir = project();
+    let root = dir.path();
+    for (crate_attrs, unrelated) in [
+        ("#![no_std]", ""),
+        ("", "#[derive(Debug)] pub struct Unrelated;"),
+        (
+            "#![no_std]\n#![recursion_limit = \"128\"]",
+            "#[derive(Debug, Clone)] pub struct Unrelated;",
+        ),
+    ] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                r#"
+{crate_attrs}
+pub fn source() {{}}
+pub mod a {{ {unrelated} #[doc(inline)] pub use crate::source as Alias; }}
+pub mod b {{ {unrelated} #[doc(inline)] pub use crate::source as Alias; }}
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("app/src/lib.rs"), "use alias::Alias;").unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let report = success(query(root, "use alias::Alias;", &[]));
+        assert_eq!(paths(&report, "source: ").len(), 1, "{report}");
+        assert!(report.contains("pub fn Alias"), "{report}");
+    }
+}
+
+#[test]
 fn external_inlined_aliases_share_identity_without_merging_distinct_definitions() {
     let dir = project();
     let root = dir.path();
@@ -1352,11 +1684,13 @@ pub mod generated_one {
     macro_rules! local { () => { mod inner { pub fn function() {} } }; }
     local!();
     #[doc(inline)] pub use self::inner::function as GeneratedConflict;
+    #[doc(inline)] pub use ::inner::function as GeneratedAbsolute;
 }
 pub mod generated_two {
     macro_rules! local { () => { mod inner { pub fn function() {} } }; }
     local!();
     #[doc(inline)] pub use self::inner::function as GeneratedConflict;
+    #[doc(inline)] pub use ::inner::function as GeneratedAbsolute;
 }
 #[doc(no_inline)] pub use generated_one::*;
 #[doc(no_inline)] pub use generated_two::*;
@@ -1375,7 +1709,7 @@ pub mod absolute_two {
 "#,
     )
     .unwrap();
-    let import = "use alias::{Record, Choice::{self, One}, Trait, Alias, function, Renamed, Absolute, VALUE, STATIC, nested::{self, deeper::Nested}};";
+    let import = "use alias::{Record, Choice::{self, One}, Trait, Alias, function, Renamed, Absolute, GeneratedAbsolute, VALUE, STATIC, nested::{self, deeper::Nested}};";
     fs::write(root.join("app/src/lib.rs"), import).unwrap();
     success(
         Command::new("cargo")
@@ -1385,7 +1719,7 @@ pub mod absolute_two {
             .unwrap(),
     );
     let report = success(query(root, import, &[]));
-    assert_eq!(paths(&report, "source: ").len(), 12, "{report}");
+    assert_eq!(paths(&report, "source: ").len(), 13, "{report}");
     for name in [
         "Conflict",
         "LocalConflict",
@@ -1406,6 +1740,64 @@ pub mod absolute_two {
         );
         let error = failure(query(root, &format!("use alias::{name};"), &[]));
         assert!(error.contains("ambiguous"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn inactive_and_macro_reexports_do_not_merge_distinct_modules() {
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("inner/src/lib.rs"),
+        r#"
+pub mod one { pub mod M { pub struct Item { pub first: u8 } } }
+pub mod two { pub mod M { pub struct Item { pub second: u16 } } }
+#[macro_export] macro_rules! make { () => {} }
+pub fn function() {}
+pub mod separate;
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("inner/src/separate.rs"), "pub fn function() {}").unwrap();
+    for attribute in ["#[cfg(any())]", "#[doc(inline)]", "#[doc(no_inline)]"] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                r#"
+pub mod a {{
+    #[doc(inline)] pub use inner::one::*;
+    {attribute} pub use inner::make as M;
+    #[doc(inline)] pub use inner::function as Alias;
+    #[doc(inline)] pub use inner::separate::function as Separate;
+}}
+pub mod b {{
+    #[doc(inline)] pub use inner::two::*;
+    {attribute} pub use inner::make as M;
+    #[doc(inline)] pub use inner::function as Alias;
+    #[doc(inline)] pub use inner::separate::function as Separate;
+}}
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("app/src/lib.rs"), "use alias::M::Item;").unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success(), "{attribute}: {checked:?}");
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("ambiguous"),
+            "{checked:?}"
+        );
+        let error = failure(query(root, "use alias::M::Item;", &[]));
+        assert!(error.contains("ambiguous"), "{attribute}: {error}");
+        let report = success(query(root, "use alias::{Alias, Separate};", &[]));
+        assert!(report.contains("pub fn Alias"), "{report}");
+        assert!(report.contains("pub fn Separate"), "{report}");
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::cargo_graph::{self, FeatureGraph};
 use crate::cli::FeatureSelection;
 use crate::imports::{ImportPath, identifier_key};
-use crate::resolver::{ResolvedDependency, package_spec};
+use crate::resolver::{ResolvedDependency, library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, NodeDep, Package, PackageId};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
 use html_to_markdown_rs::{CodeBlockStyle, ConversionOptions, HeadingStyle, convert};
@@ -15,8 +15,13 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) struct Documentation {
     pub(crate) directory: PathBuf,
-    external_crates: Vec<NodeDep>,
+    external_crates: Vec<ExternalCrate>,
     _generation_lock: fs::File,
+}
+
+struct ExternalCrate {
+    dependency: NodeDep,
+    source: PathBuf,
 }
 
 pub(crate) fn generate(
@@ -29,6 +34,7 @@ pub(crate) fn generate(
 ) -> Result<Documentation, String> {
     let package = dependency.package;
     let configuration = cargo_graph::cargo_configuration(manifest)?;
+    let mut compiler = crate::compiler::Context::new(manifest, metadata, &configuration)?;
     let targeted = cargo_graph::targeted(target, &configuration);
     let host = if host_context && targeted {
         Some(cargo_graph::host_triple(manifest, metadata)?)
@@ -37,7 +43,9 @@ pub(crate) fn generate(
     };
     let target = host.as_deref().or(target);
     let suppress_target_flags = host_context && targeted;
-    let effective_target = cargo_graph::platform(manifest, metadata, target)?;
+    compiler.suppress_target_flags = suppress_target_flags;
+    let effective_target =
+        cargo_graph::platform_with_context(manifest, metadata, target, &compiler)?;
     let contents = documentation_manifest(metadata, graph, package, host_context)?;
     let lock = fs::read(metadata.workspace_root.join("Cargo.lock"))
         .map_err(|error| format!("cannot read workspace Cargo.lock: {error}"))?;
@@ -82,6 +90,7 @@ pub(crate) fn generate(
     target_flags.hash(&mut identity);
     lock.hash(&mut identity);
     configuration.hash(&mut identity);
+    compiler.hash(&mut identity);
     let generation = metadata.target_directory.join("excra").join(format!(
         "docs-{}-{:016x}",
         package.name,
@@ -130,7 +139,7 @@ pub(crate) fn generate(
                 package.id
             )
         })?;
-    let generated_graph = cargo_graph::features(
+    let generated_graph = cargo_graph::features_with_context(
         manifest,
         &generated_metadata,
         generated_metadata
@@ -139,6 +148,7 @@ pub(crate) fn generate(
         &FeatureSelection::default(),
         target,
         false,
+        &compiler,
     )?;
     let expected = graph
         .closure((package.id.clone(), host_context))?
@@ -149,6 +159,7 @@ pub(crate) fn generate(
                 unit.host,
                 unit.features.clone(),
                 !targeted || !unit.host,
+                compiler.workspace_enabled() && metadata.workspace_members.contains(&unit.package),
             )
         })
         .collect::<HashSet<_>>();
@@ -166,12 +177,17 @@ pub(crate) fn generate(
                 host_context || unit.host,
                 unit.features.clone(),
                 !suppress_target_flags && (!targeted || !unit.host),
+                generated_metadata
+                    .packages
+                    .iter()
+                    .find(|package| package.id == unit.package)
+                    .is_some_and(|package| compiler.wraps(package)),
             )
         })
         .collect::<HashSet<_>>();
     if actual != expected {
         return Err(format!(
-            "documentation graph changed Cargo package, host, feature, or compiler flag context for {}",
+            "documentation graph changed Cargo package, host, feature, or compiler flag context (including workspace wrappers) for {}",
             package.id
         ));
     }
@@ -194,11 +210,7 @@ pub(crate) fn generate(
     if let Some(target) = target {
         command.args(["--target", target]);
     }
-    if suppress_target_flags {
-        // The selected host package is a target unit in the isolated manifest.
-        // An empty encoded value overrides every source of target Rust flags.
-        command.env("CARGO_ENCODED_RUSTFLAGS", "");
-    }
+    compiler.apply(&mut command);
     let output = command
         .stderr(Stdio::inherit())
         .output()
@@ -220,7 +232,25 @@ pub(crate) fn generate(
             .resolve
             .as_ref()
             .and_then(|resolve| resolve.nodes.iter().find(|node| node.id == documented.id))
-            .map(|node| node.deps.clone())
+            .map(|node| {
+                node.deps
+                    .iter()
+                    .filter_map(|dependency| {
+                        let package = generated_metadata
+                            .packages
+                            .iter()
+                            .find(|package| package.id == dependency.pkg)?;
+                        Some(ExternalCrate {
+                            dependency: dependency.clone(),
+                            source: library_target(package)
+                                .ok()?
+                                .src_path
+                                .clone()
+                                .into_std_path_buf(),
+                        })
+                    })
+                    .collect()
+            })
             .unwrap_or_default(),
         _generation_lock: generation_lock,
     })
@@ -438,7 +468,7 @@ enum ItemIdentity {
 
 fn item_identity(
     docs: &Path,
-    external_crates: &[NodeDep],
+    external_crates: &[ExternalCrate],
     item: &HtmlItem,
     visited: &mut HashSet<HtmlItem>,
 ) -> Result<ItemIdentity, String> {
@@ -542,53 +572,143 @@ fn plain_attributes(attributes: &[syn::Attribute]) -> bool {
             "forbid",
             "deprecated",
             "path",
+            "macro_export",
+            "no_std",
+            "no_main",
+            "recursion_limit",
+            "type_length_limit",
+            "expect",
+            "inline",
+            "cold",
+            "must_use",
+            "repr",
+            "non_exhaustive",
+            "derive",
         ]
         .iter()
         .any(|name| attribute.path().is_ident(name))
     })
 }
 
-fn plain_items(items: &[syn::Item]) -> bool {
-    items.iter().all(|item| {
-        let attrs = match item {
-            syn::Item::Const(item) => &item.attrs,
-            syn::Item::Enum(item) => &item.attrs,
-            syn::Item::ExternCrate(item) => &item.attrs,
-            syn::Item::Fn(item) => &item.attrs,
-            syn::Item::ForeignMod(item) => &item.attrs,
-            syn::Item::Impl(item) => &item.attrs,
-            syn::Item::Macro(item) if item.ident.is_some() => &item.attrs,
-            syn::Item::Mod(item) => &item.attrs,
-            syn::Item::Static(item) => &item.attrs,
-            syn::Item::Struct(item) => &item.attrs,
-            syn::Item::Trait(item) => &item.attrs,
-            syn::Item::TraitAlias(item) => &item.attrs,
-            syn::Item::Type(item) => &item.attrs,
-            syn::Item::Union(item) => &item.attrs,
-            syn::Item::Use(item) => &item.attrs,
-            // Macro expansion can introduce bindings absent from this source.
-            _ => return false,
-        };
-        plain_attributes(attrs)
+fn item_attributes(item: &syn::Item) -> Option<&[syn::Attribute]> {
+    Some(match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) if item.ident.is_some() => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        // Macro expansion can introduce bindings absent from this source.
+        _ => return None,
     })
 }
 
-fn declared_reexport(
-    docs: &Path,
-    external_crates: &[NodeDep],
-    item: &HtmlItem,
-) -> Option<ItemIdentity> {
-    let relative = item.page.strip_prefix(docs).ok()?;
-    let kind = page_kind(&item.page)?;
-    let (module, name) = if kind == "index" {
-        let module = relative.parent()?;
-        (module.parent()?, module.file_name()?.to_str()?)
-    } else {
-        (
-            relative.parent()?,
-            item.page.file_stem()?.to_str()?.split_once('.')?.1,
-        )
-    };
+fn plain_items(items: &[syn::Item]) -> bool {
+    items.iter().all(|item| {
+        item_attributes(item).is_some_and(|attrs| {
+            // Derives retain the annotated declaration, but an imported
+            // procedural derive can introduce additional bindings.
+            plain_attributes(attrs)
+                && !attrs
+                    .iter()
+                    .any(|attribute| attribute.path().is_ident("derive"))
+        })
+    })
+}
+
+fn unconditional_attributes(attributes: &[syn::Attribute]) -> bool {
+    plain_attributes(attributes)
+        && !attributes
+            .iter()
+            .any(|attribute| attribute.path().is_ident("cfg"))
+}
+
+fn declaration(item: &syn::Item) -> Option<(&syn::Ident, &'static str)> {
+    Some(match item {
+        syn::Item::Const(item) => (&item.ident, "constant"),
+        syn::Item::Enum(item) => (&item.ident, "enum"),
+        syn::Item::Fn(item) => (&item.sig.ident, "fn"),
+        syn::Item::Macro(item) => (item.ident.as_ref()?, "macro"),
+        syn::Item::Mod(item) => (&item.ident, "index"),
+        syn::Item::Static(item) => (&item.ident, "static"),
+        syn::Item::Struct(item) => (&item.ident, "struct"),
+        syn::Item::Trait(item) => (&item.ident, "trait"),
+        syn::Item::TraitAlias(item) => (&item.ident, "traitalias"),
+        syn::Item::Type(item) => (&item.ident, "type"),
+        syn::Item::Union(item) => (&item.ident, "union"),
+        _ => return None,
+    })
+}
+
+// Without dependency HTML, only unconditional declarations can prove that an
+// external re-export contributes to this page's namespace and kind.
+fn external_has_kind(source: &Path, path: &[String], kind: &str) -> Option<bool> {
+    let syntax = syn::parse_file(&fs::read_to_string(source).ok()?).ok()?;
+    if !unconditional_attributes(&syntax.attrs) {
+        return None;
+    }
+    let mut items = syntax.items;
+    let mut directory = source.parent()?.to_path_buf();
+    let (name, parents) = path.split_last()?;
+    for name in parents {
+        let mut modules = items.into_iter().filter_map(|item| match item {
+            syn::Item::Mod(module) if identifier_key(&module.ident.to_string()) == *name => {
+                Some(module)
+            }
+            _ => None,
+        });
+        let module = modules.next()?;
+        if modules.next().is_some()
+            || !unconditional_attributes(&module.attrs)
+            || module
+                .attrs
+                .iter()
+                .any(|attribute| attribute.path().is_ident("path"))
+        {
+            return None;
+        }
+        if let Some((_, contents)) = module.content {
+            items = contents;
+        } else {
+            let file = directory.join(format!("{name}.rs"));
+            let nested = directory.join(name).join("mod.rs");
+            let file = match (file.is_file(), nested.is_file()) {
+                (true, false) => file,
+                (false, true) => nested,
+                _ => return None,
+            };
+            let syntax = syn::parse_file(&fs::read_to_string(file).ok()?).ok()?;
+            if !unconditional_attributes(&syntax.attrs) {
+                return None;
+            }
+            items = syntax.items;
+        }
+        directory.push(name);
+    }
+    let mut kinds = Vec::new();
+    for item in &items {
+        if let Some((ident, kind)) = declaration(item)
+            && identifier_key(&ident.to_string()) == *name
+        {
+            if !unconditional_attributes(item_attributes(item)?) {
+                return None;
+            }
+            kinds.push(kind);
+        }
+    }
+    (!kinds.is_empty()).then(|| kinds.contains(&kind))
+}
+
+fn module_items(docs: &Path, module: &Path) -> Option<Vec<syn::Item>> {
     let components = module
         .iter()
         .map(|part| part.to_str())
@@ -622,26 +742,100 @@ fn declared_reexport(
             syntax.items
         };
     }
-    if !plain_items(&items) {
-        return None;
+    Some(items)
+}
+
+// Source bindings still shadow globs when rustdoc omits their pages. A use
+// without a page has an unknown namespace, so conservatively block all three.
+fn source_bindings(items: &[syn::Item], name: &str) -> (u8, u8) {
+    let mut shadowed = 0;
+    let mut public = 0;
+    for item in items {
+        if !item_attributes(item).is_some_and(plain_attributes) {
+            continue;
+        }
+        let (ident, namespaces, visibility) = match item {
+            syn::Item::Const(item) => (&item.ident, 2, &item.vis),
+            syn::Item::Enum(item) => (&item.ident, 1, &item.vis),
+            syn::Item::ExternCrate(item) => (
+                item.rename.as_ref().map_or(&item.ident, |(_, ident)| ident),
+                1,
+                &item.vis,
+            ),
+            syn::Item::Fn(item) => (&item.sig.ident, 2, &item.vis),
+            syn::Item::Mod(item) => (&item.ident, 1, &item.vis),
+            syn::Item::Static(item) => (&item.ident, 2, &item.vis),
+            syn::Item::Struct(item) => (
+                &item.ident,
+                if matches!(item.fields, syn::Fields::Named(_)) {
+                    1
+                } else {
+                    1 | 2
+                },
+                &item.vis,
+            ),
+            syn::Item::Trait(item) => (&item.ident, 1, &item.vis),
+            syn::Item::TraitAlias(item) => (&item.ident, 1, &item.vis),
+            syn::Item::Type(item) => (&item.ident, 1, &item.vis),
+            syn::Item::Union(item) => (&item.ident, 1, &item.vis),
+            syn::Item::Use(item) => {
+                if matches!(item.vis, syn::Visibility::Public(_))
+                    && !item.attrs.iter().any(|attribute| {
+                        attribute.path().is_ident("doc")
+                            && matches!(&attribute.meta, syn::Meta::List(list)
+                                if list.tokens.to_string().split(',').any(|part| part.trim() == "hidden"))
+                    })
+                {
+                    continue;
+                }
+                let mut targets = Vec::new();
+                reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
+                if targets.iter().any(|(glob, _)| !glob) {
+                    shadowed |= 1 | 2 | 4;
+                    if matches!(item.vis, syn::Visibility::Public(_)) {
+                        public |= 1 | 2 | 4;
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        if identifier_key(&ident.to_string()) == name {
+            shadowed |= namespaces;
+            if matches!(visibility, syn::Visibility::Public(_)) {
+                public |= namespaces;
+            }
+        }
     }
+    (shadowed, public)
+}
+
+fn declared_reexport(
+    docs: &Path,
+    external_crates: &[ExternalCrate],
+    item: &HtmlItem,
+) -> Option<ItemIdentity> {
+    let relative = item.page.strip_prefix(docs).ok()?;
+    let kind = page_kind(&item.page)?;
+    let (module, name) = if kind == "index" {
+        let module = relative.parent()?;
+        (module.parent()?, module.file_name()?.to_str()?)
+    } else {
+        (
+            relative.parent()?,
+            item.page.file_stem()?.to_str()?.split_once('.')?.1,
+        )
+    };
+    let components = module
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let items = module_items(docs, module)?;
     // A declaration shadows a glob in its own namespace.
     if items.iter().any(|item| {
-        let ident = match (kind, item) {
-            ("fn" | "attr" | "derive", syn::Item::Fn(item)) => Some(&item.sig.ident),
-            ("struct", syn::Item::Struct(item)) => Some(&item.ident),
-            ("enum", syn::Item::Enum(item)) => Some(&item.ident),
-            ("union", syn::Item::Union(item)) => Some(&item.ident),
-            ("trait", syn::Item::Trait(item)) => Some(&item.ident),
-            ("traitalias", syn::Item::TraitAlias(item)) => Some(&item.ident),
-            ("type", syn::Item::Type(item)) => Some(&item.ident),
-            ("constant", syn::Item::Const(item)) => Some(&item.ident),
-            ("static", syn::Item::Static(item)) => Some(&item.ident),
-            ("index", syn::Item::Mod(item)) => Some(&item.ident),
-            ("macro", syn::Item::Macro(item)) => item.ident.as_ref(),
-            _ => None,
-        };
-        ident.is_some_and(|ident| identifier_key(&ident.to_string()) == name)
+        declaration(item).is_some_and(|(ident, declared)| {
+            declared == kind && identifier_key(&ident.to_string()) == name
+        })
     }) {
         return None;
     }
@@ -652,46 +846,62 @@ fn declared_reexport(
         {
             let mut origins = Vec::new();
             reexport_targets(&item.tree, &mut Vec::new(), name, &mut origins);
-            targets.extend(
-                origins
-                    .into_iter()
-                    .map(|(glob, path)| (glob, item.leading_colon.is_some(), path)),
-            );
+            targets.extend(origins.into_iter().map(|(glob, path)| {
+                (
+                    glob,
+                    item.leading_colon.is_some(),
+                    path,
+                    unconditional_attributes(&item.attrs),
+                )
+            }));
         }
     }
-    let explicit = targets.iter().any(|(glob, _, _)| !glob);
-    let mut definitions = HashSet::new();
-    for (glob, absolute, mut path) in targets {
-        if explicit && glob {
+    targets.sort_by_key(|(glob, _, _, _)| *glob);
+    let mut resolved = Vec::new();
+    for (glob, absolute, mut path, unconditional) in targets {
+        if glob && resolved.iter().any(|(glob, _)| !glob) {
             continue;
+        }
+        if !unconditional {
+            return None;
+        }
+        if glob && !plain_items(&items) {
+            // Expansions may introduce an explicit binding that shadows a glob.
+            return None;
         }
         let mut base = components.clone();
         let external = !matches!(path.first()?.as_str(), "crate" | "self" | "super");
         let (crate_name, external_path) = path.split_first()?;
-        if external && (absolute || !scope_shadows_external(&items, crate_name)) {
+        if external
+            && (absolute || (plain_items(&items) && !scope_shadows_external(&items, crate_name)))
+        {
             // --no-deps can omit the canonical external page and its source.
             // Resolve the declared path before considering local HTML paths:
             // an absolute external path bypasses same-named local modules.
-            let mut packages = external_crates
-                .iter()
-                .filter(|dep| {
-                    dep.name.replace('-', "_") == *crate_name
-                        && dep
-                            .dep_kinds
-                            .iter()
-                            .any(|kind| kind.kind == DependencyKind::Normal)
-                })
-                .map(|dep| &dep.pkg);
+            let mut packages = external_crates.iter().filter(|dep| {
+                dep.dependency.name.replace('-', "_") == *crate_name
+                    && dep
+                        .dependency
+                        .dep_kinds
+                        .iter()
+                        .any(|kind| kind.kind == DependencyKind::Normal)
+            });
             if let Some(package) = packages.next() {
-                if packages.any(|other| other != package) {
+                if packages.any(|other| other.dependency.pkg != package.dependency.pkg) {
                     return None;
                 }
-                definitions.insert(ItemIdentity::External {
-                    package: package.clone(),
-                    path: external_path.to_vec(),
-                    kind: kind.to_string(),
-                    fragment: item.fragment.clone(),
-                });
+                if !external_has_kind(&package.source, external_path, kind)? {
+                    continue;
+                }
+                resolved.push((
+                    glob,
+                    ItemIdentity::External {
+                        package: package.dependency.pkg.clone(),
+                        path: external_path.to_vec(),
+                        kind: kind.to_string(),
+                        fragment: item.fragment.clone(),
+                    },
+                ));
                 continue;
             }
             if absolute {
@@ -729,11 +939,20 @@ fn declared_reexport(
         if !page.is_file() {
             return None;
         }
-        definitions.insert(ItemIdentity::Page(HtmlItem {
-            page,
-            fragment: item.fragment.clone(),
-        }));
+        resolved.push((
+            glob,
+            ItemIdentity::Page(HtmlItem {
+                page,
+                fragment: item.fragment.clone(),
+            }),
+        ));
     }
+    let explicit = resolved.iter().any(|(glob, _)| !glob);
+    let definitions = resolved
+        .into_iter()
+        .filter(|(glob, _)| !explicit || !glob)
+        .map(|(_, definition)| definition)
+        .collect::<HashSet<_>>();
     if definitions.len() == 1 {
         let definition = definitions.into_iter().next()?;
         if definition != ItemIdentity::Page(item.clone()) {
@@ -881,6 +1100,8 @@ struct ParsedPage {
 struct Bindings {
     explicit: Vec<(HtmlItem, u8)>,
     globs: Vec<String>,
+    shadowed: u8,
+    unavailable: u8,
 }
 
 impl ParsedPage {
@@ -1011,7 +1232,7 @@ impl HtmlVisitor for ExportBindings {
 
 struct HtmlLookup<'a> {
     docs: &'a Path,
-    external_crates: &'a [NodeDep],
+    external_crates: &'a [ExternalCrate],
     pages: HashMap<PathBuf, ParsedPage>,
     completed: HashMap<(HtmlItem, String, bool), Result<Vec<HtmlItem>, String>>,
     #[cfg(test)]
@@ -1019,7 +1240,7 @@ struct HtmlLookup<'a> {
 }
 
 impl<'a> HtmlLookup<'a> {
-    fn new(docs: &'a Path, external_crates: &'a [NodeDep]) -> Self {
+    fn new(docs: &'a Path, external_crates: &'a [ExternalCrate]) -> Self {
         Self {
             docs,
             external_crates,
@@ -1134,7 +1355,12 @@ impl<'a> HtmlLookup<'a> {
             {
                 self.expansions += 1;
             }
-            let Bindings { explicit, globs } = match self.bindings(&item, name, type_only) {
+            let Bindings {
+                explicit,
+                globs,
+                mut shadowed,
+                unavailable: omitted_public,
+            } = match self.bindings(&item, name, type_only) {
                 Ok(bindings) => bindings,
                 Err(error) if item == *root => return Err(error),
                 Err(error) => {
@@ -1142,7 +1368,19 @@ impl<'a> HtmlLookup<'a> {
                     continue;
                 }
             };
-            let mut shadowed = 0;
+            let visible = explicit
+                .iter()
+                .fold(0, |all, (_, namespaces)| all | namespaces);
+            let missing = if item == *root {
+                shadowed
+            } else {
+                omitted_public
+            } & !visible;
+            if missing & namespaces != 0 {
+                return Err(format!(
+                    "binding '{name}' has no available rustdoc HTML page; cannot establish a glob match"
+                ));
+            }
             for (item, binding_namespaces) in explicit {
                 shadowed |= binding_namespaces;
                 if binding_namespaces & namespaces != 0 {
@@ -1239,6 +1477,16 @@ impl<'a> HtmlLookup<'a> {
             }
         }
         let globs = page.globs.clone();
+        let (shadowed, unavailable) = if globs.is_empty() {
+            (0, 0)
+        } else {
+            module_items(
+                docs,
+                directory.strip_prefix(docs).expect("page is inside docs"),
+            )
+            .map(|items| source_bindings(&items, name))
+            .unwrap_or_default()
+        };
         let mut bindings = Vec::new();
         for candidate in candidates {
             let candidate = self.follow_redirect(&candidate)?;
@@ -1254,6 +1502,8 @@ impl<'a> HtmlLookup<'a> {
         Ok(Bindings {
             explicit: bindings,
             globs,
+            shadowed,
+            unavailable,
         })
     }
 }
