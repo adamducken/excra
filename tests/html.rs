@@ -1437,6 +1437,55 @@ fn unavailable_globs_do_not_block_independent_local_bindings() {
 }
 
 #[test]
+fn unavailable_globs_cannot_hide_competing_definitions() {
+    for nested in [false, true] {
+        let dir = project();
+        let root = dir.path();
+        fs::write(
+            root.join("inner/src/lib.rs"),
+            "#![doc(html_root_url = \"https://example.invalid/inner/\")]\npub struct Item { pub external: u64 }",
+        )
+        .unwrap();
+        let external = "#[doc(no_inline)] pub use inner::*;";
+        let external = if nested {
+            format!("pub mod exports {{ {external} }}\n#[doc(no_inline)] pub use exports::*;")
+        } else {
+            external.to_string()
+        };
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "pub mod local {{ pub struct Item {{ pub local: u8 }} }}\n\
+                 #[doc(no_inline)] pub use local::*;\n{external}"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/src/lib.rs"),
+            "pub fn item(_: alias::Item) {}",
+        )
+        .unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success());
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("ambiguous"),
+            "{checked:?}"
+        );
+        let error = failure(query(root, "use alias::Item;", &[]));
+        assert!(
+            error.contains("unavailable") || error.contains("ambiguous"),
+            "{error}"
+        );
+        let report = success(query(root, "use alias::local::Item;", &[]));
+        assert!(report.contains("pub local: u8"), "{report}");
+    }
+}
+
+#[test]
 fn local_non_inlined_globs_resolve_concrete_names_and_preserve_precedence() {
     let dir = project();
     fs::write(
@@ -1511,6 +1560,10 @@ fn omitted_bindings_shadow_globs_without_substituting_another_definition() {
             "struct Item;",
             "mod local { pub struct Item; } use local::Item;",
             "mod local { pub struct Item; } #[doc(hidden)] pub use local::Item;",
+            "#[doc(hidden)] pub struct Actual { pub actual: u64 } pub use Actual as Item;",
+            "#[doc(hidden)] pub struct Actual { pub actual: u64 } #[doc(no_inline)] pub use Actual as Item;",
+            "#[doc(hidden)] pub mod local { pub struct Actual { pub actual: u64 } } #[doc(no_inline)] pub use local::Actual as Item;",
+            "pub fn Item() {} #[doc(hidden)] pub struct Actual { pub actual: u64 } pub use Actual as Item;",
         ] {
             let source = format!(
                 "pub mod origin {{ pub struct Item {{ pub wrong: u8 }} pub struct Control; }}\n\
@@ -1535,7 +1588,12 @@ fn omitted_bindings_shadow_globs_without_substituting_another_definition() {
                 binding.contains("doc(hidden)"),
                 "{binding}: {checked:?}"
             );
-            let error = failure(query(root, &import, &[]));
+            let output = query(root, &import, &[]);
+            assert!(
+                !output.status.success(),
+                "{binding} (nested={nested}): {output:?}"
+            );
+            let error = failure(output);
             assert!(
                 error.contains("no available rustdoc HTML page"),
                 "{binding}: {error}"
@@ -1550,6 +1608,163 @@ fn omitted_bindings_shadow_globs_without_substituting_another_definition() {
             let report = success(query(root, &format!("use {prefix}::{control};"), &[]));
             assert!(
                 paths(&report, "source: ")[0].ends_with("origin/struct.Control.html"),
+                "{report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn foreign_bindings_shadow_globs_and_keep_their_namespace_and_cfg() {
+    let dir = project();
+    let root = dir.path();
+    for nested in [false, true] {
+        for (binding, available) in [
+            ("#[doc(hidden)] pub fn item(arg: u64);", false),
+            ("#[doc(hidden)] pub static item: u64;", false),
+            ("fn item(arg: u64);", false),
+            ("#[cfg(any())] #[doc(hidden)] pub fn item(arg: u64);", true),
+            ("#[cfg(all())] #[doc(hidden)] pub static item: u64;", false),
+            (
+                "#[cfg_attr(all(), doc(hidden))] pub fn item(arg: u64);",
+                false,
+            ),
+        ] {
+            let source = format!(
+                "pub mod origin {{ pub fn item(_: u8) {{}} pub struct Control; }}\n\
+                 #[doc(no_inline)] pub use origin::*;\n\
+                 unsafe extern \"C\" {{ {binding} }}"
+            );
+            let source = format!(
+                "{source}\npub mod independent {{ {source} pub mod item {{ pub struct Nested; }} }}"
+            );
+            fs::write(
+                root.join("api/src/lib.rs"),
+                if nested {
+                    format!("pub mod scope {{ {source} }}")
+                } else {
+                    source
+                },
+            )
+            .unwrap();
+            let prefix = if nested { "alias::scope" } else { "alias" };
+            success(
+                Command::new("cargo")
+                    .args(["check", "--offline", "--locked", "--package", "api"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            let output = query(root, &format!("use {prefix}::item;"), &[]);
+            if available {
+                let report = success(output);
+                assert!(report.contains("pub fn item(_: u8)"), "{report}");
+            } else {
+                let error = failure(output);
+                assert!(
+                    error.contains("no available rustdoc HTML page")
+                        || error.contains("source bindings are incomplete"),
+                    "{binding}: {error}"
+                );
+            }
+            let report = success(query(
+                root,
+                &format!("use {prefix}::independent::item::Nested;"),
+                &[],
+            ));
+            assert!(report.contains("pub struct Nested"), "{report}");
+            let report = success(query(root, &format!("use {prefix}::origin::Control;"), &[]));
+            assert!(report.contains("pub struct Control"), "{report}");
+        }
+    }
+}
+
+#[test]
+fn exported_macros_shadow_globs_at_the_crate_root() {
+    let dir = project();
+    let root = dir.path();
+    for (binding, available) in [
+        (
+            "#[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; }",
+            false,
+        ),
+        (
+            "pub mod nested { #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } }",
+            false,
+        ),
+        ("pub mod nested;", false),
+        (
+            "pub fn define() { #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } }",
+            false,
+        ),
+        (
+            "#[cfg(any())] #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; }",
+            true,
+        ),
+        ("macro_rules! Item { () => { 2u64 }; }", true),
+    ] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "#[macro_export] macro_rules! Visible {{ () => {{ 1u8 }}; }}\n\
+                 #[doc(no_inline)] pub use Visible as Direct;\n\
+                 pub mod origin {{ #[doc(no_inline)] pub use crate::Visible as Item; pub struct Control; }}\n\
+                 #[doc(no_inline)] pub use origin::*;\n{binding}\n{}",
+                if binding == "pub mod nested;" {
+                    "#[doc(no_inline)] pub use Extra as NestedAlias;"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("api/src/nested.rs"),
+            "#[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; }\n\
+             #[macro_export] macro_rules! Extra { () => { 3u8 }; }\n\
+             #[doc(no_inline)] pub use crate::origin::*;",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/src/lib.rs"),
+            format!(
+                "pub fn value() -> {} {{ alias::Item!() }}",
+                if available { "u8" } else { "u64" }
+            ),
+        )
+        .unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let output = query(root, "use alias::Item;", &[]);
+        if available {
+            let report = success(output);
+            assert!(
+                paths(&report, "source: ")[0].ends_with("macro.Visible.html"),
+                "{binding}: {report}"
+            );
+        } else {
+            let error = failure(output);
+            assert!(
+                error.contains("no available rustdoc HTML page")
+                    || error.contains("source bindings are incomplete"),
+                "{binding}: {error}"
+            );
+        }
+        let report = success(query(root, "use alias::Control;", &[]));
+        assert!(report.contains("pub struct Control"), "{report}");
+        let report = success(query(root, "use alias::Direct;", &[]));
+        assert!(report.contains("macro_rules!"), "{report}");
+        if binding == "pub mod nested;" {
+            let report = success(query(root, "use alias::NestedAlias;", &[]));
+            assert!(report.contains("macro_rules! Extra"), "{report}");
+            let report = success(query(root, "use alias::nested::Item;", &[]));
+            assert!(
+                paths(&report, "source: ")[0].ends_with("macro.Visible.html"),
                 "{report}"
             );
         }
@@ -2179,6 +2394,72 @@ fn inlined_module_aliases_follow_out_of_line_and_nested_sources() {
     );
     let report = success(query(root, import, &[]));
     assert_eq!(paths(&report, "source: ").len(), 6, "{report}");
+}
+
+#[test]
+fn inlined_module_aliases_keep_glob_source_evidence_and_shadowing() {
+    for out_of_line in [false, true] {
+        let dir = project();
+        let root = dir.path();
+        let original = r#"
+pub mod origin { pub struct Item { pub correct: u64 } pub struct Hidden; pub fn foreign() {} }
+#[doc(no_inline)] pub use origin::*;
+#[doc(hidden)] pub struct Actual;
+pub use Actual as Hidden;
+unsafe extern "C" { #[doc(hidden)] pub fn foreign(value: u64); }
+pub use super::sibling::Unit as Explicit;
+pub mod deep {
+    pub mod origin { pub struct Deep; }
+    #[doc(no_inline)] pub use origin::*;
+}
+"#;
+        let declaration = if out_of_line {
+            fs::create_dir_all(root.join("api/src/outer")).unwrap();
+            fs::write(root.join("api/src/outer/original.rs"), original).unwrap();
+            "pub mod original;".to_string()
+        } else {
+            format!("pub mod original {{ {original} }}")
+        };
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "pub mod outer {{ pub mod sibling {{ pub struct Unit; }} {declaration} }}\n\
+                 #[cfg(any())] pub use nonexistent::Module as renamed;\n\
+                 #[cfg(all())] #[doc(inline)] pub use outer::original as renamed;\n\
+                 #[doc(inline)] pub use renamed as chained;"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/src/lib.rs"),
+            "use alias::{outer::original::Item, renamed::Item as Alias};\n\
+             pub fn item(_: Item) -> Alias { Alias { correct: 1 } }\n\
+             pub fn explicit() -> alias::renamed::Explicit { alias::renamed::Explicit }",
+        )
+        .unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let mut pages = Vec::new();
+        for prefix in ["alias::outer::original", "alias::renamed", "alias::chained"] {
+            let report = success(query(root, &format!("use {prefix}::Item;"), &[]));
+            assert!(report.contains("pub correct: u64"), "{report}");
+            pages.push(paths(&report, "source: ")[0].clone());
+            let report = success(query(root, &format!("use {prefix}::Explicit;"), &[]));
+            assert!(report.contains("pub struct"), "{report}");
+            let report = success(query(root, &format!("use {prefix}::deep::Deep;"), &[]));
+            assert!(report.contains("pub struct Deep"), "{report}");
+            for name in ["Hidden", "foreign"] {
+                let error = failure(query(root, &format!("use {prefix}::{name};"), &[]));
+                assert!(error.contains("no available rustdoc HTML page"), "{error}");
+            }
+        }
+        assert!(pages.iter().all(|page| page == &pages[0]), "{pages:?}");
+    }
 }
 
 #[test]
