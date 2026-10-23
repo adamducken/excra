@@ -115,6 +115,10 @@ Output follows ordinary rustdoc semantics, including `cfg(doc)`. Excra does
 not reconstruct or validate a separate compiler-expanded API. The requested
 crate must successfully document with `cargo doc`.
 
+Following a non-inlined glob re-export requires source evidence that its
+bindings are not shadowed. Unknown attributes, macro expansions, conditional
+selection, or missing source can make that lookup unavailable.
+
 For agent instructions, see [excra-skill.md](excra-skill.md).
 
 ## License

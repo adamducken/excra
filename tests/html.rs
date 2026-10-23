@@ -1121,6 +1121,64 @@ fn isolated_docs_preserve_workspace_wrapper_membership_and_composition() {
 }
 
 #[test]
+#[cfg(unix)]
+fn relative_cargo_home_preserves_workspace_wrappers_from_both_invocation_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = project();
+    let root = dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = ['app', 'api', 'inner']\nresolver = '3'\n",
+    )
+    .unwrap();
+    fs::write(root.join("app/Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nalias = { package = 'api', path = '../api' }\n").unwrap();
+    fs::write(
+        root.join("app/src/lib.rs"),
+        "pub fn item() -> alias::Item { alias::Item { expected: 1 } }",
+    )
+    .unwrap();
+    fs::write(root.join("api/src/lib.rs"), "pub use inner::Item;").unwrap();
+    fs::write(
+        root.join("inner/src/lib.rs"),
+        "#![allow(unexpected_cfgs)]\n#[cfg(wrapper_flag)] pub struct Item { pub expected: u64 }\n#[cfg(not(wrapper_flag))] pub struct Item { pub incorrect: u8 }",
+    )
+    .unwrap();
+    let wrapper = root.join("workspace-wrapper");
+    fs::write(&wrapper, "#!/bin/sh\nexec \"$@\" --cfg wrapper_flag\n").unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.join("custom-cargo-home");
+    fs::create_dir(&home).unwrap();
+    let wrappers = "[build]\nrustc-workspace-wrapper = './workspace-wrapper'\n";
+    fs::write(home.join("wrappers.toml"), wrappers).unwrap();
+    for config in [wrappers, "include = ['wrappers.toml']\n"] {
+        fs::write(home.join("config.toml"), config).unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--package", "app"])
+                .env("CARGO_HOME", "custom-cargo-home")
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let mut pages = Vec::new();
+        for caller in [root, root.parent().unwrap()] {
+            let report = success(
+                query_command(root, "use alias::Item;", &[])
+                    .env("CARGO_HOME", "custom-cargo-home")
+                    .current_dir(caller)
+                    .output()
+                    .unwrap(),
+            );
+            assert!(report.contains("pub expected: u64"), "{report}");
+            assert!(!report.contains("incorrect"), "{report}");
+            pages.push(paths(&report, "source: "));
+        }
+        assert_eq!(pages[0], pages[1]);
+    }
+}
+
+#[test]
 fn missing_or_stale_lockfiles_are_not_changed() {
     let dir = project();
     let lock = fs::read(dir.path().join("Cargo.lock")).unwrap();
@@ -1482,13 +1540,152 @@ fn omitted_bindings_shadow_globs_without_substituting_another_definition() {
                 error.contains("no available rustdoc HTML page"),
                 "{binding}: {error}"
             );
-            let report = success(query(root, &format!("use {prefix}::Control;"), &[]));
+            // Derives may generate extra bindings. The explicit path remains
+            // available even when the glob's complete binding set is unknown.
+            let control = if binding.contains("derive") {
+                "origin::Control"
+            } else {
+                "Control"
+            };
+            let report = success(query(root, &format!("use {prefix}::{control};"), &[]));
             assert!(
                 paths(&report, "source: ")[0].ends_with("origin/struct.Control.html"),
                 "{report}"
             );
         }
     }
+}
+
+#[test]
+fn uncertain_source_bindings_never_substitute_glob_definitions() {
+    let dir = project();
+    let root = dir.path();
+    for nested in [false, true] {
+        for binding in [
+            "#[cfg_attr(all(), doc(hidden))] pub struct Item { pub actual: u64 }",
+            "macro_rules! define { () => { #[doc(hidden)] pub struct Item { pub actual: u64 } }; } define!();",
+        ] {
+            let source = format!(
+                "pub mod origin {{ pub struct Item {{ pub wrong: u8 }} pub struct Control; }}\n\
+                 #[doc(no_inline)] pub use origin::*;\n\
+                 #[doc(no_inline)] pub use origin::Control;\n{binding}"
+            );
+            let source = if nested {
+                format!("pub mod nested {{ {source} }}")
+            } else {
+                source
+            };
+            fs::write(root.join("api/src/lib.rs"), source).unwrap();
+            let prefix = if nested { "alias::nested" } else { "alias" };
+            fs::write(
+                root.join("app/src/lib.rs"),
+                format!("pub fn item() -> {prefix}::Item {{ {prefix}::Item {{ actual: 1 }} }}"),
+            )
+            .unwrap();
+            success(
+                Command::new("cargo")
+                    .args(["check", "--offline", "--locked", "--package", "app"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            let error = failure(query(root, &format!("use {prefix}::Item;"), &[]));
+            assert!(
+                error.contains("cannot establish binding"),
+                "{binding}: {error}"
+            );
+            let report = success(query(root, &format!("use {prefix}::Control;"), &[]));
+            assert!(report.contains("pub struct Control"), "{report}");
+        }
+    }
+}
+
+#[test]
+fn inactive_conditional_bindings_allow_globs_but_enabled_hidden_bindings_block_them() {
+    let dir = project();
+    let root = dir.path();
+    // This fixture checks the default compiler context. Coverage instruments
+    // excra itself already; its inherited compiler wrapper must not change it.
+    let (active_platform, inactive_platform) = if cfg!(windows) {
+        ("windows", "unix")
+    } else {
+        ("unix", "windows")
+    };
+    for nested in [false, true] {
+        for (predicate, flags, active) in [
+            ("any()", &[][..], false),
+            ("feature = \"extra\"", &[][..], false),
+            ("feature = \"extra\"", &["--features", "extra"][..], true),
+            (inactive_platform, &[][..], false),
+            (active_platform, &[][..], true),
+            ("not(doc)", &[][..], false),
+            ("doc", &[][..], true),
+        ] {
+            let source = format!(
+                "pub mod origin {{ pub struct Item {{ pub right: u8 }} }}\n\
+                 #[doc(no_inline)] pub use origin::*;\n\
+                 #[cfg({predicate})] #[doc(hidden)] pub struct Item {{ pub actual: u64 }}"
+            );
+            fs::write(
+                root.join("api/src/lib.rs"),
+                if nested {
+                    format!("pub mod nested {{ {source} }}")
+                } else {
+                    source
+                },
+            )
+            .unwrap();
+            let prefix = if nested { "alias::nested" } else { "alias" };
+            if !predicate.contains("doc") {
+                fs::write(
+                    root.join("app/src/lib.rs"),
+                    format!(
+                        "pub fn item() -> {prefix}::Item {{ {prefix}::Item {{ {}: 1 }} }}",
+                        if active { "actual" } else { "right" }
+                    ),
+                )
+                .unwrap();
+                success(
+                    Command::new("cargo")
+                        .args(["check", "--offline", "--locked", "--package", "app"])
+                        .args(flags)
+                        .env_remove("RUSTC_WRAPPER")
+                        .current_dir(root)
+                        .output()
+                        .unwrap(),
+                );
+            }
+            let output = query_command(root, &format!("use {prefix}::Item;"), flags)
+                .env_remove("RUSTC_WRAPPER")
+                .output()
+                .unwrap();
+            if active {
+                let error = failure(output);
+                assert!(
+                    error.contains("no available rustdoc HTML page"),
+                    "{predicate}: {error}"
+                );
+            } else {
+                let report = success(output);
+                assert!(report.contains("pub right: u8"), "{predicate}: {report}");
+                assert!(
+                    paths(&report, "source: ")[0].ends_with("origin/struct.Item.html"),
+                    "{report}"
+                );
+            }
+        }
+    }
+    // Rustdoc flags can enable a feature outside Cargo's feature graph. Never
+    // infer that such a declaration is inactive from metadata alone.
+    fs::write(root.join("api/src/lib.rs"), "pub mod origin { pub struct Item { pub wrong: u8 } }\n#[doc(no_inline)] pub use origin::*;\n#[cfg(feature = \"injected\")] #[doc(hidden)] pub struct Item { pub actual: u64 }").unwrap();
+    let error = failure(
+        query_command(root, "use alias::Item;", &[])
+            .env_remove("RUSTC_WRAPPER")
+            .env("RUSTDOCFLAGS", "--cfg feature=\"injected\"")
+            .output()
+            .unwrap(),
+    );
+    assert!(error.contains("no available rustdoc HTML page"), "{error}");
 }
 
 #[test]
@@ -1579,6 +1776,87 @@ pub struct Namespace;
         let error = failure(query(root, &format!("use alias::{name};"), &[]));
         assert!(error.contains("ambiguous"), "{name}: {error}");
     }
+}
+
+#[test]
+fn scoped_aliases_and_edition_2015_roots_share_canonical_reexport_identity() {
+    let dir = project();
+    let root = dir.path();
+    let manifest = root.join("api/Cargo.toml");
+    let original = fs::read_to_string(&manifest).unwrap();
+    fs::write(root.join("inner/src/lib.rs"), "pub fn item() {}").unwrap();
+    for out_of_line in [false, true] {
+        for (edition, body) in [
+            (
+                "2024",
+                "use crate::source as local; #[doc(inline)] pub use local::item;",
+            ),
+            (
+                "2024",
+                "use super::source::{self as first}; use self::first as local; #[doc(inline)] pub use local::item;",
+            ),
+            (
+                "2024",
+                "pub mod imports { pub use crate::source as local; } #[doc(inline)] pub use imports::local::item;",
+            ),
+            (
+                "2024",
+                "pub use crate::source::item as local; #[doc(inline)] pub use self::local as item;",
+            ),
+            (
+                "2024",
+                "use inner as local; #[doc(inline)] pub use local::item;",
+            ),
+            ("2015", "#[doc(inline)] pub use source::item;"),
+            ("2015", "#[doc(inline)] pub use ::source::item;"),
+            (
+                "2015",
+                "use source as local; #[doc(inline)] pub use self::local::item;",
+            ),
+            (
+                "2015",
+                "use upstream as local; #[doc(inline)] pub use self::local::item;",
+            ),
+        ] {
+            fs::write(
+                &manifest,
+                original.replace("edition = \"2024\"", &format!("edition = \"{edition}\"")),
+            )
+            .unwrap();
+            let mut source =
+                "extern crate inner as upstream;\npub mod source { pub fn item() {} }\n"
+                    .to_string();
+            for name in ["a", "b"] {
+                fs::write(root.join(format!("api/src/{name}.rs")), body).unwrap();
+                source.push_str(&if out_of_line {
+                    format!("pub mod {name};\n")
+                } else {
+                    format!("pub mod {name} {{ {body} }}\n")
+                });
+            }
+            source.push_str("#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;");
+            fs::write(root.join("api/src/lib.rs"), source).unwrap();
+            fs::write(root.join("app/src/lib.rs"), "use alias::item;").unwrap();
+            success(
+                Command::new("cargo")
+                    .args(["check", "--offline", "--locked", "--package", "app"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            let report = success(query(root, "use alias::item;", &[]));
+            assert_eq!(
+                paths(&report, "source: ").len(),
+                1,
+                "{edition}: {body}: {report}"
+            );
+            assert!(report.contains("pub fn item()"), "{report}");
+        }
+    }
+    fs::write(&manifest, original).unwrap();
+    fs::write(root.join("api/src/lib.rs"), "pub mod source { pub fn item() {} }\npub mod a { use crate::source as local; #[doc(inline)] pub use local::item; }\npub mod b { use inner as local; #[doc(inline)] pub use local::item; }\n#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;").unwrap();
+    let error = failure(query(root, "use alias::item;", &[]));
+    assert!(error.contains("ambiguous"), "{error}");
 }
 
 #[test]
@@ -1799,6 +2077,70 @@ pub mod b {{
         assert!(report.contains("pub fn Alias"), "{report}");
         assert!(report.contains("pub fn Separate"), "{report}");
     }
+}
+
+#[test]
+fn conditional_module_declarations_do_not_unify_distinct_active_definitions() {
+    let dir = project();
+    let root = dir.path();
+    for (inactive_file, active_file) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let mut source = "pub mod common { pub fn item(_: u8) {} }\n".to_string();
+        for (name, argument) in [("a", "u16"), ("b", "u32")] {
+            let inactive = "pub use crate::common::item;";
+            let active = format!("pub fn item(_: {argument}) {{}}");
+            fs::write(root.join(format!("api/src/inactive_{name}.rs")), inactive).unwrap();
+            fs::write(root.join(format!("api/src/{name}.rs")), &active).unwrap();
+            if inactive_file {
+                source.push_str(&format!(
+                    "#[cfg(any())] #[path = \"inactive_{name}.rs\"] pub mod {name};\n"
+                ));
+            } else {
+                source.push_str(&format!("#[cfg(any())] pub mod {name} {{ {inactive} }}\n"));
+            }
+            if active_file {
+                source.push_str(&format!("#[cfg(all())] pub mod {name};\n"));
+            } else {
+                source.push_str(&format!("#[cfg(all())] pub mod {name} {{ {active} }}\n"));
+            }
+        }
+        source.push_str("#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;");
+        fs::write(root.join("api/src/lib.rs"), source).unwrap();
+        fs::write(root.join("app/src/lib.rs"), "use alias::item;").unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success(), "{checked:?}");
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("ambiguous"),
+            "{checked:?}"
+        );
+        let error = failure(query(root, "use alias::item;", &[]));
+        assert!(
+            error.contains("ambiguous"),
+            "{inactive_file}/{active_file}: {error}"
+        );
+    }
+    fs::write(
+        root.join("api/src/lib.rs"),
+        r#"
+#![allow(unexpected_cfgs)]
+pub mod common { pub fn item(_: u8) {} }
+#[cfg(excra_disabled)] pub mod a { pub use crate::common::item; }
+#[cfg(excra_disabled)] pub mod b { pub use crate::common::item; }
+macro_rules! define {
+    () => { pub mod a { pub fn item(_: u16) {} } pub mod b { pub fn item(_: u32) {} } };
+}
+define!();
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#,
+    )
+    .unwrap();
+    let error = failure(query(root, "use alias::item;", &[]));
+    assert!(error.contains("ambiguous"), "{error}");
 }
 
 #[test]

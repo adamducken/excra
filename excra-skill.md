@@ -68,6 +68,9 @@ Markdown. Cargo progress appears on stderr.
   their parent enum's Markdown.
 - External module re-exports without a page in the requested crate are unavailable.
 - Ambiguous names are errors.
+- Non-inlined glob re-exports are unavailable when source inspection cannot
+  rule out shadowing, including unknown attributes, expansions, conditional
+  selection, or missing source.
 - The requested crate must successfully document. Inspect
   reported Cargo/rustdoc diagnostics when generation fails.
 - A missing/stale `Cargo.lock` must be refreshed explicitly with `cargo check`

@@ -3,6 +3,7 @@ use crate::cli::FeatureSelection;
 use crate::imports::{ImportPath, identifier_key};
 use crate::resolver::{ResolvedDependency, library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, NodeDep, Package, PackageId};
+use cargo_platform::{Cfg, CfgExpr};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
 use html_to_markdown_rs::{CodeBlockStyle, ConversionOptions, HeadingStyle, convert};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct Documentation {
     pub(crate) directory: PathBuf,
     external_crates: Vec<ExternalCrate>,
+    source_context: SourceContext,
     _generation_lock: fs::File,
 }
 
@@ -228,6 +230,17 @@ pub(crate) fn generate(
     convert_crate(&docs, &docs.join(dependency.target.name.replace('-', "_")))?;
     Ok(Documentation {
         directory: docs,
+        source_context: SourceContext::new(
+            effective_target.cfg,
+            &graph
+                .closure((package.id.clone(), host_context))?
+                .into_iter()
+                .find(|unit| unit.package == package.id && unit.host == host_context)
+                .expect("documented unit is in closure")
+                .features,
+            package,
+            &configuration,
+        ),
         external_crates: generated_metadata
             .resolve
             .as_ref()
@@ -469,6 +482,7 @@ enum ItemIdentity {
 fn item_identity(
     docs: &Path,
     external_crates: &[ExternalCrate],
+    context: &SourceContext,
     item: &HtmlItem,
     visited: &mut HashSet<HtmlItem>,
 ) -> Result<ItemIdentity, String> {
@@ -509,10 +523,10 @@ fn item_identity(
             }
         }
     }
-    if let Some(definition) = declared_reexport(docs, external_crates, item) {
+    if let Some(definition) = declared_reexport(docs, external_crates, context, item) {
         return match definition {
             ItemIdentity::Page(definition) => {
-                item_identity(docs, external_crates, &definition, visited)
+                item_identity(docs, external_crates, context, &definition, visited)
             }
             external => Ok(external),
         };
@@ -559,6 +573,196 @@ fn rendered_code(html: &str) -> Option<String> {
     let code = markdown.trim().strip_prefix("```")?.split_once('\n')?.1;
     let code = code.strip_suffix("```")?;
     Some(code.to_string())
+}
+
+#[derive(Default)]
+struct SourceContext {
+    cfg: Option<Vec<Cfg>>,
+    edition_2015: bool,
+}
+
+impl SourceContext {
+    fn new(
+        mut cfg: Vec<Cfg>,
+        features: &[String],
+        package: &Package,
+        configuration: &[(PathBuf, String)],
+    ) -> Self {
+        // The platform probe supplies compiler cfg, not arbitrary rustdoc or
+        // build-script cfg. Such contexts must remain unknown to this pass.
+        let custom = package
+            .targets
+            .iter()
+            .any(|target| target.kind.iter().any(|kind| kind == "custom-build"))
+            || std::env::vars_os().any(|(name, value)| {
+                if value.is_empty() {
+                    return false;
+                }
+                let name = name.to_string_lossy();
+                matches!(
+                    name.as_ref(),
+                    "RUSTC"
+                        | "RUSTDOC"
+                        | "RUSTC_WRAPPER"
+                        | "RUSTC_WORKSPACE_WRAPPER"
+                        | "CARGO_BUILD_RUSTC"
+                        | "CARGO_BUILD_RUSTDOC"
+                        | "CARGO_BUILD_RUSTC_WRAPPER"
+                        | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                ) || ((matches!(name.as_ref(), "RUSTFLAGS" | "RUSTDOCFLAGS")
+                    || name.ends_with("_RUSTFLAGS")
+                    || name.ends_with("_RUSTDOCFLAGS"))
+                    && flags_change_cfg(&value.to_string_lossy()))
+            })
+            || configuration.iter().any(|(_, contents)| {
+                let Ok(table) = contents.parse::<toml::Table>() else {
+                    return true;
+                };
+                let build = table.get("build");
+                [
+                    "rustc",
+                    "rustdoc",
+                    "rustc-wrapper",
+                    "rustc-workspace-wrapper",
+                ]
+                .iter()
+                .any(|key| {
+                    build
+                        .and_then(|build| build.get(key))
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                }) || build.is_some_and(config_flags_change_cfg)
+                    || table
+                        .get("target")
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|targets| targets.values().any(config_flags_change_cfg))
+            });
+        let cfg = if custom {
+            None
+        } else {
+            cfg.push(Cfg::Name("doc".into()));
+            cfg.extend(
+                features
+                    .iter()
+                    .map(|feature| Cfg::KeyPair("feature".into(), feature.clone())),
+            );
+            Some(cfg)
+        };
+        Self {
+            cfg,
+            edition_2015: package.edition.as_str() == "2015",
+        }
+    }
+
+    fn matches(&self, expression: &CfgExpr) -> Option<bool> {
+        match expression {
+            CfgExpr::Value(value) => {
+                let name = match value {
+                    Cfg::Name(name) | Cfg::KeyPair(name, _) => name,
+                };
+                modeled_cfg(name)
+                    .then(|| self.cfg.as_ref().map(|cfg| cfg.contains(value)))
+                    .flatten()
+            }
+            CfgExpr::Not(expression) => self.matches(expression).map(|value| !value),
+            CfgExpr::All(expressions) | CfgExpr::Any(expressions) => {
+                let all = matches!(expression, CfgExpr::All(_));
+                let mut result = Some(all);
+                for expression in expressions {
+                    match self.matches(expression) {
+                        Some(value) if value != all => return Some(value),
+                        None => result = None,
+                        _ => {}
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    fn enabled(&self, attributes: &[syn::Attribute]) -> Option<bool> {
+        let mut result = Some(true);
+        for attribute in attributes
+            .iter()
+            .filter(|attribute| attribute.path().is_ident("cfg"))
+        {
+            let enabled = match &attribute.meta {
+                syn::Meta::List(list) => list
+                    .tokens
+                    .to_string()
+                    .parse::<CfgExpr>()
+                    .ok()
+                    .and_then(|expression| self.matches(&expression)),
+                _ => None,
+            };
+            match enabled {
+                Some(false) => return Some(false),
+                None => result = None,
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn active_items(&self, items: Vec<syn::Item>) -> Vec<syn::Item> {
+        items
+            .into_iter()
+            .filter(|item| {
+                let attrs = match item {
+                    syn::Item::Macro(item) => Some(item.attrs.as_slice()),
+                    _ => item_attributes(item),
+                };
+                attrs.is_none_or(|attrs| self.enabled(attrs) != Some(false))
+            })
+            .collect()
+    }
+
+    fn complete_items(&self, items: &[syn::Item]) -> bool {
+        plain_items(items)
+            && items.iter().all(|item| {
+                item_attributes(item).is_some_and(|attrs| self.enabled(attrs) == Some(true))
+            })
+    }
+}
+
+fn modeled_cfg(name: &str) -> bool {
+    matches!(
+        name,
+        "doc"
+            | "unix"
+            | "windows"
+            | "feature"
+            | "target_arch"
+            | "target_os"
+            | "target_env"
+            | "target_vendor"
+            | "target_family"
+            | "target_endian"
+            | "target_pointer_width"
+    )
+}
+
+fn flags_change_cfg(flags: &str) -> bool {
+    flags.contains("--target")
+        || flags.contains('@')
+        || (flags.contains("--cfg")
+            && flags
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(modeled_cfg))
+}
+
+fn config_flags_change_cfg(section: &toml::Value) -> bool {
+    ["rustflags", "rustdocflags"].iter().any(|key| {
+        section.get(key).is_some_and(|flags| match flags {
+            toml::Value::String(flags) => flags_change_cfg(flags),
+            toml::Value::Array(flags) => flags
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .is_none_or(|flags| flags_change_cfg(&flags.join("\x1f"))),
+            _ => true,
+        })
+    })
 }
 
 fn plain_attributes(attributes: &[syn::Attribute]) -> bool {
@@ -708,7 +912,7 @@ fn external_has_kind(source: &Path, path: &[String], kind: &str) -> Option<bool>
     (!kinds.is_empty()).then(|| kinds.contains(&kind))
 }
 
-fn module_items(docs: &Path, module: &Path) -> Option<Vec<syn::Item>> {
+fn module_items(docs: &Path, context: &SourceContext, module: &Path) -> Option<Vec<syn::Item>> {
     let components = module
         .iter()
         .map(|part| part.to_str())
@@ -719,19 +923,23 @@ fn module_items(docs: &Path, module: &Path) -> Option<Vec<syn::Item>> {
     if !plain_attributes(&syntax.attrs) {
         return None;
     }
-    let mut items = syntax.items;
+    let mut items = context.active_items(syntax.items);
     for name in &components[1..] {
-        let module = items.into_iter().find_map(|item| match item {
+        let mut modules = items.into_iter().filter_map(|item| match item {
             syn::Item::Mod(module) if identifier_key(&module.ident.to_string()) == *name => {
                 Some(module)
             }
             _ => None,
-        })?;
-        if !plain_attributes(&module.attrs) {
+        });
+        let module = modules.next()?;
+        if modules.next().is_some()
+            || !plain_attributes(&module.attrs)
+            || context.enabled(&module.attrs) != Some(true)
+        {
             return None;
         }
         directory.push(name);
-        items = if let Some((_, items)) = module.content {
+        items = context.active_items(if let Some((_, items)) = module.content {
             items
         } else {
             let source = source_link(docs, &directory.join("index.html"))?;
@@ -740,7 +948,7 @@ fn module_items(docs: &Path, module: &Path) -> Option<Vec<syn::Item>> {
                 return None;
             }
             syntax.items
-        };
+        });
     }
     Some(items)
 }
@@ -813,6 +1021,7 @@ fn source_bindings(items: &[syn::Item], name: &str) -> (u8, u8) {
 fn declared_reexport(
     docs: &Path,
     external_crates: &[ExternalCrate],
+    context: &SourceContext,
     item: &HtmlItem,
 ) -> Option<ItemIdentity> {
     let relative = item.page.strip_prefix(docs).ok()?;
@@ -826,11 +1035,7 @@ fn declared_reexport(
             item.page.file_stem()?.to_str()?.split_once('.')?.1,
         )
     };
-    let components = module
-        .iter()
-        .map(|part| part.to_str())
-        .collect::<Option<Vec<_>>>()?;
-    let items = module_items(docs, module)?;
+    let items = module_items(docs, context, module)?;
     // A declaration shadows a glob in its own namespace.
     if items.iter().any(|item| {
         declaration(item).is_some_and(|(ident, declared)| {
@@ -851,101 +1056,76 @@ fn declared_reexport(
                     glob,
                     item.leading_colon.is_some(),
                     path,
-                    unconditional_attributes(&item.attrs),
+                    plain_attributes(&item.attrs) && context.enabled(&item.attrs) == Some(true),
                 )
             }));
         }
     }
     targets.sort_by_key(|(glob, _, _, _)| *glob);
     let mut resolved = Vec::new();
-    for (glob, absolute, mut path, unconditional) in targets {
+    for (glob, absolute, path, unconditional) in targets {
         if glob && resolved.iter().any(|(glob, _)| !glob) {
             continue;
         }
         if !unconditional {
             return None;
         }
-        if glob && !plain_items(&items) {
+        if glob && !context.complete_items(&items) {
             // Expansions may introduce an explicit binding that shadows a glob.
             return None;
         }
-        let mut base = components.clone();
-        let external = !matches!(path.first()?.as_str(), "crate" | "self" | "super");
-        let (crate_name, external_path) = path.split_first()?;
-        if external
-            && (absolute || (plain_items(&items) && !scope_shadows_external(&items, crate_name)))
-        {
-            // --no-deps can omit the canonical external page and its source.
-            // Resolve the declared path before considering local HTML paths:
-            // an absolute external path bypasses same-named local modules.
-            let mut packages = external_crates.iter().filter(|dep| {
-                dep.dependency.name.replace('-', "_") == *crate_name
-                    && dep
-                        .dependency
-                        .dep_kinds
-                        .iter()
-                        .any(|kind| kind.kind == DependencyKind::Normal)
-            });
-            if let Some(package) = packages.next() {
+        let definition = match resolve_source_path(
+            docs,
+            context,
+            module,
+            absolute,
+            path,
+            &mut HashSet::new(),
+        )? {
+            SourcePath::External(path) => {
+                // --no-deps may omit both the external page and its source.
+                let (crate_name, external_path) = path.split_first()?;
+                let mut packages = external_crates.iter().filter(|dep| {
+                    dep.dependency.name.replace('-', "_") == *crate_name
+                        && dep
+                            .dependency
+                            .dep_kinds
+                            .iter()
+                            .any(|kind| kind.kind == DependencyKind::Normal)
+                });
+                let package = packages.next()?;
                 if packages.any(|other| other.dependency.pkg != package.dependency.pkg) {
                     return None;
                 }
                 if !external_has_kind(&package.source, external_path, kind)? {
                     continue;
                 }
-                resolved.push((
-                    glob,
-                    ItemIdentity::External {
-                        package: package.dependency.pkg.clone(),
-                        path: external_path.to_vec(),
-                        kind: kind.to_string(),
-                        fragment: item.fragment.clone(),
-                    },
-                ));
-                continue;
-            }
-            if absolute {
-                return None;
-            }
-        }
-        match path.first()?.as_str() {
-            "crate" => {
-                base.truncate(1);
-                path.remove(0);
-            }
-            "self" => {
-                path.remove(0);
-            }
-            "super" => {
-                while path.first().is_some_and(|part| part == "super") {
-                    if base.len() <= 1 {
-                        return None;
-                    }
-                    base.pop();
-                    path.remove(0);
+                ItemIdentity::External {
+                    package: package.dependency.pkg.clone(),
+                    path: external_path.to_vec(),
+                    kind: kind.to_string(),
+                    fragment: item.fragment.clone(),
                 }
             }
-            _ => {}
-        }
-        let mut page = docs.to_path_buf();
-        page.extend(&base);
-        let (name, parents) = path.split_last()?;
-        page.extend(parents);
-        page = if kind == "index" {
-            page.join(name).join("index.html")
-        } else {
-            page.join(format!("{kind}.{name}.html"))
+            SourcePath::Local(path) => {
+                let (name, parents) = path.split_last()?;
+                let mut page = docs.to_path_buf();
+                page.extend(parents);
+                page = if kind == "index" {
+                    page.join(name).join("index.html")
+                } else {
+                    page.join(format!("{kind}.{name}.html"))
+                };
+                if !page.is_file() {
+                    return None;
+                }
+                ItemIdentity::Page(HtmlItem {
+                    page,
+                    fragment: item.fragment.clone(),
+                })
+            }
         };
-        if !page.is_file() {
-            return None;
-        }
-        resolved.push((
-            glob,
-            ItemIdentity::Page(HtmlItem {
-                page,
-                fragment: item.fragment.clone(),
-            }),
-        ));
+        resolved.push((glob, definition));
     }
     let explicit = resolved.iter().any(|(glob, _)| !glob);
     let definitions = resolved
@@ -962,9 +1142,136 @@ fn declared_reexport(
     None
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SourcePath {
+    Local(Vec<String>),
+    External(Vec<String>),
+}
+
+fn resolve_source_path(
+    docs: &Path,
+    context: &SourceContext,
+    module: &Path,
+    absolute: bool,
+    mut path: Vec<String>,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<SourcePath> {
+    let mut base = module
+        .iter()
+        .map(|part| part.to_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    let external_only = absolute && !context.edition_2015;
+    let mut implicit_external = !absolute
+        && !context.edition_2015
+        && !matches!(path.first()?.as_str(), "crate" | "self" | "super");
+    if absolute
+        || (context.edition_2015 && !matches!(path.first()?.as_str(), "crate" | "self" | "super"))
+    {
+        base.truncate(1);
+    }
+    match path.first()?.as_str() {
+        "crate" => {
+            base.truncate(1);
+            path.remove(0);
+        }
+        "self" => {
+            path.remove(0);
+        }
+        "super" => {
+            while path.first().is_some_and(|part| part == "super") {
+                if base.len() <= 1 {
+                    return None;
+                }
+                base.pop();
+                path.remove(0);
+            }
+        }
+        _ => {}
+    }
+    while let Some(name) = path.first() {
+        let scope = base.iter().collect::<PathBuf>();
+        let items = module_items(docs, context, &scope)?;
+        let mut crates = items.iter().filter_map(|item| match item {
+            syn::Item::ExternCrate(item)
+                if identifier_key(
+                    &item
+                        .rename
+                        .as_ref()
+                        .map_or(&item.ident, |(_, ident)| ident)
+                        .to_string(),
+                ) == *name =>
+            {
+                Some(item)
+            }
+            _ => None,
+        });
+        if let Some(external) = crates.next() {
+            if crates.next().is_some()
+                || !plain_attributes(&external.attrs)
+                || context.enabled(&external.attrs) != Some(true)
+            {
+                return None;
+            }
+            if external.ident == "self" {
+                path[0] = "crate".into();
+                return resolve_source_path(docs, context, &scope, false, path, visited);
+            }
+            path[0] = identifier_key(&external.ident.to_string()).into_owned();
+            return Some(SourcePath::External(path));
+        }
+        if external_only {
+            return context
+                .complete_items(&items)
+                .then_some(SourcePath::External(path));
+        }
+        let mut aliases = Vec::new();
+        for item in &items {
+            if let syn::Item::Use(item) = item {
+                let mut targets = Vec::new();
+                reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
+                for (_, target) in targets.into_iter().filter(|(glob, _)| !glob) {
+                    if !plain_attributes(&item.attrs) || context.enabled(&item.attrs) != Some(true)
+                    {
+                        return None;
+                    }
+                    aliases.push((item.leading_colon.is_some(), target));
+                }
+            }
+        }
+        if !aliases.is_empty() {
+            if aliases.len() != 1 || !visited.insert((scope.clone(), name.clone())) {
+                return None;
+            }
+            let (absolute, target) = aliases.pop()?;
+            let target = resolve_source_path(docs, context, &scope, absolute, target, visited)?;
+            let suffix = &path[1..];
+            return match target {
+                SourcePath::External(mut target) => {
+                    target.extend_from_slice(suffix);
+                    Some(SourcePath::External(target))
+                }
+                SourcePath::Local(target) if suffix.is_empty() => Some(SourcePath::Local(target)),
+                SourcePath::Local(mut target) => {
+                    let root = PathBuf::from(target.first()?);
+                    target[0] = "crate".into();
+                    target.extend_from_slice(suffix);
+                    resolve_source_path(docs, context, &root, false, target, visited)
+                }
+            };
+        }
+        if implicit_external && !scope_shadows_external(&items, name) {
+            return context
+                .complete_items(&items)
+                .then_some(SourcePath::External(path));
+        }
+        base.push(path.remove(0));
+        implicit_external = false;
+    }
+    Some(SourcePath::Local(base))
+}
+
 fn scope_shadows_external(items: &[syn::Item], name: &str) -> bool {
     items.iter().any(|item| match item {
-        syn::Item::Mod(item) => identifier_key(&item.ident.to_string()) == name,
         syn::Item::ExternCrate(item) => {
             let ident = item.rename.as_ref().map_or(&item.ident, |(_, ident)| ident);
             identifier_key(&ident.to_string()) == name
@@ -974,7 +1281,9 @@ fn scope_shadows_external(items: &[syn::Item], name: &str) -> bool {
             reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
             targets.iter().any(|(glob, _)| !glob)
         }
-        _ => false,
+        _ => declaration(item).is_some_and(|(ident, kind)| {
+            type_kind(kind) && identifier_key(&ident.to_string()) == name
+        }),
     })
 }
 
@@ -1045,7 +1354,11 @@ pub(crate) fn find_page(
     import: &ImportPath,
 ) -> Result<PathBuf, String> {
     let docs = &documentation.directory;
-    let mut lookup = HtmlLookup::new(docs, &documentation.external_crates);
+    let mut lookup = HtmlLookup::new(
+        docs,
+        &documentation.external_crates,
+        &documentation.source_context,
+    );
     let mut item = HtmlItem::new(docs.join(crate_name).join("index.html"));
     for (index, name) in import
         .segments
@@ -1102,6 +1415,7 @@ struct Bindings {
     globs: Vec<String>,
     shadowed: u8,
     unavailable: u8,
+    source_complete: bool,
 }
 
 impl ParsedPage {
@@ -1233,6 +1547,7 @@ impl HtmlVisitor for ExportBindings {
 struct HtmlLookup<'a> {
     docs: &'a Path,
     external_crates: &'a [ExternalCrate],
+    source_context: &'a SourceContext,
     pages: HashMap<PathBuf, ParsedPage>,
     completed: HashMap<(HtmlItem, String, bool), Result<Vec<HtmlItem>, String>>,
     #[cfg(test)]
@@ -1240,10 +1555,15 @@ struct HtmlLookup<'a> {
 }
 
 impl<'a> HtmlLookup<'a> {
-    fn new(docs: &'a Path, external_crates: &'a [ExternalCrate]) -> Self {
+    fn new(
+        docs: &'a Path,
+        external_crates: &'a [ExternalCrate],
+        source_context: &'a SourceContext,
+    ) -> Self {
         Self {
             docs,
             external_crates,
+            source_context,
             pages: HashMap::new(),
             completed: HashMap::new(),
             #[cfg(test)]
@@ -1301,7 +1621,7 @@ impl<'a> HtmlLookup<'a> {
         }
         let result = self
             .collect_candidates(&item, name, type_only)
-            .and_then(|mut items| {
+            .and_then(|(mut items, uncertain)| {
                 items.sort();
                 if items.len() > 1 {
                     let mut identities = HashSet::new();
@@ -1310,6 +1630,7 @@ impl<'a> HtmlLookup<'a> {
                         if identities.insert(item_identity(
                             self.docs,
                             self.external_crates,
+                            self.source_context,
                             &item,
                             &mut HashSet::new(),
                         )?) {
@@ -1317,6 +1638,11 @@ impl<'a> HtmlLookup<'a> {
                         }
                     }
                     items = distinct;
+                }
+                if uncertain && items.len() == 1 {
+                    return Err(format!(
+                        "cannot establish binding '{name}' through a glob: source bindings are incomplete"
+                    ));
                 }
                 Ok(items)
             });
@@ -1329,12 +1655,13 @@ impl<'a> HtmlLookup<'a> {
         root: &HtmlItem,
         name: &str,
         type_only: bool,
-    ) -> Result<Vec<HtmlItem>, String> {
-        let mut pending = vec![(root.clone(), if type_only { 1 } else { 1 | 2 | 4 })];
-        let mut visited: HashMap<PathBuf, u8> = HashMap::new();
+    ) -> Result<(Vec<HtmlItem>, bool), String> {
+        let mut pending = vec![(root.clone(), if type_only { 1 } else { 1 | 2 | 4 }, false)];
+        let mut visited: HashMap<(PathBuf, bool), u8> = HashMap::new();
         let mut candidates = HashSet::new();
+        let mut uncertain_match = false;
         let mut unavailable = None;
-        while let Some((item, namespaces)) = pending.pop() {
+        while let Some((item, namespaces, uncertain)) = pending.pop() {
             let item = match self.follow_redirect(&item) {
                 Ok(item) => item,
                 Err(error) => {
@@ -1345,7 +1672,7 @@ impl<'a> HtmlLookup<'a> {
             if item.fragment.is_some() {
                 continue;
             }
-            let seen = visited.entry(item.page.clone()).or_default();
+            let seen = visited.entry((item.page.clone(), uncertain)).or_default();
             let namespaces = namespaces & !*seen;
             if namespaces == 0 {
                 continue;
@@ -1360,6 +1687,7 @@ impl<'a> HtmlLookup<'a> {
                 globs,
                 mut shadowed,
                 unavailable: omitted_public,
+                source_complete,
             } = match self.bindings(&item, name, type_only) {
                 Ok(bindings) => bindings,
                 Err(error) if item == *root => return Err(error),
@@ -1384,6 +1712,7 @@ impl<'a> HtmlLookup<'a> {
             for (item, binding_namespaces) in explicit {
                 shadowed |= binding_namespaces;
                 if binding_namespaces & namespaces != 0 {
+                    uncertain_match |= uncertain;
                     candidates.insert(item);
                 }
             }
@@ -1397,7 +1726,7 @@ impl<'a> HtmlLookup<'a> {
                     item.page.parent().expect("page has a parent"),
                     &href,
                 ) {
-                    Ok(page) => pending.push((page, remaining)),
+                    Ok(page) => pending.push((page, remaining, uncertain || !source_complete)),
                     Err(error) => {
                         unavailable.get_or_insert(error);
                     }
@@ -1409,7 +1738,7 @@ impl<'a> HtmlLookup<'a> {
         {
             return Err(error);
         }
-        Ok(candidates.into_iter().collect())
+        Ok((candidates.into_iter().collect(), uncertain_match))
     }
 
     fn bindings(
@@ -1419,6 +1748,7 @@ impl<'a> HtmlLookup<'a> {
         type_only: bool,
     ) -> Result<Bindings, String> {
         let docs = self.docs;
+        let context = self.source_context;
         let page = self.page(&item.page)?;
         let directory = item.page.parent().expect("page has a parent");
         let mut candidates = Vec::new();
@@ -1477,14 +1807,18 @@ impl<'a> HtmlLookup<'a> {
             }
         }
         let globs = page.globs.clone();
-        let (shadowed, unavailable) = if globs.is_empty() {
-            (0, 0)
+        let (shadowed, unavailable, source_complete) = if globs.is_empty() {
+            (0, 0, true)
         } else {
             module_items(
                 docs,
+                context,
                 directory.strip_prefix(docs).expect("page is inside docs"),
             )
-            .map(|items| source_bindings(&items, name))
+            .map(|items| {
+                let (shadowed, public) = source_bindings(&items, name);
+                (shadowed, public, context.complete_items(&items))
+            })
             .unwrap_or_default()
         };
         let mut bindings = Vec::new();
@@ -1504,6 +1838,7 @@ impl<'a> HtmlLookup<'a> {
             globs,
             shadowed,
             unavailable,
+            source_complete,
         })
     }
 }
@@ -1811,10 +2146,16 @@ mod tests {
         for levels in [15, 30, 60] {
             let dir = tempfile::TempDir::new().unwrap();
             let docs = dir.path();
+            let crate_dir = docs.join("fixture");
             let write_module = |name: &str, body: String| {
-                let directory = docs.join(name);
+                let directory = crate_dir.join(name);
                 fs::create_dir_all(&directory).unwrap();
-                fs::write(directory.join("index.html"), format!("<main><section id=\"main-content\"><dl class=\"item-table\">{body}</dl></section></main>")).unwrap();
+                let source = if name.is_empty() {
+                    "../source.html"
+                } else {
+                    "../../source.html"
+                };
+                fs::write(directory.join("index.html"), format!("<main><a class=\"src\" href=\"{source}\">Source</a><section id=\"main-content\"><dl class=\"item-table\">{body}</dl></section></main>")).unwrap();
             };
             let glob = |href: &str| {
                 format!("<dt><code>pub use <a href=\"{href}\">module</a>::*;</code></dt>")
@@ -1824,12 +2165,13 @@ mod tests {
                 "<dt><a href=\"struct.Item.html\">Item</a></dt>".to_string()
                     + &glob("../index.html"),
             );
-            let definition = docs.join("leaf/struct.Item.html");
+            let definition = crate_dir.join("leaf/struct.Item.html");
             fs::write(
                 &definition,
                 "<main><pre class=\"rust item-decl\"><code>pub struct Item;</code></pre></main>",
             )
             .unwrap();
+            let mut source = "pub mod leaf { pub struct Item; }".to_string();
             for level in 0..levels {
                 let previous = if level == 0 {
                     vec!["leaf".to_string()]
@@ -1842,15 +2184,18 @@ mod tests {
                     .collect::<String>();
                 for side in ["a", "b"] {
                     write_module(&format!("{side}{level}"), exports.clone());
+                    source.push_str(&format!("pub mod {side}{level} {{}}"));
                 }
             }
+            fs::write(docs.join("source.html"), format!("<code>{source}</code>")).unwrap();
             write_module(
                 "",
                 glob(&format!("a{}/index.html", levels - 1))
                     + &glob(&format!("b{}/index.html", levels - 1)),
             );
-            let root = HtmlItem::new(docs.join("index.html"));
-            let mut lookup = HtmlLookup::new(docs, &[]);
+            let root = HtmlItem::new(crate_dir.join("index.html"));
+            let context = SourceContext::default();
+            let mut lookup = HtmlLookup::new(docs, &[], &context);
             let result = lookup.candidates(&root, "Item", false).unwrap();
             assert_eq!(result, vec![HtmlItem::new(definition)]);
             assert_eq!(lookup.expansions, 2 * levels + 2);
@@ -1868,6 +2213,118 @@ mod tests {
             );
             assert_eq!(lookup.expansions, 3 * (2 * levels + 2));
             assert_eq!(lookup.pages.len(), parsed);
+            fs::remove_file(docs.join("source.html")).unwrap();
+            let mut lookup = HtmlLookup::new(docs, &[], &context);
+            assert!(
+                lookup
+                    .candidates(&root, "Item", false)
+                    .unwrap_err()
+                    .contains("source bindings are incomplete")
+            );
+            assert_eq!(
+                lookup
+                    .candidates(
+                        &HtmlItem::new(crate_dir.join("leaf/index.html")),
+                        "Item",
+                        false
+                    )
+                    .unwrap(),
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_source_selection_preserves_unknown_predicates() {
+        let context = SourceContext {
+            cfg: Some(vec![
+                Cfg::Name("doc".into()),
+                Cfg::Name("unix".into()),
+                Cfg::KeyPair("feature".into(), "enabled".into()),
+                Cfg::KeyPair("target_os".into(), "linux".into()),
+            ]),
+            ..SourceContext::default()
+        };
+        for (predicate, expected) in [
+            ("any()", Some(false)),
+            ("all()", Some(true)),
+            ("feature = \"disabled\"", Some(false)),
+            ("feature = \"enabled\"", Some(true)),
+            ("target_os = \"windows\"", Some(false)),
+            ("not(doc)", Some(false)),
+            ("not(windows)", Some(true)),
+            ("unknown_flag", None),
+            ("target_feature = \"sse2\"", None),
+            ("not(unknown_flag)", None),
+            ("all(unknown_flag, any())", Some(false)),
+            ("any(unknown_flag, all())", Some(true)),
+            ("any(unknown_flag, unix)", Some(true)),
+            ("all(unknown_flag, unix)", None),
+        ] {
+            let syntax = syn::parse_file(&format!("#[cfg({predicate})] pub struct Item;")).unwrap();
+            assert_eq!(
+                context.enabled(item_attributes(&syntax.items[0]).unwrap()),
+                expected,
+                "{predicate}"
+            );
+        }
+        let syntax =
+            syn::parse_file("#[cfg(unknown_flag)] #[cfg(any())] pub struct Item;").unwrap();
+        assert!(context.active_items(syntax.items).is_empty());
+        let unknown = SourceContext::default();
+        assert_eq!(
+            unknown.matches(&"feature = \"disabled\"".parse().unwrap()),
+            None
+        );
+        assert_eq!(unknown.matches(&"all()".parse().unwrap()), Some(true));
+        assert!(!flags_change_cfg(
+            "--cfg coverage --cfg=unknown_flag -C instrument-coverage"
+        ));
+        for flags in [
+            "--cfg feature=\"extra\"",
+            "--cfg=target_os=\"other\"",
+            "@flags.txt",
+            "--target other",
+        ] {
+            assert!(flags_change_cfg(flags), "{flags}");
+        }
+        for config in [
+            "rustdocflags = ['--cfg', 'feature=\"extra\"']",
+            "rustdocflags = '--cfg feature=\"extra\"'",
+        ] {
+            let table = config.parse::<toml::Table>().unwrap();
+            assert!(config_flags_change_cfg(&toml::Value::Table(table)));
+        }
+    }
+
+    #[test]
+    fn cyclic_source_aliases_and_parent_paths_stop_without_identity_evidence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docs = dir.path();
+        fs::create_dir(docs.join("fixture")).unwrap();
+        fs::write(
+            docs.join("fixture/index.html"),
+            "<a class=\"src\" href=\"../source.html\">Source</a>",
+        )
+        .unwrap();
+        fs::write(
+            docs.join("source.html"),
+            "<code>use b as a; use a as b;</code>",
+        )
+        .unwrap();
+        let context = SourceContext::default();
+        for path in [vec!["a", "item"], vec!["super", "item"]] {
+            assert_eq!(
+                resolve_source_path(
+                    docs,
+                    &context,
+                    Path::new("fixture"),
+                    false,
+                    path.into_iter().map(str::to_string).collect(),
+                    &mut HashSet::new()
+                ),
+                None
+            );
         }
     }
 

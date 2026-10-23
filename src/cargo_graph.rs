@@ -10,7 +10,7 @@ use std::process::Command;
 
 pub(crate) struct TargetPlatform {
     pub(crate) name: String,
-    cfg: Vec<Cfg>,
+    pub(crate) cfg: Vec<Cfg>,
 }
 
 impl TargetPlatform {
@@ -127,9 +127,9 @@ fn probe(
 }
 
 pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    let mut directories = manifest
-        .parent()
-        .expect("manifest has a parent")
+    let manifest = std::path::absolute(manifest).map_err(|error| error.to_string())?;
+    let invocation = manifest.parent().expect("manifest has a parent");
+    let mut directories = invocation
         .ancestors()
         .map(|directory| directory.join(".cargo"))
         .collect::<Vec<_>>();
@@ -137,7 +137,9 @@ pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, Strin
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
     {
-        directories.push(home);
+        // Every Cargo subprocess runs from this directory, including when
+        // excra itself was invoked elsewhere with --root.
+        directories.push(invocation.join(home));
     }
     let mut configuration = Vec::new();
     let mut visited = HashSet::new();
@@ -160,7 +162,10 @@ fn read_configuration(
     visited: &mut HashSet<PathBuf>,
     configuration: &mut Vec<(PathBuf, String)>,
 ) -> Result<(), String> {
-    let contents = match fs::read_to_string(path) {
+    // Keep the logical origin (including symlinks) for Cargo-relative paths;
+    // canonicalization below is only for detecting repeated includes.
+    let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
@@ -195,7 +200,7 @@ fn read_configuration(
             )?;
         }
     }
-    configuration.push((path.to_path_buf(), contents));
+    configuration.push((path, contents));
     Ok(())
 }
 
