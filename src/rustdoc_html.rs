@@ -52,8 +52,8 @@ pub(crate) fn generate(
     let lock = fs::read(metadata.workspace_root.join("Cargo.lock"))
         .map_err(|error| format!("cannot read workspace Cargo.lock: {error}"))?;
     let mut identity = std::collections::hash_map::DefaultHasher::new();
-    // Do not reuse Markdown produced by an older conversion implementation.
-    (env!("CARGO_PKG_VERSION"), "markdown-v2").hash(&mut identity);
+    // Invalidate compiled artifacts and Markdown from older generation logic.
+    (env!("CARGO_PKG_VERSION"), "docs-v3").hash(&mut identity);
     package_spec(package).hash(&mut identity);
     package.manifest_path.hash(&mut identity);
     contents.hash(&mut identity);
@@ -1570,16 +1570,40 @@ fn resolve_source_path(
         }
         let shadowed = scope_shadows_external(&items, name, requested);
         let mut target = None;
+        if (!aliases.is_empty() || (!shadowed && !globs.is_empty()))
+            && !visited.insert((scope.clone(), name.clone()))
+        {
+            return None;
+        }
         if !aliases.is_empty() {
-            if aliases.len() != 1 || !visited.insert((scope.clone(), name.clone())) {
+            let mut definitions = HashSet::new();
+            for (absolute, alias_path) in aliases {
+                let definition = resolve_source_path(
+                    docs,
+                    context,
+                    &scope,
+                    absolute,
+                    alias_path,
+                    requested,
+                    &mut visited.clone(),
+                )?;
+                if let SourcePath::Local(path) = &definition
+                    && local_source_namespaces(docs, context, path, None)
+                        .is_some_and(|binding| binding & requested == 0)
+                {
+                    continue;
+                }
+                // Unknown namespaces remain candidates, so they cannot certify
+                // another alias as the only origin in the requested namespace.
+                definitions.insert(definition);
+            }
+            if definitions.len() > 1 {
                 return None;
             }
-            let (absolute, alias_path) = aliases.pop()?;
-            target = Some(resolve_source_path(
-                docs, context, &scope, absolute, alias_path, requested, visited,
-            )?);
-        } else if !shadowed && !globs.is_empty() {
-            if !context.complete_items(&items) || !visited.insert((scope.clone(), name.clone())) {
+            target = definitions.into_iter().next();
+        }
+        if target.is_none() && !shadowed && !globs.is_empty() {
+            if !context.complete_items(&items) {
                 return None;
             }
             let mut definitions = HashSet::new();
@@ -1774,11 +1798,6 @@ fn source_glob_bindings(
 
 fn scope_shadows_external(items: &[syn::Item], name: &str, namespaces: u8) -> bool {
     items.iter().any(|item| match item {
-        syn::Item::Use(item) => {
-            let mut targets = Vec::new();
-            reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
-            targets.iter().any(|(glob, _)| !glob)
-        }
         syn::Item::ForeignMod(block) => block.items.iter().any(|item| {
             foreign_binding(item).is_some_and(|(ident, binding, _)| {
                 namespaces & binding != 0 && identifier_key(&ident.to_string()) == name

@@ -1045,17 +1045,32 @@ fn isolated_docs_preserve_workspace_wrapper_membership_and_composition() {
         "build-environment",
         "configuration",
         "included-configuration",
+        "print-link-args",
+        "print-link-args-split",
+        "print-native-static-libs",
         "external-request",
     ] {
         if mode == "external-request" {
             fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = ['app', 'inner']\nexclude = ['api', 'outside']\nresolver = '3'\n").unwrap();
         }
         let config = root.join(".cargo/config.toml");
-        fs::write(&config, match mode {
-            "configuration" => "[build]\nrustc-workspace-wrapper = 'workspace-wrapper'\nrustc-wrapper = './general-wrapper'\n",
-            "included-configuration" => "include = ['wrappers.toml']\n",
+        let mut contents = String::from(match mode {
+            "configuration" => {
+                "[build]\nrustc-workspace-wrapper = 'workspace-wrapper'\nrustc-wrapper = './general-wrapper'\n"
+            }
+            "included-configuration"
+            | "print-link-args"
+            | "print-link-args-split"
+            | "print-native-static-libs" => "include = ['wrappers.toml']\n",
             _ => "",
-        }).unwrap();
+        });
+        contents.push_str(match mode {
+            "print-link-args" => "[build]\nrustflags = ['--print=link-args']\n",
+            "print-link-args-split" => "[build]\nrustflags = ['--print', 'link-args']\n",
+            "print-native-static-libs" => "[build]\nrustflags = ['--print=native-static-libs']\n",
+            _ => "",
+        });
+        fs::write(&config, contents).unwrap();
         fs::write(root.join(".cargo/wrappers.toml"), "[build]\nrustc-workspace-wrapper = './workspace-wrapper'\nrustc-wrapper = './general-wrapper'\n").unwrap();
         let configure = |command: &mut Command| {
             for name in [
@@ -1103,6 +1118,10 @@ fn isolated_docs_preserve_workspace_wrapper_membership_and_composition() {
         let expected = fs::read_to_string(root.join("target/doc/api/struct.Item.html")).unwrap();
         assert!(expected.contains("expected"), "{mode}");
         assert!(!expected.contains("incorrect"), "{mode}");
+        let expected =
+            fs::read_to_string(root.join("target/doc/api/struct.External.html")).unwrap();
+        assert!(expected.contains("expected_external"), "{mode}");
+        assert!(!expected.contains("incorrect_external"), "{mode}");
         let mut command = query_command(root, "use alias::{Item, External};", &[]);
         configure(&mut command);
         let report = success(command.output().unwrap());
@@ -1118,6 +1137,152 @@ fn isolated_docs_preserve_workspace_wrapper_membership_and_composition() {
             "{mode}: {report}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn compiler_wrapper_distinguishes_probes_with_inherited_package_context() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let member = root.join("member");
+    let outside = root.join("outside");
+    fs::create_dir(&member).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let compiler = root.join("compiler");
+    let wrapper = root.join("wrapper");
+    fs::write(&compiler, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    fs::write(&wrapper, "#!/bin/sh\nexec \"$@\" --cfg workspace_flag\n").unwrap();
+    for script in [&compiler, &wrapper] {
+        fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for (arguments, probe) in [
+        (vec!["-vV"], true),
+        (vec!["--print=cfg"], true),
+        (vec!["--print", "cfg", "--print", "target-libdir"], true),
+        (vec!["--print=file-names", "--print=link-args"], true),
+        (vec!["lib.rs", "--emit=metadata"], false),
+        (vec!["lib.rs", "--print=link-args"], false),
+        (vec!["lib.rs", "--print", "link-args"], false),
+        (vec!["lib.rs", "--print=link-args=output.txt"], false),
+        (vec!["lib.rs", "--print=native-static-libs"], false),
+        (vec!["lib.rs", "--print", "native-static-libs"], false),
+    ] {
+        for directory in [Some(&member), Some(&outside), None] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_excra"));
+            command
+                .arg(&compiler)
+                .args(&arguments)
+                .env(
+                    "EXCRA_COMPILER_WORKSPACE_MEMBERS",
+                    serde_json::to_string(&[member.canonicalize().unwrap()]).unwrap(),
+                )
+                .env("EXCRA_COMPILER_GENERAL_WRAPPER", "")
+                .env("EXCRA_COMPILER_WORKSPACE_WRAPPER", &wrapper);
+            if let Some(directory) = directory {
+                command.env("CARGO_MANIFEST_DIR", directory);
+            } else {
+                command.env_remove("CARGO_MANIFEST_DIR");
+            }
+            let output = success(command.output().unwrap());
+            assert_eq!(
+                output.contains("workspace_flag"),
+                probe || directory != Some(&outside),
+                "{arguments:?}, {directory:?}: {output}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn repeated_configuration_includes_preserve_workspace_wrapper_precedence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let parent = dir.path();
+    let root = parent.join("child");
+    fs::create_dir_all(root.join(".cargo")).unwrap();
+    fs::create_dir(parent.join(".cargo")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = ['app', 'api', 'inner']\nresolver = '3'\n",
+    )
+    .unwrap();
+    for (name, dependencies, source) in [
+        (
+            "app",
+            "[dependencies]\nalias = { package = 'api', path = '../api' }\n",
+            "",
+        ),
+        (
+            "api",
+            "[dependencies]\ninner = { path = '../inner' }\n",
+            "pub use inner::Item;",
+        ),
+        (
+            "inner",
+            "",
+            "#![allow(unexpected_cfgs)]\n#[cfg(one)] pub struct Item { pub expected: u8 }\n#[cfg(not(one))] pub struct Item { pub incorrect: u64 }\n",
+        ),
+    ] {
+        member(
+            &root,
+            name,
+            &format!(
+                "[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2024'\n{dependencies}"
+            ),
+            source,
+        );
+    }
+    for flag in ["one", "two"] {
+        let wrapper = parent.join(format!("{flag}-wrapper"));
+        fs::write(&wrapper, format!("#!/bin/sh\nexec \"$@\" --cfg {flag}\n")).unwrap();
+        fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        parent.join(".cargo/shared.toml"),
+        "[build]\nrustc-workspace-wrapper = './one-wrapper'\n",
+    )
+    .unwrap();
+    fs::write(
+        parent.join(".cargo/config.toml"),
+        "include = ['shared.toml']\n[build]\nrustc-workspace-wrapper = './two-wrapper'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        "include = ['../../.cargo/shared.toml']\n",
+    )
+    .unwrap();
+    success(
+        Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    success(
+        Command::new("cargo")
+            .args([
+                "doc",
+                "--offline",
+                "--locked",
+                "--no-deps",
+                "--package",
+                "api",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    let expected = fs::read_to_string(root.join("target/doc/api/struct.Item.html")).unwrap();
+    assert!(expected.contains("expected"));
+    assert!(!expected.contains("incorrect"));
+    let report = success(query(&root, "use alias::Item;", &[]));
+    assert!(report.contains("pub expected: u8"), "{report}");
+    assert!(!report.contains("incorrect"), "{report}");
 }
 
 #[test]
@@ -2150,6 +2315,26 @@ fn glob_imported_module_aliases_follow_their_canonical_origins() {
             "correct: u8",
         ),
         (
+            "pub use crate::original::nested; pub use crate::values::nested;",
+            "original",
+            "correct: u8",
+        ),
+        (
+            "pub use crate::values::nested; pub use crate::original::nested;",
+            "original",
+            "correct: u8",
+        ),
+        (
+            "pub use crate::original::nested as common; pub use crate::values::nested as common; pub use common as nested;",
+            "original",
+            "correct: u8",
+        ),
+        (
+            "pub use crate::original::*; pub use crate::values::nested;",
+            "original",
+            "correct: u8",
+        ),
+        (
             "pub use crate::other::*; pub mod nested { pub struct Item { pub local: u16 } }",
             "a",
             "local: u16",
@@ -2176,7 +2361,11 @@ pub mod b {{ #[doc(inline)] pub use crate::{origin}::nested as Alias; }}
         )
         .unwrap();
         let import = "use alias::Alias::Item;";
-        fs::write(root.join("app/src/lib.rs"), import).unwrap();
+        fs::write(
+            root.join("app/src/lib.rs"),
+            "use alias::Alias::{self, Item};",
+        )
+        .unwrap();
         success(
             Command::new("cargo")
                 .args(["check", "--offline", "--locked", "--package", "app"])
@@ -2190,6 +2379,16 @@ pub mod b {{ #[doc(inline)] pub use crate::{origin}::nested as Alias; }}
             report.contains(&format!("pub {field}")),
             "{imports}: {report}"
         );
+        let report = success(query(root, "use alias::Alias::{self};", &[]));
+        assert_eq!(paths(&report, "source: ").len(), 1, "{imports}: {report}");
+        assert!(report.contains("# Module"), "{imports}: {report}");
+        if imports.contains("values") {
+            let error = failure(query(root, "use alias::Alias;", &[]));
+            assert!(
+                error.contains("ambiguous") || error.contains("no available rustdoc HTML page"),
+                "{imports}: {error}"
+            );
+        }
     }
     fs::write(
         root.join("api/src/lib.rs"),
@@ -2211,6 +2410,8 @@ pub mod b { pub use crate::other::*; #[doc(inline)] pub use nested as Alias; }
     assert!(!checked.status.success());
     assert!(String::from_utf8_lossy(&checked.stderr).contains("ambiguous"));
     let error = failure(query(root, "use alias::Alias::Item;", &[]));
+    assert!(error.contains("ambiguous"), "{error}");
+    let error = failure(query(root, "use alias::Alias::{self};", &[]));
     assert!(error.contains("ambiguous"), "{error}");
 }
 

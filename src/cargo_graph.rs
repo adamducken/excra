@@ -142,7 +142,7 @@ pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, Strin
         directories.push(invocation.join(home));
     }
     let mut configuration = Vec::new();
-    let mut visited = HashSet::new();
+    let mut active = HashSet::new();
     // Merge from the least specific directory; each file overrides includes.
     for directory in directories.into_iter().rev() {
         let legacy = directory.join("config");
@@ -151,7 +151,7 @@ pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, Strin
         } else {
             directory.join("config.toml")
         };
-        read_configuration(&path, true, &mut visited, &mut configuration)?;
+        read_configuration(&path, true, &mut active, &mut configuration)?;
     }
     Ok(configuration)
 }
@@ -159,11 +159,11 @@ pub(crate) fn cargo_configuration(manifest: &Path) -> Result<Vec<(PathBuf, Strin
 fn read_configuration(
     path: &Path,
     optional: bool,
-    visited: &mut HashSet<PathBuf>,
+    active: &mut HashSet<PathBuf>,
     configuration: &mut Vec<(PathBuf, String)>,
 ) -> Result<(), String> {
     // Keep the logical origin (including symlinks) for Cargo-relative paths;
-    // canonicalization below is only for detecting repeated includes.
+    // canonicalization below is only for detecting recursive includes.
     let path = std::path::absolute(path).map_err(|error| error.to_string())?;
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -171,8 +171,11 @@ fn read_configuration(
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
     let canonical = path.canonicalize().map_err(|error| error.to_string())?;
-    if !visited.insert(canonical) {
-        return Ok(());
+    if !active.insert(canonical.clone()) {
+        return Err(format!(
+            "recursive Cargo configuration include: {}",
+            path.display()
+        ));
     }
     let table = contents
         .parse::<toml::Table>()
@@ -195,11 +198,12 @@ fn read_configuration(
                     .expect("configuration has a parent")
                     .join(name),
                 optional,
-                visited,
+                active,
                 configuration,
             )?;
         }
     }
+    active.remove(&canonical);
     configuration.push((path, contents));
     Ok(())
 }
@@ -519,6 +523,58 @@ fn parse_platform(output: &str) -> Result<TargetPlatform, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_include_cycles_fail_explicitly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = dir.path().join("first.toml");
+        let second = dir.path().join("second.toml");
+        for include in ["first.toml", "second.toml"] {
+            fs::write(&first, format!("include = ['{include}']\n")).unwrap();
+            fs::write(&second, "include = ['first.toml']\n").unwrap();
+            let error = read_configuration(&first, false, &mut HashSet::new(), &mut Vec::new())
+                .unwrap_err();
+            assert!(
+                error.contains("recursive Cargo configuration include"),
+                "{error}"
+            );
+            assert!(error.contains("first.toml"), "{error}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repeated_configuration_includes_keep_their_logical_origins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(
+            root.join("shared.toml"),
+            "[build]\nrustc-workspace-wrapper = './wrapper'\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../shared.toml", root.join("nested/shared.toml")).unwrap();
+        let path = root.join("config.toml");
+        fs::write(
+            &path,
+            "include = ['shared.toml', 'nested/shared.toml', 'shared.toml']\n",
+        )
+        .unwrap();
+        let mut configuration = Vec::new();
+        read_configuration(&path, false, &mut HashSet::new(), &mut configuration).unwrap();
+        assert_eq!(
+            configuration
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            [
+                root.join("shared.toml"),
+                root.join("nested/shared.toml"),
+                root.join("shared.toml"),
+                path
+            ]
+        );
+    }
 
     #[test]
     fn layered_graphs_keep_all_edges_with_linear_output() {

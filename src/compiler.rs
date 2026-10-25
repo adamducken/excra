@@ -153,14 +153,25 @@ pub(crate) fn run_wrapper() -> Result<ExitCode, String> {
     let mut arguments = std::env::args_os().skip(1);
     let compiler = arguments.next().ok_or("missing wrapped compiler")?;
     let arguments = arguments.collect::<Vec<_>>();
-    // Cargo's version/cfg probes have no package context and use its workspace
-    // wrapper too. Real compilations are routed by the original membership.
-    let probe = arguments.iter().any(|argument| {
-        argument == "-vV"
-            || argument == "--print"
-            || argument
+    // Informational probes use Cargo's workspace wrapper even when they inherit
+    // package context. Print modes that compile retain membership routing.
+    let probe = arguments.iter().enumerate().any(|(index, argument)| {
+        if matches!(argument.to_str(), Some("-vV" | "-V" | "--version")) {
+            return true;
+        }
+        let print = if argument == "--print" {
+            arguments.get(index + 1).and_then(|value| value.to_str())
+        } else {
+            argument
                 .to_str()
-                .is_some_and(|argument| argument.starts_with("--print="))
+                .and_then(|value| value.strip_prefix("--print="))
+        };
+        print.is_some_and(|value| {
+            !matches!(
+                value.split('=').next(),
+                Some("link-args" | "native-static-libs")
+            )
+        })
     });
     let member = probe
         || std::env::var_os("CARGO_MANIFEST_DIR").is_none_or(|directory| {
