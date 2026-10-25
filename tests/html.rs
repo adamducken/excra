@@ -1994,6 +1994,60 @@ pub struct Namespace;
 }
 
 #[test]
+fn documentation_html_cannot_merge_distinct_structs_or_traits() {
+    let dir = project();
+    let root = dir.path();
+    for injected in [false, true] {
+        let struct_doc = if injected {
+            r#"/// <div id="synthetic-implementations-list"><a class="struct" href="../shared/struct.Shared.html">Shared</a></div>"#
+        } else {
+            ""
+        };
+        let trait_doc = if injected {
+            r#"/// <script src="../../trait.impl/api/shared/trait.SharedTrait.js"></script>"#
+        } else {
+            ""
+        };
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                r#"
+pub mod a {{
+    {struct_doc}
+    pub struct Clash {{ pub first: u8 }}
+    {trait_doc}
+    pub trait TraitClash {{ fn first(&self); }}
+}}
+pub mod b {{
+    {struct_doc}
+    pub struct Clash {{ pub second: u64 }}
+    {trait_doc}
+    pub trait TraitClash {{ fn second(&self); }}
+}}
+pub mod shared {{ pub struct Shared; pub trait SharedTrait {{}} }}
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#
+            ),
+        )
+        .unwrap();
+        for name in ["Clash", "TraitClash"] {
+            let import = format!("use alias::{name};");
+            fs::write(root.join("app/src/lib.rs"), &import).unwrap();
+            let checked = Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(!checked.status.success());
+            assert!(String::from_utf8_lossy(&checked.stderr).contains("ambiguous"));
+            let error = failure(query(root, &import, &[]));
+            assert!(error.contains("ambiguous"), "{injected}: {name}: {error}");
+        }
+    }
+}
+
+#[test]
 fn scoped_aliases_and_edition_2015_roots_share_canonical_reexport_identity() {
     let dir = project();
     let root = dir.path();
@@ -2071,6 +2125,92 @@ fn scoped_aliases_and_edition_2015_roots_share_canonical_reexport_identity() {
     fs::write(&manifest, original).unwrap();
     fs::write(root.join("api/src/lib.rs"), "pub mod source { pub fn item() {} }\npub mod a { use crate::source as local; #[doc(inline)] pub use local::item; }\npub mod b { use inner as local; #[doc(inline)] pub use local::item; }\n#[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;").unwrap();
     let error = failure(query(root, "use alias::item;", &[]));
+    assert!(error.contains("ambiguous"), "{error}");
+}
+
+#[test]
+fn glob_imported_module_aliases_follow_their_canonical_origins() {
+    let dir = project();
+    let root = dir.path();
+    for (imports, origin, field) in [
+        ("pub use crate::original::*;", "original", "correct: u8"),
+        (
+            "pub use crate::first::*; pub use crate::second::*;",
+            "original",
+            "correct: u8",
+        ),
+        (
+            "pub use crate::other::*; pub use crate::original::nested;",
+            "original",
+            "correct: u8",
+        ),
+        (
+            "pub use crate::values::*; pub use crate::original::*;",
+            "original",
+            "correct: u8",
+        ),
+        (
+            "pub use crate::other::*; pub mod nested { pub struct Item { pub local: u16 } }",
+            "a",
+            "local: u16",
+        ),
+        ("pub use crate::cycle_one::*;", "original", "correct: u8"),
+    ] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                r#"
+pub mod original {{ pub mod nested {{ pub struct Item {{ pub correct: u8 }} }} }}
+pub mod other {{ pub mod nested {{ pub struct Item {{ pub wrong: u64 }} }} }}
+pub mod values {{ pub fn nested() {{}} }}
+pub mod first {{ pub use crate::original::*; }}
+pub mod second {{ pub use crate::first::*; pub use crate::original::*; }}
+pub mod cycle_one {{ pub use crate::cycle_two::*; pub use crate::original::*; }}
+pub mod cycle_two {{ pub use crate::cycle_one::*; }}
+pub mod a {{ {imports} #[doc(inline)] pub use nested as Alias; }}
+pub mod b {{ #[doc(inline)] pub use crate::{origin}::nested as Alias; }}
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#
+            ),
+        )
+        .unwrap();
+        let import = "use alias::Alias::Item;";
+        fs::write(root.join("app/src/lib.rs"), import).unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let report = success(query(root, import, &[]));
+        assert_eq!(paths(&report, "source: ").len(), 1, "{imports}: {report}");
+        assert!(
+            report.contains(&format!("pub {field}")),
+            "{imports}: {report}"
+        );
+    }
+    fs::write(
+        root.join("api/src/lib.rs"),
+        r#"
+pub mod original { pub mod nested { pub struct Item; } }
+pub mod other { pub mod nested { pub struct Item; } }
+pub mod a { pub use crate::original::*; #[doc(inline)] pub use nested as Alias; }
+pub mod b { pub use crate::other::*; #[doc(inline)] pub use nested as Alias; }
+#[doc(no_inline)] pub use a::*;
+#[doc(no_inline)] pub use b::*;
+"#,
+    )
+    .unwrap();
+    let checked = Command::new("cargo")
+        .args(["check", "--offline", "--locked", "--package", "app"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(!checked.status.success());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("ambiguous"));
+    let error = failure(query(root, "use alias::Alias::Item;", &[]));
     assert!(error.contains("ambiguous"), "{error}");
 }
 

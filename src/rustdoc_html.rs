@@ -489,38 +489,15 @@ fn item_identity(
     if !visited.insert(item.clone()) {
         return Ok(ItemIdentity::Page(item.clone()));
     }
-    let html = read_html(&item.page)?;
+    let page = ParsedPage::new(read_html(&item.page)?)?;
     let directory = item.page.parent().expect("page has a parent");
     let kind = page_kind(&item.page).unwrap_or_default();
-    // Inlined nominal types keep their canonical self-type links in auto impls.
-    if let Some((_, implementations)) = html.split_once("id=\"synthetic-implementations-list\"") {
-        for link in implementations
-            .split("</div>")
-            .next()
-            .unwrap_or_default()
-            .split("<a ")
-            .skip(1)
+    for (link_kind, href) in page.identity_links {
+        if link_kind == kind
+            && let Ok(mut definition) = local_link(docs, directory, &href)
         {
-            let tag = link.split('>').next().unwrap_or_default();
-            if attribute(tag, "class") == Some(kind)
-                && let Some(href) = attribute(tag, "href")
-                && let Ok(mut definition) = local_link(docs, directory, href)
-            {
-                definition.fragment = item.fragment.clone();
-                return Ok(ItemIdentity::Page(definition));
-            }
-        }
-    }
-    // Trait implementation scripts likewise belong to the definition's path.
-    if kind == "trait" {
-        for script in html.split("<script ").skip(1) {
-            let tag = script.split('>').next().unwrap_or_default();
-            if let Some(src) = attribute(tag, "src")
-                && (src.contains("/trait.impl/") || src.contains("/implementors/"))
-                && let Ok(definition) = local_link(docs, directory, src)
-            {
-                return Ok(ItemIdentity::Page(definition));
-            }
+            definition.fragment = item.fragment.clone();
+            return Ok(ItemIdentity::Page(definition));
         }
     }
     if let Some(definition) = declared_reexport(docs, external_crates, context, item) {
@@ -980,13 +957,18 @@ fn module_items_with_visited(
     }
     let mut items = context.active_items(syntax.items);
     for (index, name) in components[1..].iter().enumerate() {
+        let non_module = items.iter().any(|item| {
+            declaration(item).is_some_and(|(ident, kind)| {
+                kind != "index" && type_kind(kind) && identifier_key(&ident.to_string()) == *name
+            })
+        });
         let aliased = items.iter().any(|item| {
             let syn::Item::Use(item) = item else {
                 return false;
             };
             let mut targets = Vec::new();
             reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
-            targets.iter().any(|(glob, _)| !glob)
+            !targets.is_empty()
         });
         let mut modules = items.into_iter().filter_map(|item| match item {
             syn::Item::Mod(module) if identifier_key(&module.ident.to_string()) == *name => {
@@ -995,12 +977,19 @@ fn module_items_with_visited(
             _ => None,
         });
         let Some(module) = modules.next() else {
-            if !aliased {
+            if !aliased || non_module {
                 return None;
             }
             let scope = directory.strip_prefix(docs).ok()?;
-            let SourcePath::Local(mut path) =
-                resolve_source_path(docs, context, scope, false, vec![name.to_string()], visited)?
+            let SourcePath::Local(mut path) = resolve_source_path(
+                docs,
+                context,
+                scope,
+                false,
+                vec![name.to_string()],
+                1,
+                visited,
+            )?
             else {
                 return None;
             };
@@ -1170,16 +1159,35 @@ fn source_import_namespaces(
         module,
         absolute,
         path.clone(),
+        1 | 2 | 4,
         &mut HashSet::new(),
     )
     .or_else(|| {
         // Enum variants are not modules, so resolve their enum separately.
         variant = path.pop();
-        resolve_source_path(docs, context, module, absolute, path, &mut HashSet::new())
+        resolve_source_path(
+            docs,
+            context,
+            module,
+            absolute,
+            path,
+            1,
+            &mut HashSet::new(),
+        )
     })?;
     let SourcePath::Local(path) = target else {
         return None;
     };
+    local_source_namespaces(docs, context, &path, variant.as_deref())
+        .filter(|namespaces| *namespaces != 0)
+}
+
+fn local_source_namespaces(
+    docs: &Path,
+    context: &SourceContext,
+    path: &[String],
+    variant: Option<&str>,
+) -> Option<u8> {
     let (name, parents) = path.split_last()?;
     let (_, items) = module_items(docs, context, &parents.iter().collect::<PathBuf>())?;
     if !context.complete_items(&items) {
@@ -1187,12 +1195,12 @@ fn source_import_namespaces(
     }
     let mut namespaces = 0;
     for item in &items {
-        if let Some(variant) = &variant {
+        if let Some(variant) = variant {
             if let syn::Item::Enum(item) = item
                 && identifier_key(&item.ident.to_string()) == *name
             {
                 for item in &item.variants {
-                    if identifier_key(&item.ident.to_string()) == *variant {
+                    if identifier_key(&item.ident.to_string()) == variant {
                         if !plain_attributes(&item.attrs)
                             || context.enabled(&item.attrs) != Some(true)
                         {
@@ -1236,7 +1244,7 @@ fn source_import_namespaces(
             namespaces |= 4;
         }
     }
-    (namespaces != 0).then_some(namespaces)
+    Some(namespaces)
 }
 
 // Source bindings still shadow globs when rustdoc omits their pages. Imports
@@ -1373,8 +1381,22 @@ fn declared_reexport(
             // Expansions may introduce an explicit binding that shadows a glob.
             return None;
         }
-        let target =
-            resolve_source_path(docs, context, &module, absolute, path, &mut HashSet::new())?;
+        let namespaces = if type_kind(kind) {
+            1
+        } else if kind == "macro" {
+            4
+        } else {
+            2
+        };
+        let target = resolve_source_path(
+            docs,
+            context,
+            &module,
+            absolute,
+            path,
+            namespaces,
+            &mut HashSet::new(),
+        )?;
         let definition = match target {
             SourcePath::External(path) => {
                 // --no-deps may omit both the external page and its source.
@@ -1436,7 +1458,7 @@ fn declared_reexport(
     None
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 enum SourcePath {
     Local(Vec<String>),
     External(Vec<String>),
@@ -1448,6 +1470,7 @@ fn resolve_source_path(
     module: &Path,
     absolute: bool,
     mut path: Vec<String>,
+    namespaces: u8,
     visited: &mut HashSet<(PathBuf, String)>,
 ) -> Option<SourcePath> {
     let mut base = module
@@ -1512,7 +1535,9 @@ fn resolve_source_path(
             }
             if external.ident == "self" {
                 path[0] = "crate".into();
-                return resolve_source_path(docs, context, &scope, false, path, visited);
+                return resolve_source_path(
+                    docs, context, &scope, false, path, namespaces, visited,
+                );
             }
             path[0] = identifier_key(&external.ident.to_string()).into_owned();
             return Some(SourcePath::External(path));
@@ -1522,26 +1547,75 @@ fn resolve_source_path(
                 .complete_items(&items)
                 .then_some(SourcePath::External(path));
         }
+        let requested = if path.len() > 1 { 1 } else { namespaces };
         let mut aliases = Vec::new();
+        let mut globs = Vec::new();
         for item in &items {
             if let syn::Item::Use(item) = item {
                 let mut targets = Vec::new();
                 reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
-                for (_, target) in targets.into_iter().filter(|(glob, _)| !glob) {
-                    if !plain_attributes(&item.attrs) || context.enabled(&item.attrs) != Some(true)
-                    {
-                        return None;
+                for (glob, target) in targets {
+                    if glob {
+                        globs.push((item, target));
+                    } else {
+                        if !plain_attributes(&item.attrs)
+                            || context.enabled(&item.attrs) != Some(true)
+                        {
+                            return None;
+                        }
+                        aliases.push((item.leading_colon.is_some(), target));
                     }
-                    aliases.push((item.leading_colon.is_some(), target));
                 }
             }
         }
+        let shadowed = scope_shadows_external(&items, name, requested);
+        let mut target = None;
         if !aliases.is_empty() {
             if aliases.len() != 1 || !visited.insert((scope.clone(), name.clone())) {
                 return None;
             }
-            let (absolute, target) = aliases.pop()?;
-            let target = resolve_source_path(docs, context, &scope, absolute, target, visited)?;
+            let (absolute, alias_path) = aliases.pop()?;
+            target = Some(resolve_source_path(
+                docs, context, &scope, absolute, alias_path, requested, visited,
+            )?);
+        } else if !shadowed && !globs.is_empty() {
+            if !context.complete_items(&items) || !visited.insert((scope.clone(), name.clone())) {
+                return None;
+            }
+            let mut definitions = HashSet::new();
+            for (import, mut path) in globs {
+                path.pop();
+                // This import cannot establish its own leading module name.
+                if import.leading_colon.is_none() && path.first() == Some(name) {
+                    continue;
+                }
+                let SourcePath::Local(module) = resolve_source_path(
+                    docs,
+                    context,
+                    &scope,
+                    import.leading_colon.is_some(),
+                    path,
+                    1,
+                    &mut visited.clone(),
+                )?
+                else {
+                    return None;
+                };
+                definitions.extend(source_glob_bindings(
+                    docs,
+                    context,
+                    &module.iter().collect::<PathBuf>(),
+                    name,
+                    requested,
+                    &mut visited.clone(),
+                )?);
+            }
+            if definitions.len() > 1 {
+                return None;
+            }
+            target = definitions.into_iter().next();
+        }
+        if let Some(target) = target {
             let suffix = &path[1..];
             return match target {
                 SourcePath::External(mut target) => {
@@ -1553,12 +1627,12 @@ fn resolve_source_path(
                     let root = PathBuf::from(target.first()?);
                     target[0] = "crate".into();
                     target.extend_from_slice(suffix);
-                    resolve_source_path(docs, context, &root, false, target, visited)
+                    resolve_source_path(docs, context, &root, false, target, namespaces, visited)
                 }
             };
         }
         if implicit_external
-            && !scope_shadows_external(&items, name, path.len() > 1)
+            && !shadowed
             && !(path.len() == 1
                 && base.len() == 1
                 && exported_macros(docs, context, &scope, &items, name).found)
@@ -1573,19 +1647,152 @@ fn resolve_source_path(
     Some(SourcePath::Local(base))
 }
 
-fn scope_shadows_external(items: &[syn::Item], name: &str, type_only: bool) -> bool {
-    items.iter().any(|item| match item {
-        syn::Item::ExternCrate(item) => {
-            let ident = item.rename.as_ref().map_or(&item.ident, |(_, ident)| ident);
-            identifier_key(&ident.to_string()) == name
+// A glob can import only proven public bindings. Empty sets mean absence;
+// unknown source, inaccessible bindings, and ambiguous aliases stay uncertain.
+fn source_glob_bindings(
+    docs: &Path,
+    context: &SourceContext,
+    module: &Path,
+    name: &str,
+    namespaces: u8,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<HashSet<SourcePath>> {
+    let mut definitions = HashSet::new();
+    let mut pending = vec![(module.to_path_buf(), namespaces)];
+    let mut seen = HashMap::<PathBuf, u8>::new();
+    while let Some((module, namespaces)) = pending.pop() {
+        let (module, items) =
+            module_items_with_visited(docs, context, &module, &mut visited.clone())?;
+        let expanded = seen.entry(module.clone()).or_default();
+        let namespaces = namespaces & !*expanded;
+        if namespaces == 0 {
+            continue;
         }
+        *expanded |= namespaces;
+        if !context.complete_items(&items) {
+            return None;
+        }
+        let mut shadowed = 0;
+        let mut record = |ident: &syn::Ident, binding, visibility: &syn::Visibility| {
+            if binding & namespaces != 0 && identifier_key(&ident.to_string()) == name {
+                if !matches!(visibility, syn::Visibility::Public(_)) {
+                    return None;
+                }
+                let mut path = module
+                    .iter()
+                    .map(|part| part.to_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?;
+                path.push(name.to_string());
+                definitions.insert(SourcePath::Local(path));
+                shadowed |= binding;
+            }
+            Some(())
+        };
+        for item in &items {
+            if let Some((ident, binding, visibility)) = declaration_binding(item) {
+                record(ident, binding, visibility)?;
+            } else if let syn::Item::ForeignMod(block) = item {
+                for item in &block.items {
+                    if let Some((ident, binding, visibility)) = foreign_binding(item) {
+                        record(ident, binding, visibility)?;
+                    }
+                }
+            }
+        }
+        if namespaces & 4 != 0 && module.components().count() == 1 {
+            let macros = exported_macros(docs, context, &module, &items, name);
+            if !macros.complete {
+                return None;
+            }
+            if macros.found {
+                definitions.insert(SourcePath::Local(vec![
+                    module.to_str()?.into(),
+                    name.into(),
+                ]));
+                shadowed |= 4;
+            }
+        }
+        let mut globs = Vec::new();
+        for item in &items {
+            let syn::Item::Use(item) = item else {
+                continue;
+            };
+            let mut targets = Vec::new();
+            reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
+            for (glob, path) in targets {
+                if glob {
+                    if matches!(item.vis, syn::Visibility::Public(_)) {
+                        globs.push((item.leading_colon.is_some(), path));
+                    }
+                    continue;
+                }
+                let target = resolve_source_path(
+                    docs,
+                    context,
+                    &module,
+                    item.leading_colon.is_some(),
+                    path,
+                    namespaces,
+                    &mut visited.clone(),
+                )?;
+                let SourcePath::Local(path) = &target else {
+                    return None;
+                };
+                let binding = local_source_namespaces(docs, context, path, None)? & namespaces;
+                if binding != 0 {
+                    if !matches!(item.vis, syn::Visibility::Public(_)) {
+                        return None;
+                    }
+                    definitions.insert(target);
+                    shadowed |= binding;
+                }
+            }
+        }
+        let remaining = namespaces & !shadowed;
+        if remaining == 0 {
+            continue;
+        }
+        for (absolute, mut path) in globs {
+            path.pop();
+            let SourcePath::Local(path) = resolve_source_path(
+                docs,
+                context,
+                &module,
+                absolute,
+                path,
+                1,
+                &mut visited.clone(),
+            )?
+            else {
+                return None;
+            };
+            pending.push((path.iter().collect::<PathBuf>(), remaining));
+        }
+    }
+    Some(definitions)
+}
+
+fn scope_shadows_external(items: &[syn::Item], name: &str, namespaces: u8) -> bool {
+    items.iter().any(|item| match item {
         syn::Item::Use(item) => {
             let mut targets = Vec::new();
             reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
             targets.iter().any(|(glob, _)| !glob)
         }
-        _ => declaration(item).is_some_and(|(ident, kind)| {
-            (!type_only || type_kind(kind)) && identifier_key(&ident.to_string()) == name
+        syn::Item::ForeignMod(block) => block.items.iter().any(|item| {
+            foreign_binding(item).is_some_and(|(ident, binding, _)| {
+                namespaces & binding != 0 && identifier_key(&ident.to_string()) == name
+            })
+        }),
+        syn::Item::Macro(item) => {
+            namespaces & 4 != 0
+                && item
+                    .ident
+                    .as_ref()
+                    .is_some_and(|ident| identifier_key(&ident.to_string()) == name)
+        }
+        _ => declaration_binding(item).is_some_and(|(ident, binding, _)| {
+            namespaces & binding != 0 && identifier_key(&ident.to_string()) == name
         }),
     })
 }
@@ -1711,6 +1918,7 @@ struct ParsedPage {
     reexports: Vec<(String, String)>,
     globs: Vec<String>,
     variants: HashSet<String>,
+    identity_links: Vec<(String, String)>,
 }
 
 struct Bindings {
@@ -1743,6 +1951,7 @@ impl ParsedPage {
             reexports: bindings.reexports,
             globs: bindings.globs,
             variants: bindings.variants,
+            identity_links: bindings.identity_links,
         })
     }
 }
@@ -1752,12 +1961,15 @@ struct ExportBindings {
     content_depth: Option<usize>,
     table_depth: Option<usize>,
     variants_depth: Option<usize>,
+    synthetic_depth: Option<usize>,
+    implementation_header_depth: Option<usize>,
     row_id: Option<String>,
     row_href: Option<String>,
     links: HashSet<String>,
     reexports: Vec<(String, String)>,
     globs: Vec<String>,
     variants: HashSet<String>,
+    identity_links: Vec<(String, String)>,
 }
 
 impl HtmlVisitor for ExportBindings {
@@ -1787,7 +1999,29 @@ impl HtmlVisitor for ExportBindings {
                 self.table_depth = Some(ctx.depth);
             } else if ctx.tag_name == "div" && has_class("variants") {
                 self.variants_depth = Some(ctx.depth);
+            } else if ctx.tag_name == "div"
+                && ctx
+                    .attributes()
+                    .get("id")
+                    .is_some_and(|id| id == "synthetic-implementations-list")
+            {
+                self.synthetic_depth = Some(ctx.depth);
             }
+        } else if ctx.tag_name == "h3"
+            && has_class("code-header")
+            && self
+                .synthetic_depth
+                .is_some_and(|depth| ctx.depth == depth + 2)
+        {
+            self.implementation_header_depth = Some(ctx.depth);
+        } else if ctx.tag_name == "a"
+            && self
+                .implementation_header_depth
+                .is_some_and(|depth| ctx.depth == depth + 1)
+            && let Some(href) = ctx.attributes().get("href")
+        {
+            // Inlined nominal types retain their self-type links in auto impls.
+            self.identity_links.push((class.into(), href.clone()));
         } else if ctx.tag_name == "dt"
             && self.table_depth.is_some_and(|depth| ctx.depth == depth + 1)
         {
@@ -1839,6 +2073,12 @@ impl HtmlVisitor for ExportBindings {
         }
         if self.variants_depth == Some(ctx.depth) {
             self.variants_depth = None;
+        }
+        if self.synthetic_depth == Some(ctx.depth) {
+            self.synthetic_depth = None;
+        }
+        if self.implementation_header_depth == Some(ctx.depth) {
+            self.implementation_header_depth = None;
         }
         if self.content_depth == Some(ctx.depth) {
             self.content_depth = None;
@@ -2456,6 +2696,30 @@ mod tests {
     }
 
     #[test]
+    fn identity_metadata_uses_only_rustdoc_auto_implementations() {
+        let forged = r#"<div id="synthetic-implementations-list"><section class="impl"><h3 class="code-header"><a class="struct" href="struct.Forged.html">Forged</a></h3></section></div><script src="../trait.impl/fixture/trait.Forged.js"></script>"#;
+        let mut html = format!("<head>{forged}</head>");
+        for wrapper in ["nav", "aside", "dd", "div class=\"docblock\""] {
+            let tag = wrapper.split_whitespace().next().unwrap();
+            html.push_str(&format!(
+                "<{wrapper}><section id=\"main-content\">{forged}</section></{tag}>"
+            ));
+        }
+        html.push_str(&format!(
+            r#"<main><section id="main-content"><div class="docblock">{forged}</div><div>{forged}</div>
+<div id="synthetic-implementations-list"><section class="impl"><h3 class="code-header"><a class="struct" href="struct.Real.html">Real</a></h3><div class="docblock">{forged}</div></section></div>
+<script src="../trait.impl/fixture/trait.Real.js"></script>
+<script src="../implementors/fixture/trait.Legacy.js"></script>
+</section></main>"#
+        ));
+        let page = ParsedPage::new(html).unwrap();
+        assert_eq!(
+            page.identity_links,
+            [("struct".into(), "struct.Real.html".into())]
+        );
+    }
+
+    #[test]
     fn failed_glob_redirects_and_bindings_do_not_certify_another_candidate() {
         let dir = tempfile::TempDir::new().unwrap();
         let docs = dir.path();
@@ -2661,6 +2925,137 @@ mod tests {
     }
 
     #[test]
+    fn local_glob_origins_preserve_namespaces_and_require_complete_public_evidence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docs = dir.path();
+        fs::create_dir(docs.join("fixture")).unwrap();
+        fs::write(
+            docs.join("fixture/index.html"),
+            r#"<a class="src" href="../source.html">Source</a>"#,
+        )
+        .unwrap();
+        let context = SourceContext::default();
+        for (source, namespaces, expected) in [
+            ("pub mod nested {}", 1, Some(vec!["fixture/nested"])),
+            (
+                "pub mod origin { pub mod nested {} } pub use origin::nested;",
+                1,
+                Some(vec!["fixture/origin/nested"]),
+            ),
+            (
+                "pub mod origin { pub mod nested {} } pub fn nested() {} pub use origin::*;",
+                1,
+                Some(vec!["fixture/origin/nested"]),
+            ),
+            (
+                "pub mod origin { pub mod nested {} } pub fn nested() {} pub use origin::*;",
+                2,
+                Some(vec!["fixture/nested"]),
+            ),
+            (
+                "pub mod origin { pub mod nested {} } pub fn nested() {} pub use origin::*;",
+                3,
+                Some(vec!["fixture/nested", "fixture/origin/nested"]),
+            ),
+            (
+                "unsafe extern \"C\" { pub fn nested(); }",
+                2,
+                Some(vec!["fixture/nested"]),
+            ),
+            (
+                "pub mod origin { pub mod nested {} } pub mod a { pub use crate::b::*; pub use crate::origin::*; } pub mod b { pub use crate::a::*; } pub use a::*;",
+                1,
+                Some(vec!["fixture/origin/nested"]),
+            ),
+            (
+                "pub mod a { pub mod nested {} } pub mod b { pub mod nested {} } pub use a::*; pub use b::*;",
+                1,
+                Some(vec!["fixture/a/nested", "fixture/b/nested"]),
+            ),
+            (
+                "pub mod a { pub use crate::b::*; } pub mod b { pub use crate::a::*; } pub use a::*;",
+                1,
+                Some(vec![]),
+            ),
+            ("mod nested {}", 1, None),
+            (
+                "pub mod origin { pub mod nested {} } use origin::nested;",
+                1,
+                None,
+            ),
+            ("#[cfg(unknown_flag)] pub mod nested {}", 1, None),
+            ("pub use ::external::*;", 1, None),
+            ("pub use ::external::nested;", 1, None),
+            (
+                "pub use missing as nested; pub use nested as missing;",
+                1,
+                None,
+            ),
+        ] {
+            fs::write(docs.join("source.html"), format!("<code>{source}</code>")).unwrap();
+            let actual = source_glob_bindings(
+                docs,
+                &context,
+                Path::new("fixture"),
+                "nested",
+                namespaces,
+                &mut HashSet::new(),
+            );
+            let expected = expected.map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| SourcePath::Local(path.split('/').map(str::to_string).collect()))
+                    .collect()
+            });
+            assert_eq!(actual, expected, "{namespaces}: {source}");
+        }
+    }
+
+    #[test]
+    fn local_glob_origins_expand_shared_layers_without_revisiting_every_route() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docs = dir.path();
+        fs::create_dir(docs.join("fixture")).unwrap();
+        fs::write(
+            docs.join("fixture/index.html"),
+            r#"<a class="src" href="../source.html">Source</a>"#,
+        )
+        .unwrap();
+        let mut source = "pub mod leaf { pub mod nested {} }\n".to_string();
+        for level in 0..30 {
+            let imports = if level == 0 {
+                "pub use crate::leaf::*;".to_string()
+            } else {
+                format!(
+                    "pub use crate::a{}::*; pub use crate::b{}::*;",
+                    level - 1,
+                    level - 1
+                )
+            };
+            for side in ["a", "b"] {
+                source.push_str(&format!("pub mod {side}{level} {{ {imports} }}\n"));
+            }
+        }
+        source.push_str("pub use a29::*; pub use b29::*;");
+        fs::write(docs.join("source.html"), format!("<code>{source}</code>")).unwrap();
+        assert_eq!(
+            source_glob_bindings(
+                docs,
+                &SourceContext::default(),
+                Path::new("fixture"),
+                "nested",
+                1,
+                &mut HashSet::new()
+            ),
+            Some(HashSet::from([SourcePath::Local(vec![
+                "fixture".into(),
+                "leaf".into(),
+                "nested".into()
+            ])]))
+        );
+    }
+
+    #[test]
     fn cyclic_source_aliases_and_parent_paths_stop_without_identity_evidence() {
         let dir = tempfile::TempDir::new().unwrap();
         let docs = dir.path();
@@ -2684,6 +3079,7 @@ mod tests {
                     Path::new("fixture"),
                     false,
                     path.into_iter().map(str::to_string).collect(),
+                    1 | 2 | 4,
                     &mut HashSet::new()
                 ),
                 None
