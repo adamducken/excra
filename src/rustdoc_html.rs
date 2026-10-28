@@ -5,7 +5,9 @@ use crate::resolver::{ResolvedDependency, library_target, package_spec};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, NodeDep, Package, PackageId};
 use cargo_platform::{Cfg, CfgExpr};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
-use html_to_markdown_rs::{CodeBlockStyle, ConversionOptions, HeadingStyle, convert};
+use html_to_markdown_rs::{
+    CodeBlockStyle, ConversionOptions, HeadingStyle, WhitespaceMode, convert,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -55,7 +57,7 @@ pub(crate) fn generate(
         .map_err(|error| format!("cannot read workspace Cargo.lock: {error}"))?;
     let mut identity = std::collections::hash_map::DefaultHasher::new();
     // Invalidate compiled artifacts and Markdown from older generation logic.
-    (env!("CARGO_PKG_VERSION"), "docs-v3").hash(&mut identity);
+    (env!("CARGO_PKG_VERSION"), "docs-v4").hash(&mut identity);
     package_spec(package).hash(&mut identity);
     package.manifest_path.hash(&mut identity);
     contents.hash(&mut identity);
@@ -204,7 +206,7 @@ pub(crate) fn generate(
             "--locked",
             "--no-deps",
             "--lib",
-            "--message-format=json-render-diagnostics",
+            "--message-format=json",
             "--manifest-path",
         ])
         .arg(&generated_manifest);
@@ -215,20 +217,22 @@ pub(crate) fn generate(
         command.args(["--target", target]);
     }
     compiler.apply(&mut command);
+    crate::compiler::validate_documentation_html(&mut command, manifest, &configuration)?;
     let output = command
         .stderr(Stdio::inherit())
         .output()
         .map_err(|error| format!("cannot run cargo doc: {error}"))?;
+    let docs = documentation_dir(
+        &String::from_utf8_lossy(&output.stdout),
+        &documented.id.repr,
+    );
     if !output.status.success() {
         return Err(format!(
             "cargo doc failed for {} {}",
             package.name, package.version
         ));
     }
-    let docs = documentation_dir(
-        &String::from_utf8_lossy(&output.stdout),
-        &documented.id.repr,
-    )?;
+    let docs = docs?;
     convert_crate(&docs, &docs.join(dependency.target.name.replace('-', "_")))?;
     Ok(Documentation {
         directory: docs,
@@ -434,9 +438,17 @@ fn convert_crate(docs: &Path, directory: &Path) -> Result<(), String> {
 
 fn documentation_dir(output: &str, package: &str) -> Result<PathBuf, String> {
     let mut directories = Vec::new();
+    let mut invalid_html = false;
     for line in output.lines() {
         let artifact: serde_json::Value = serde_json::from_str(line)
             .map_err(|error| format!("cannot read Cargo documentation artifact: {error}"))?;
+        if artifact["reason"] == "compiler-message" {
+            if let Some(rendered) = artifact["message"]["rendered"].as_str() {
+                eprint!("{rendered}");
+            }
+            invalid_html |= artifact["package_id"] == package
+                && artifact["message"]["code"]["code"] == "rustdoc::invalid_html_tags";
+        }
         if artifact["reason"] != "compiler-artifact" || artifact["package_id"] != package {
             continue;
         }
@@ -456,6 +468,9 @@ fn documentation_dir(output: &str, package: &str) -> Result<PathBuf, String> {
                 }
             }
         }
+    }
+    if invalid_html {
+        return Err("invalid documentation HTML; cannot trust rustdoc API bindings".into());
     }
     directories.sort();
     directories.dedup();
@@ -536,27 +551,27 @@ fn source_file(page: &Path) -> Option<syn::File> {
         .split_once("</code>")?
         .0;
     let snippet = code
-        .lines()
+        .split_inclusive('\n')
         .map(|line| line.split_once("</a>").map_or(line, |(_, code)| code))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<String>();
     syn::parse_file(&rendered_code(&snippet)?).ok()
 }
 
 fn rendered_code(html: &str) -> Option<String> {
-    let markdown = convert(
+    let visitor = Arc::new(Mutex::new(CodeLinks {
+        raw_code: Some(String::new()),
+        ..Default::default()
+    }));
+    convert(
         &format!("<pre><code>{html}</code></pre>"),
         ConversionOptions {
-            code_block_style: CodeBlockStyle::Backticks,
-            visitor: Some(Arc::new(Mutex::new(CodeLinks::default()))),
+            whitespace_mode: WhitespaceMode::Strict,
+            visitor: Some(visitor.clone()),
             ..Default::default()
         },
     )
-    .ok()?
-    .content?;
-    let code = markdown.trim().strip_prefix("```")?.split_once('\n')?.1;
-    let code = code.strip_suffix("```")?;
-    Some(code.to_string())
+    .ok()?;
+    visitor.lock().ok()?.raw_code.take()
 }
 
 #[derive(Default)]
@@ -583,6 +598,7 @@ struct SourceQuery {
     absolute: bool,
     path: Vec<String>,
     namespaces: u8,
+    from: Option<PathBuf>,
 }
 
 impl SourceContext {
@@ -1159,6 +1175,91 @@ fn declaration_binding(item: &syn::Item) -> Option<(syn::Ident, u8, &syn::Visibi
     Some((ident.clone(), namespaces, visibility))
 }
 
+fn visibility_accessible(visibility: &syn::Visibility, module: &Path, from: Option<&Path>) -> bool {
+    if matches!(visibility, syn::Visibility::Public(_)) {
+        return true;
+    }
+    let Some(from) = from else {
+        return false;
+    };
+    let mut scope = module.to_path_buf();
+    if let syn::Visibility::Restricted(visibility) = visibility {
+        for (index, segment) in visibility.path.segments.iter().enumerate() {
+            let name = segment.ident.to_string();
+            match name.as_str() {
+                "crate" => scope = module.iter().take(1).collect(),
+                "self" => {}
+                "super" => {
+                    scope.pop();
+                }
+                _ => {
+                    // Rust 2015 also permits crate-relative visibility paths
+                    // without an explicit `crate::` prefix.
+                    if index == 0 {
+                        scope = module.iter().take(1).collect();
+                    }
+                    scope.push(identifier_key(&name).as_ref());
+                }
+            }
+        }
+    }
+    from.starts_with(scope)
+}
+
+fn struct_namespaces(
+    item: &syn::ItemStruct,
+    context: &SourceContext,
+    module: &Path,
+    from: Option<&Path>,
+) -> u8 {
+    let constructor = !matches!(item.fields, syn::Fields::Named(_))
+        && (from.is_some()
+            || !item
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("non_exhaustive")))
+        && item.fields.iter().all(|field| {
+            context.enabled(&field.attrs) == Some(false)
+                || visibility_accessible(&field.vis, module, from)
+        });
+    if constructor { 1 | 2 } else { 1 }
+}
+
+fn source_struct_namespaces(
+    docs: &Path,
+    context: &SourceContext,
+    module: &Path,
+    name: &str,
+) -> Option<u8> {
+    let (from, _) = module_items(docs, context, module)?;
+    let SourcePath::Local(path) = resolve_source_path(
+        docs,
+        context,
+        &from,
+        false,
+        vec![name.to_string()],
+        1,
+        &mut HashSet::new(),
+    )?
+    else {
+        return None;
+    };
+    let (name, parents) = path.split_last()?;
+    let (module, items) = module_items(docs, context, &parents.iter().collect::<PathBuf>())?;
+    let mut declarations = items.iter().filter_map(|item| match item {
+        syn::Item::Struct(item) if identifier_key(&item.ident.to_string()) == *name => Some(item),
+        _ => None,
+    });
+    let item = declarations.next()?;
+    if declarations.next().is_some()
+        || !plain_attributes(&item.attrs)
+        || context.enabled(&item.attrs) != Some(true)
+    {
+        return None;
+    }
+    Some(struct_namespaces(item, context, &module, Some(&from)))
+}
+
 struct ExportedMacros<'a> {
     docs: &'a Path,
     context: &'a SourceContext,
@@ -1259,6 +1360,7 @@ fn source_import_namespaces(
     module: &Path,
     absolute: bool,
     mut path: Vec<String>,
+    exported: bool,
 ) -> Option<u8> {
     let mut variant = None;
     let target = resolve_source_path(
@@ -1286,8 +1388,15 @@ fn source_import_namespaces(
     let SourcePath::Local(path) = target else {
         return None;
     };
-    local_source_namespaces(docs, context, &path, variant.as_deref())
-        .filter(|namespaces| *namespaces != 0)
+    let (from, _) = module_items(docs, context, module)?;
+    local_source_namespaces(
+        docs,
+        context,
+        &path,
+        variant.as_deref(),
+        (!exported).then_some(from.as_path()),
+    )
+    .filter(|namespaces| *namespaces != 0)
 }
 
 fn local_source_namespaces(
@@ -1295,9 +1404,10 @@ fn local_source_namespaces(
     context: &SourceContext,
     path: &[String],
     variant: Option<&str>,
+    from: Option<&Path>,
 ) -> Option<u8> {
     let (name, parents) = path.split_last()?;
-    let (_, items) = module_items(docs, context, &parents.iter().collect::<PathBuf>())?;
+    let (module, items) = module_items(docs, context, &parents.iter().collect::<PathBuf>())?;
     if !context.complete_items(&items) {
         return None;
     }
@@ -1325,7 +1435,11 @@ fn local_source_namespaces(
         } else if let Some((ident, binding_namespaces, _)) = declaration_binding(item)
             && identifier_key(&ident.to_string()) == *name
         {
-            namespaces |= binding_namespaces;
+            namespaces |= if let syn::Item::Struct(item) = item {
+                struct_namespaces(item, context, &module, from)
+            } else {
+                binding_namespaces
+            };
         } else if let syn::Item::ForeignMod(block) = item {
             for item in &block.items {
                 if let Some((ident, binding_namespaces, _)) = foreign_binding(item)
@@ -1366,6 +1480,7 @@ fn source_bindings(
 ) -> (u8, u8, u8) {
     let mut shadowed = 0;
     let mut public = 0;
+    let mut uncertain_imports = 0;
     for item in items {
         if !item_attributes(item).is_some_and(plain_attributes) {
             continue;
@@ -1390,17 +1505,29 @@ fn source_bindings(
             let mut targets = Vec::new();
             reexport_targets(&item.tree, &mut Vec::new(), name, &mut targets);
             for (_, path) in targets.into_iter().filter(|(glob, _)| !glob) {
-                let namespaces = source_import_namespaces(
+                let known_namespaces = source_import_namespaces(
                     docs,
                     context,
                     module,
                     item.leading_colon.is_some(),
-                    path,
-                )
-                .unwrap_or(1 | 2 | 4);
+                    path.clone(),
+                    false,
+                );
+                let namespaces = known_namespaces.unwrap_or(1 | 2 | 4);
                 shadowed |= namespaces;
                 if matches!(item.vis, syn::Visibility::Public(_)) {
-                    public |= namespaces;
+                    public |= source_import_namespaces(
+                        docs,
+                        context,
+                        module,
+                        item.leading_colon.is_some(),
+                        path,
+                        true,
+                    )
+                    .unwrap_or(0);
+                }
+                if known_namespaces.is_none() {
+                    uncertain_imports |= namespaces;
                 }
             }
             continue;
@@ -1411,7 +1538,11 @@ fn source_bindings(
         if identifier_key(&ident.to_string()) == name {
             shadowed |= namespaces;
             if matches!(visibility, syn::Visibility::Public(_)) {
-                public |= namespaces;
+                public |= if let syn::Item::Struct(item) = item {
+                    struct_namespaces(item, context, module, None)
+                } else {
+                    namespaces
+                };
             }
         }
     }
@@ -1430,7 +1561,7 @@ fn source_bindings(
             complete &= !4;
         }
     }
-    (shadowed, public, complete)
+    (shadowed, public, complete & !uncertain_imports)
 }
 
 fn declared_reexport(
@@ -1587,6 +1718,7 @@ fn resolve_source_path(
         absolute,
         path: path.clone(),
         namespaces,
+        from: None,
     };
     if let Some(result) = context.cache.borrow().paths.get(&key) {
         return result.clone();
@@ -1732,7 +1864,7 @@ fn resolve_source_path_uncached(
                     &mut visited.clone(),
                 )?;
                 if let SourcePath::Local(path) = &definition
-                    && local_source_namespaces(docs, context, path, None)
+                    && local_source_namespaces(docs, context, path, None, Some(&scope))
                         .is_some_and(|binding| binding & requested == 0)
                 {
                     continue;
@@ -1773,6 +1905,7 @@ fn resolve_source_path_uncached(
                     docs,
                     context,
                     &module.iter().collect::<PathBuf>(),
+                    &scope,
                     name,
                     requested,
                     &mut visited.clone(),
@@ -1821,6 +1954,7 @@ fn source_glob_bindings(
     docs: &Path,
     context: &SourceContext,
     module: &Path,
+    from: &Path,
     name: &str,
     namespaces: u8,
     visited: &mut HashSet<(PathBuf, String, u8)>,
@@ -1831,6 +1965,7 @@ fn source_glob_bindings(
         absolute: false,
         path: vec![name.to_string()],
         namespaces,
+        from: Some(from.to_path_buf()),
     };
     if let Some(result) = context.cache.borrow().globs.get(&key) {
         return result.clone();
@@ -1840,7 +1975,8 @@ fn source_glob_bindings(
     {
         context.cache.borrow_mut().expansions += 1;
     }
-    let result = source_glob_bindings_uncached(docs, context, module, name, namespaces, visited);
+    let result =
+        source_glob_bindings_uncached(docs, context, module, from, name, namespaces, visited);
     let mut cache = context.cache.borrow_mut();
     if cache.cycles == cycles {
         cache.globs.insert(key, result.clone());
@@ -1852,6 +1988,7 @@ fn source_glob_bindings_uncached(
     docs: &Path,
     context: &SourceContext,
     module: &Path,
+    from: &Path,
     name: &str,
     namespaces: u8,
     visited: &mut HashSet<(PathBuf, String, u8)>,
@@ -1872,8 +2009,14 @@ fn source_glob_bindings_uncached(
             return None;
         }
         let mut shadowed = 0;
-        let mut record = |ident: &syn::Ident, binding, visibility: &syn::Visibility| {
+        let mut record = |ident: &syn::Ident, binding, imported, visibility: &syn::Visibility| {
             if binding & namespaces != 0 && identifier_key(&ident.to_string()) == name {
+                // An inaccessible constructor still shadows globs in its own
+                // defining module, but is not imported by another module.
+                shadowed |= binding;
+                if imported & namespaces == 0 {
+                    return Some(());
+                }
                 if !matches!(visibility, syn::Visibility::Public(_)) {
                     return None;
                 }
@@ -1883,17 +2026,21 @@ fn source_glob_bindings_uncached(
                     .collect::<Option<Vec<_>>>()?;
                 path.push(name.to_string());
                 definitions.insert(SourcePath::Local(path));
-                shadowed |= binding;
             }
             Some(())
         };
         for item in &items {
             if let Some((ident, binding, visibility)) = declaration_binding(item) {
-                record(&ident, binding, visibility)?;
+                let imported = if let syn::Item::Struct(item) = item {
+                    struct_namespaces(item, context, &module, Some(from))
+                } else {
+                    binding
+                };
+                record(&ident, binding, imported, visibility)?;
             } else if let syn::Item::ForeignMod(block) = item {
                 for item in &block.items {
                     if let Some((ident, binding, visibility)) = foreign_binding(item) {
-                        record(ident, binding, visibility)?;
+                        record(ident, binding, binding, visibility)?;
                     }
                 }
             }
@@ -1937,12 +2084,16 @@ fn source_glob_bindings_uncached(
                 let SourcePath::Local(path) = &target else {
                     return None;
                 };
-                let binding = local_source_namespaces(docs, context, path, None)? & namespaces;
+                let binding =
+                    local_source_namespaces(docs, context, path, None, Some(&module))? & namespaces;
                 if binding != 0 {
                     if !matches!(item.vis, syn::Visibility::Public(_)) {
                         return None;
                     }
-                    definitions.insert(target);
+                    let imported = local_source_namespaces(docs, context, path, None, Some(from))?;
+                    if imported & namespaces != 0 {
+                        definitions.insert(target);
+                    }
                     shadowed |= binding;
                 }
             }
@@ -2430,6 +2581,7 @@ impl<'a> HtmlLookup<'a> {
         let mut candidates = HashSet::new();
         let mut matched_namespaces = 0;
         let mut uncertain_match = false;
+        let mut incomplete_namespaces = 0;
         let mut unavailable = None;
         let mut unavailable_namespaces = 0;
         while let Some((item, namespaces, uncertain)) = pending.pop() {
@@ -2460,7 +2612,7 @@ impl<'a> HtmlLookup<'a> {
                 mut shadowed,
                 unavailable: omitted_public,
                 source_complete,
-            } = match self.bindings(&item, name, type_only) {
+            } = match self.bindings(&item, name, type_only, item != *root) {
                 Ok(bindings) => bindings,
                 Err(error) if item == *root => return Err(error),
                 Err(error) => {
@@ -2472,6 +2624,11 @@ impl<'a> HtmlLookup<'a> {
             let visible = explicit
                 .iter()
                 .fold(0, |all, (_, namespaces)| all | namespaces);
+            if item != *root {
+                // Explicit HTML bindings remain available; absent entries on
+                // a terminal glob page need source evidence too.
+                incomplete_namespaces |= namespaces & !source_complete & !visible;
+            }
             let missing = if item == *root {
                 shadowed
             } else {
@@ -2514,7 +2671,7 @@ impl<'a> HtmlLookup<'a> {
             .filter(|_| candidates.is_empty() || unavailable_namespaces & matched_namespaces != 0);
         Ok((
             candidates.into_iter().collect(),
-            uncertain_match,
+            uncertain_match || incomplete_namespaces & matched_namespaces != 0,
             unavailable,
         ))
     }
@@ -2524,6 +2681,7 @@ impl<'a> HtmlLookup<'a> {
         item: &HtmlItem,
         name: &str,
         type_only: bool,
+        through_glob: bool,
     ) -> Result<Bindings, String> {
         let docs = self.docs;
         let page = self.page(&item.page)?;
@@ -2584,28 +2742,39 @@ impl<'a> HtmlLookup<'a> {
             }
         }
         let globs = page.globs.clone();
-        let (shadowed, unavailable, source_complete) = if globs.is_empty() {
-            (0, 0, 1 | 2 | 4)
-        } else {
-            module_items(
-                docs,
-                &self.source_context,
-                directory.strip_prefix(docs).expect("page is inside docs"),
-            )
-            .map(|(module, items)| {
-                source_bindings(docs, &self.source_context, &module, &items, name)
-            })
-            .unwrap_or_default()
-        };
+        let (shadowed, unavailable, source_complete) =
+            if page_kind(&item.page) == Some("enum") || (globs.is_empty() && !through_glob) {
+                (0, 0, 1 | 2 | 4)
+            } else {
+                module_items(
+                    docs,
+                    &self.source_context,
+                    directory.strip_prefix(docs).expect("page is inside docs"),
+                )
+                .map(|(module, items)| {
+                    source_bindings(docs, &self.source_context, &module, &items, name)
+                })
+                .unwrap_or_default()
+            };
         let mut bindings = Vec::new();
         for candidate in candidates {
             let candidate = self.follow_redirect(&candidate)?;
             if !type_only || candidate.kind().is_some_and(type_kind) {
-                let namespaces = if matches!(candidate.kind(), Some("struct" | "variant")) {
+                let mut namespaces = if matches!(candidate.kind(), Some("struct" | "variant")) {
                     item_namespaces(&candidate, &self.page(&candidate.page)?.html)?
                 } else {
                     item_namespaces(&candidate, "")?
                 };
+                if candidate.kind() == Some("struct")
+                    && let Some(source) = source_struct_namespaces(
+                        docs,
+                        &self.source_context,
+                        directory.strip_prefix(docs).expect("page is inside docs"),
+                        name,
+                    )
+                {
+                    namespaces = source;
+                }
                 bindings.push((candidate, namespaces));
             }
         }
@@ -2655,6 +2824,8 @@ fn item_namespaces(item: &HtmlItem, html: &str) -> Result<u8, String> {
                 })
             } else {
                 declaration.trim_end().ends_with(";</code>")
+                    && !declaration.contains("/* private fields */")
+                    && !declaration.contains("non_exhaustive")
             };
             // Unit and tuple constructors also occupy the value namespace.
             if constructor { 1 | 2 } else { 1 }
@@ -2813,9 +2984,27 @@ pub(crate) fn write_markdown(docs: &Path, page: &Path) -> Result<PathBuf, String
 struct CodeLinks {
     depth: usize,
     link_text: Option<String>,
+    raw_code: Option<String>,
 }
 
 impl HtmlVisitor for CodeLinks {
+    fn visit_code_block(
+        &mut self,
+        _: &NodeContext<'_>,
+        _: Option<&str>,
+        code: &str,
+    ) -> VisitResult {
+        if let Some(raw_code) = &mut self.raw_code {
+            // Source recovery needs decoded code before Markdown adds fences
+            // or normalizes final line breaks.
+            raw_code.clear();
+            raw_code.push_str(code);
+            VisitResult::Skip
+        } else {
+            VisitResult::Continue
+        }
+    }
+
     fn visit_heading(
         &mut self,
         ctx: &NodeContext<'_>,
@@ -2948,6 +3137,37 @@ mod tests {
                 "{contents}"
             );
         }
+    }
+
+    #[test]
+    fn recovered_source_preserves_backticks_entities_and_line_breaks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for source in [
+            "//! ```rust\n//! let x = 1;\n//! ```\npub struct Item;\n",
+            "const TEXT: &str = \"``` &lt; < > & ```````\";\n\n",
+            "\n\n    pub struct Indented;\n\n\n",
+            "pub struct NoFinalNewline;",
+            "",
+        ] {
+            let html = source
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            assert_eq!(
+                rendered_code(&format!("<span class=\"kw\">{html}</span>")),
+                Some(source.to_string()),
+                "{source:?}",
+            );
+            write_source(dir.path(), source);
+            assert!(
+                source_file(&dir.path().join("src/source.rs.html")).is_some(),
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            rendered_code("pub fn <a href=\"fn.item.html\">item</a>() {}\n"),
+            Some("pub fn item() {}\n".into()),
+        );
     }
 
     #[test]
@@ -3332,6 +3552,7 @@ mod tests {
                 docs,
                 &context,
                 Path::new("fixture"),
+                Path::new("fixture"),
                 "nested",
                 namespaces,
                 &mut HashSet::new(),
@@ -3343,6 +3564,57 @@ mod tests {
                     .collect()
             });
             assert_eq!(actual, expected, "{namespaces}: {source}");
+        }
+    }
+
+    #[test]
+    fn glob_constructor_visibility_and_cache_follow_the_importing_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "pub mod values { pub fn Item() {} }\n\
+             pub mod types {\n\
+                 pub struct Item(u8);\n\
+                 pub use crate::values::*;\n\
+                 pub mod child { pub use super::Item; pub use crate::values::*; }\n\
+             }\n\
+             pub mod legacy { pub struct Item(pub(in legacy) u8); pub mod child {} }",
+        )
+        .unwrap();
+        let context = SourceContext {
+            external_source: Some(source),
+            edition_2015: true,
+            ..Default::default()
+        };
+        for (module, owner) in [
+            ("fixture/types", "types"),
+            ("fixture/types/child", "types"),
+            ("fixture/legacy", "legacy"),
+        ] {
+            let constructor =
+                SourcePath::Local(vec!["fixture".into(), owner.into(), "Item".into()]);
+            let child = format!("fixture/{owner}/child");
+            for from in ["fixture", &child, "fixture"] {
+                let expected = if from == "fixture" {
+                    HashSet::new()
+                } else {
+                    HashSet::from([constructor.clone()])
+                };
+                assert_eq!(
+                    source_glob_bindings(
+                        dir.path(),
+                        &context,
+                        Path::new(module),
+                        Path::new(from),
+                        "Item",
+                        2,
+                        &mut HashSet::new(),
+                    ),
+                    Some(expected),
+                    "{module} imported from {from}",
+                );
+            }
         }
     }
 
@@ -3380,6 +3652,7 @@ mod tests {
             source_glob_bindings(
                 docs,
                 &SourceContext::default(),
+                Path::new("fixture"),
                 Path::new("fixture"),
                 "nested",
                 1,
@@ -3502,6 +3775,7 @@ mod tests {
                     docs,
                     &context,
                     Path::new("fixture"),
+                    Path::new("fixture"),
                     "Alias",
                     namespaces,
                     &mut HashSet::new(),
@@ -3578,57 +3852,17 @@ mod tests {
     fn readers_keep_the_generation_lock_during_source_regeneration() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        fs::create_dir(root.join("api")).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n[dependencies]\napi = { path = \"api\" }\n[workspace]\nresolver = \"3\"\n",
-        )
-        .unwrap();
-        fs::write(root.join("lib.rs"), "").unwrap();
-        fs::write(
-            root.join("api/Cargo.toml"),
-            "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
-        )
-        .unwrap();
-        let source = root.join("api/lib.rs");
-        fs::write(&source, "pub fn item(_: u8) {}").unwrap();
-        let manifest = root.join("Cargo.toml");
-        let metadata = MetadataCommand::new()
-            .manifest_path(&manifest)
-            .other_options(vec!["--offline".into()])
-            .exec()
-            .unwrap();
-        let graph = cargo_graph::features(
-            &manifest,
-            &metadata,
-            metadata.root_package().unwrap(),
-            &FeatureSelection::default(),
-            None,
-            false,
-        )
-        .unwrap();
-        let package = metadata
-            .packages
-            .iter()
-            .find(|package| package.name == "api")
-            .unwrap();
-        let dependency = ResolvedDependency {
-            package,
-            target: crate::resolver::library_target(package).unwrap(),
-            contexts: Vec::new(),
+        let lock = root.join(".lock");
+        let generation_lock = fs::File::create(&lock).unwrap();
+        generation_lock.lock().unwrap();
+        let docs = Documentation {
+            directory: root.to_path_buf(),
+            external_crates: Vec::new(),
+            source_context: SourceContext::default(),
+            _generation_lock: generation_lock,
         };
-        let docs = generate(&manifest, &metadata, None, &dependency, &graph, false).unwrap();
-        let import = crate::imports::parse_use_lines("use api::item;")
-            .unwrap()
-            .remove(0);
-        let page = find_page(&docs, "api", &import).unwrap();
-        let lock = docs
-            .directory
-            .ancestors()
-            .find(|path| path.join("Cargo.toml").is_file())
-            .unwrap()
-            .join(".lock");
-        fs::write(&source, "pub fn item(_: u16) {}").unwrap();
+        let markdown = docs.directory.join("fn.item.md");
+        fs::write(&markdown, "pub fn item(_: u8) {}").unwrap();
         let (ready, waiting) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| {
@@ -3639,15 +3873,14 @@ mod tests {
                     .unwrap();
                 assert!(contender.try_lock().is_err(), "reader released its lock");
                 ready.send(()).unwrap();
-                let next =
-                    generate(&manifest, &metadata, None, &dependency, &graph, false).unwrap();
-                assert_eq!(next.directory, page.parent().unwrap().parent().unwrap());
-                fs::read_to_string(page.with_extension("md")).unwrap()
+                contender.lock().unwrap();
+                fs::write(&markdown, "pub fn item(_: u16) {}").unwrap();
+                fs::read_to_string(&markdown).unwrap()
             });
             waiting
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .unwrap();
-            let content = fs::read_to_string(page.with_extension("md")).unwrap();
+            let content = fs::read_to_string(&markdown).unwrap();
             assert!(content.contains("pub fn item(_: u8)"), "{content}");
             drop(docs);
             let content = writer.join().unwrap();

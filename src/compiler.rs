@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 const MEMBERS: &str = "EXCRA_COMPILER_WORKSPACE_MEMBERS";
 const GENERAL: &str = "EXCRA_COMPILER_GENERAL_WRAPPER";
 const WORKSPACE: &str = "EXCRA_COMPILER_WORKSPACE_WRAPPER";
+const HTML_RUSTDOC: &str = "EXCRA_HTML_RUSTDOC";
 
 #[derive(Default, Hash)]
 pub(crate) struct Context {
@@ -142,11 +143,54 @@ fn wrapper(
     })
 }
 
+pub(crate) fn validate_documentation_html(
+    command: &mut Command,
+    manifest: &Path,
+    configuration: &[(PathBuf, String)],
+) -> Result<(), String> {
+    command
+        .env(
+            "RUSTDOC",
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .env(
+            HTML_RUSTDOC,
+            wrapper(
+                manifest,
+                configuration,
+                "rustdoc",
+                "RUSTDOC",
+                "CARGO_BUILD_RUSTDOC",
+            )
+            .unwrap_or_else(|| "rustdoc".into()),
+        );
+    Ok(())
+}
+
 pub(crate) fn is_wrapper() -> bool {
-    std::env::var_os(MEMBERS).is_some()
+    std::env::var_os(MEMBERS).is_some() || std::env::var_os(HTML_RUSTDOC).is_some()
 }
 
 pub(crate) fn run_wrapper() -> Result<ExitCode, String> {
+    // Cargo's rustc wrapper protocol starts with the compiler executable;
+    // its direct rustdoc invocation starts with options. Both inherit our env.
+    if let Some(rustdoc) = std::env::var_os(HTML_RUSTDOC)
+        && std::env::args_os()
+            .nth(1)
+            .is_none_or(|argument| argument.as_encoded_bytes().starts_with(b"-"))
+    {
+        // Comment HTML must not escape rustdoc's wrappers and forge metadata.
+        // Force diagnostics despite crate lint levels or --cap-lints, without
+        // replacing any configured rustdoc flags or package selection.
+        let status = Command::new(&rustdoc)
+            .args(std::env::args_os().skip(1))
+            .arg("--force-warn=rustdoc::invalid_html_tags")
+            .env_remove(HTML_RUSTDOC)
+            .env("RUSTDOC", &rustdoc)
+            .status()
+            .map_err(|error| format!("cannot run rustdoc: {error}"))?;
+        return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+    }
     let members: Vec<PathBuf> =
         serde_json::from_str(&std::env::var(MEMBERS).map_err(|error| error.to_string())?)
             .map_err(|error| format!("invalid compiler wrapper routing: {error}"))?;
@@ -191,6 +235,7 @@ pub(crate) fn run_wrapper() -> Result<ExitCode, String> {
     command
         .args(&invocation[1..])
         .args(arguments)
+        .env_remove(HTML_RUSTDOC)
         .env_remove(MEMBERS)
         .env_remove(GENERAL)
         .env_remove(WORKSPACE)

@@ -113,7 +113,8 @@ requested crate are unavailable. Cargo failures are reported as errors.
 
 Output follows ordinary rustdoc semantics, including `cfg(doc)`. Excra does
 not reconstruct or validate a separate compiler-expanded API. The requested
-crate must successfully document with `cargo doc`.
+crate must successfully document with `cargo doc`. Invalid documentation
+HTML is rejected before API lookup, even if the crate suppresses that lint.
 
 Following a non-inlined glob re-export requires source evidence that its
 bindings are not shadowed. Unknown attributes, macro expansions, conditional

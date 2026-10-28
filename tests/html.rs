@@ -338,6 +338,98 @@ pub enum E {
 }
 
 #[test]
+fn escaped_documentation_wrappers_are_rejected_even_when_lints_are_suppressed() {
+    let dir = project();
+    let root = dir.path();
+    for (declaration, payload, name) in [
+        (
+            "",
+            r#"</div></details><dl class="item-table reexports"><dt id="reexport.Item"><code>pub use <a class="struct" href="original/struct.Secret.html">Secret</a> as Item;</code></dt></dl><details><div class="docblock">"#,
+            "Item",
+        ),
+        (
+            "",
+            r#"</div></details><dl class="item-table reexports"><dt><code>pub use <a href="original/index.html">original</a>::*;</code></dt></dl><details><div class="docblock">"#,
+            "Secret",
+        ),
+        (
+            "pub enum E { Present }",
+            r#"</div></details><div class="variants"><section id="variant.Invented" class="variant"></section></div><details><div class="docblock">"#,
+            "E::Invented",
+        ),
+    ] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            if declaration.is_empty() {
+                format!(
+                    "#![allow(rustdoc::invalid_html_tags)]\n//! {payload}\n\
+                     pub mod original {{ pub struct Secret {{ pub forged: u8 }} }}"
+                )
+            } else {
+                format!("#![allow(rustdoc::invalid_html_tags)]\n/// {payload}\n{declaration}")
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let output = query_command(root, &format!("use alias::{name};"), &[])
+                .env("CARGO_ENCODED_RUSTDOCFLAGS", "--cap-lints\x1fallow")
+                .output()
+                .unwrap();
+            let error = failure(output);
+            assert!(
+                error.contains("invalid documentation HTML"),
+                "{name}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn html_validation_preserves_configured_rustdoc_executables() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = project();
+    let root = dir.path();
+    let rustdoc = root.join("rustdoc-wrapper");
+    fs::write(&rustdoc, "#!/bin/sh\nexec rustdoc --cfg wrapped \"$@\"\n").unwrap();
+    fs::set_permissions(&rustdoc, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir(root.join(".cargo")).unwrap();
+    for setting in ["RUSTDOC", "CARGO_BUILD_RUSTDOC", "config"] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            "#![allow(unexpected_cfgs)]\n#[cfg(wrapped)] pub struct Wrapped;",
+        )
+        .unwrap();
+        let mut command = query_command(root, "use alias::Wrapped;", &[]);
+        command
+            .env_remove("RUSTDOC")
+            .env_remove("CARGO_BUILD_RUSTDOC");
+        if setting == "config" {
+            fs::write(
+                root.join(".cargo/config.toml"),
+                "[build]\nrustdoc = \"./rustdoc-wrapper\"\n",
+            )
+            .unwrap();
+        } else {
+            command.env(setting, &rustdoc);
+        }
+        let report = success(command.output().unwrap());
+        assert!(report.contains("pub struct Wrapped"), "{setting}: {report}");
+        fs::write(
+            root.join("api/src/lib.rs"),
+            "//! </div></details>\npub struct Wrapped;",
+        )
+        .unwrap();
+        let error = failure(command.output().unwrap());
+        assert!(
+            error.contains("invalid documentation HTML"),
+            "{setting}: {error}"
+        );
+    }
+}
+
+#[test]
 fn cached_docs_respect_root_features_and_do_not_add_dependency_defaults() {
     let dir = project();
     let report = success(query(
@@ -1651,6 +1743,94 @@ fn unavailable_globs_cannot_hide_competing_definitions() {
 }
 
 #[test]
+fn source_globs_resolve_with_fenced_docs_and_backtick_literals() {
+    let dir = project();
+    let root = dir.path();
+    for prefix in [
+        "//! Example:\n//! ```rust\n//! let x = 1;\n//! ```",
+        "const TEXT: &str = \"```\";",
+        "const TEXT: &str = \"``````` &lt; < > &\";",
+    ] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "{prefix}\npub mod inner {{ pub struct Item; }}\n\
+                 #[doc(no_inline)] pub use inner::*;\n\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("app/src/lib.rs"), "pub use alias::Item;").unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let report = success(query(root, "use alias::Item;", &[]));
+        assert!(report.contains("pub struct Item"), "{prefix}: {report}");
+    }
+}
+
+#[test]
+fn terminal_globs_preserve_hidden_public_bindings_and_private_shadowing() {
+    let dir = project();
+    let root = dir.path();
+    for binding in [
+        "#[doc(hidden)] pub struct Item { pub actual: u64 }",
+        "#[doc(hidden)] pub fn Item() {}",
+        "struct Item;",
+        "macro_rules! define { () => { #[doc(hidden)] pub struct Item; }; } define!();",
+    ] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "pub mod hidden {{ {binding} }}\n\
+                 pub mod shown {{ pub struct Item {{ pub wrong: u8 }} pub struct Control; }}\n\
+                 #[doc(no_inline)] pub use hidden::*;\n\
+                 #[doc(no_inline)] pub use shown::*;"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/src/lib.rs"),
+            if binding.contains("pub fn") {
+                "use alias::Item; pub fn probe(_: Item) { Item(); }"
+            } else {
+                "use alias::Item; pub fn probe(_: Item) {}"
+            },
+        )
+        .unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            checked.status.success(),
+            binding == "struct Item;" || binding.contains("pub fn"),
+            "{binding}: {checked:?}"
+        );
+        let output = query(root, "use alias::Item;", &[]);
+        if binding == "struct Item;" {
+            assert!(success(output).contains("pub wrong: u8"));
+        } else {
+            let error = failure(output);
+            assert!(
+                error.contains("no available rustdoc HTML page")
+                    || error.contains("source bindings are incomplete")
+                    || error.contains("ambiguous"),
+                "{binding}: {error}"
+            );
+        }
+        if !binding.contains("define!") {
+            let report = success(query(root, "use alias::Control;", &[]));
+            assert!(report.contains("pub struct Control"), "{report}");
+        }
+    }
+}
+
+#[test]
 fn local_non_inlined_globs_resolve_concrete_names_and_preserve_precedence() {
     let dir = project();
     fs::write(
@@ -2757,6 +2937,9 @@ pub mod imported_two {
 }
 #[doc(no_inline)] pub use imported_one::*;
 #[doc(no_inline)] pub use imported_two::*;
+// Expansion-dependent exports need their own scope: other glob lookups
+// cannot prove the absence of hidden bindings in these modules.
+pub mod generated {
 pub mod generated_one {
     macro_rules! local { () => { mod inner { pub fn function() {} } }; }
     local!();
@@ -2771,6 +2954,7 @@ pub mod generated_two {
 }
 #[doc(no_inline)] pub use generated_one::*;
 #[doc(no_inline)] pub use generated_two::*;
+}
 pub mod absolute_one {
     pub mod inner { pub fn function() {} }
     #[doc(inline)] pub use ::inner::function as Absolute;
@@ -2786,7 +2970,7 @@ pub mod absolute_two {
 "#,
     )
     .unwrap();
-    let import = "use alias::{Record, Choice::{self, One}, Trait, Alias, function, Renamed, Absolute, GeneratedAbsolute, VALUE, STATIC, nested::{self, deeper::Nested}};";
+    let import = "use alias::{Record, Choice::{self, One}, Trait, Alias, function, Renamed, Absolute, generated::GeneratedAbsolute, VALUE, STATIC, nested::{self, deeper::Nested}};";
     fs::write(root.join("app/src/lib.rs"), import).unwrap();
     success(
         Command::new("cargo")
@@ -2801,7 +2985,7 @@ pub mod absolute_two {
         "Conflict",
         "LocalConflict",
         "ImportedConflict",
-        "GeneratedConflict",
+        "generated::GeneratedConflict",
         "AbsoluteConflict",
     ] {
         fs::write(root.join("app/src/lib.rs"), format!("use alias::{name};")).unwrap();
@@ -3165,6 +3349,71 @@ pub enum E {
     ] {
         let error = failure(query(dir.path(), &format!("use alias::{name};"), &[]));
         assert!(error.contains("ambiguous"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn tuple_constructor_shadowing_respects_the_importing_scope() {
+    let dir = project();
+    let root = dir.path();
+    for inline in ["", "#[doc(no_inline)]"] {
+        for (fields, accessible) in [
+            ("u8", false),
+            ("pub u8", true),
+            ("pub(crate) u8", true),
+            ("pub(super) u8", true),
+            ("pub(in crate::types) u8", false),
+        ] {
+            fs::write(
+                root.join("api/src/lib.rs"),
+                format!(
+                    "pub mod values {{ pub fn Item() {{}} }}\n\
+                     pub mod types {{\n\
+                         pub struct Item({fields});\n\
+                         pub mod child {{ pub use super::Item; #[doc(no_inline)] pub use crate::values::*; pub fn construct() {{ let _: Item = Item(0); }} }}\n\
+                         #[doc(no_inline)] pub use crate::values::*;\n\
+                     }}\n\
+                     {inline} pub use types::Item;\n\
+                     #[doc(no_inline)] pub use values::*;\n{}",
+                    if accessible { "pub fn construct() { let _: Item = Item(0); }" } else { "" },
+                ),
+            )
+            .unwrap();
+            fs::write(
+                root.join("app/src/lib.rs"),
+                if accessible {
+                    "use alias::Item; pub fn probe(_: Item) {}"
+                } else {
+                    "use alias::Item; pub fn probe(_: Item) { Item(); }"
+                },
+            )
+            .unwrap();
+            success(
+                Command::new("cargo")
+                    .args(["check", "--offline", "--locked", "--package", "app"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            let output = query(root, "use alias::Item;", &[]);
+            if accessible {
+                let report = success(output);
+                assert!(
+                    report.contains("pub struct Item"),
+                    "{fields}/{inline}: {report}"
+                );
+            } else {
+                let error = failure(output);
+                assert!(error.contains("ambiguous"), "{fields}/{inline}: {error}");
+            }
+            for scope in ["types", "types::child"] {
+                let report = success(query(root, &format!("use alias::{scope}::Item;"), &[]));
+                assert!(
+                    report.contains("pub struct Item"),
+                    "{fields}/{scope}: {report}"
+                );
+            }
+        }
     }
 }
 
