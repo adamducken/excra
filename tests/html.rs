@@ -1981,6 +1981,53 @@ fn uncertain_source_bindings_never_substitute_glob_definitions() {
 }
 
 #[test]
+fn documentation_source_links_cannot_supply_glob_binding_evidence() {
+    let dir = project();
+    let root = dir.path();
+    for genuine_source in [false, true] {
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                r#"{}
+//! <a class="src" href="struct.Control.html">Source</a>
+pub struct Control;
+pub mod origin {{ pub struct Item {{ pub wrong: u8 }} }}
+#[doc(no_inline)] pub use origin::*;
+#[doc(hidden)] pub struct Item {{ pub actual: u64 }}
+"#,
+                if genuine_source {
+                    ""
+                } else {
+                    "#![doc(html_no_source)]"
+                }
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/src/lib.rs"),
+            "pub fn item() -> alias::Item { alias::Item { actual: 1 } }",
+        )
+        .unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let error = failure(query(root, "use alias::Item;", &[]));
+        assert!(
+            error.contains(if genuine_source {
+                "no available rustdoc HTML page"
+            } else {
+                "source bindings are incomplete"
+            }),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn inactive_conditional_bindings_allow_globs_but_enabled_hidden_bindings_block_them() {
     let dir = project();
     let root = dir.path();
@@ -2094,6 +2141,43 @@ fn deeply_layered_glob_reexports_resolve_to_one_item() {
     ));
     fs::write(dir.path().join("api/src/lib.rs"), source).unwrap();
     let report = success(query(dir.path(), "use alias::Item;", &[]));
+    assert_eq!(paths(&report, "source: ").len(), 1);
+    assert!(report.contains("pub struct Item"), "{report}");
+}
+
+#[test]
+fn mixed_alias_glob_layers_resolve_to_the_shared_definition() {
+    let dir = project();
+    let root = dir.path();
+    let levels = 12;
+    let mut source = "pub mod leaf { pub mod M0 { pub struct Item; } }\n".to_string();
+    for level in 1..=levels {
+        let previous = level - 1;
+        let imports = if level == 1 {
+            "pub use crate::leaf::*;".to_string()
+        } else {
+            format!("pub use crate::a{previous}::*; pub use crate::b{previous}::*;")
+        };
+        for side in ["a", "b"] {
+            source.push_str(&format!(
+                "pub mod {side}{level} {{ {imports} #[doc(inline)] pub use M{previous} as M{level}; }}\n"
+            ));
+        }
+    }
+    source.push_str(&format!(
+        "#[doc(no_inline)] pub use a{levels}::*;\n#[doc(no_inline)] pub use b{levels}::*;"
+    ));
+    fs::write(root.join("api/src/lib.rs"), source).unwrap();
+    let import = format!("use alias::M{levels}::Item;");
+    fs::write(root.join("app/src/lib.rs"), &import).unwrap();
+    success(
+        Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    );
+    let report = success(query(root, &import, &[]));
     assert_eq!(paths(&report, "source: ").len(), 1);
     assert!(report.contains("pub struct Item"), "{report}");
 }
@@ -2452,6 +2536,165 @@ pub mod b {{ {unrelated} #[doc(inline)] pub use crate::source as Alias; }}
         let report = success(query(root, "use alias::Alias;", &[]));
         assert_eq!(paths(&report, "source: ").len(), 1, "{report}");
         assert!(report.contains("pub fn Alias"), "{report}");
+    }
+}
+
+#[test]
+fn external_facade_and_macro_exports_share_their_canonical_definitions() {
+    let dir = project();
+    let root = dir.path();
+    let manifest = root.join("inner/Cargo.toml");
+    let original = fs::read_to_string(&manifest).unwrap();
+    fs::write(root.join("inner/src/internal.rs"), "pub fn original() {}").unwrap();
+    for (proc_macro, source, left, right, name, usage, kind) in [
+        (
+            false,
+            "mod internal { pub fn item() {} } pub use internal::item;",
+            "item",
+            "item",
+            "item",
+            "pub fn call() { alias::item(); }",
+            "fn",
+        ),
+        (
+            false,
+            "mod internal; pub use internal::original as first; pub use first as second;",
+            "first",
+            "second",
+            "item",
+            "pub fn call() { alias::item(); }",
+            "fn",
+        ),
+        (
+            false,
+            "mod internal { pub fn original() {} } pub mod facade { pub use crate::internal::original as item; } pub use facade::*;",
+            "item",
+            "facade::item",
+            "item",
+            "pub fn call() { alias::item(); }",
+            "fn",
+        ),
+        (
+            false,
+            "mod nested { #[macro_export] macro_rules! Foo { () => { 1u8 }; } }",
+            "Foo",
+            "Foo",
+            "Foo",
+            "pub fn value() -> u8 { alias::Foo!() }",
+            "macro",
+        ),
+        (
+            false,
+            "mod nested { #[macro_export] macro_rules! Foo { () => { 1u8 }; } } pub use crate::Foo as Other;",
+            "Foo",
+            "Other",
+            "Foo",
+            "pub fn value() -> u8 { alias::Foo!() }",
+            "macro",
+        ),
+        (
+            true,
+            "#[proc_macro_derive(Foo, attributes(helper))] pub fn derive_foo(_: proc_macro::TokenStream) -> proc_macro::TokenStream { proc_macro::TokenStream::new() }",
+            "Foo",
+            "Foo",
+            "Foo",
+            "#[derive(alias::Foo)] #[helper] pub struct Value;",
+            "derive",
+        ),
+        (
+            true,
+            "#[proc_macro_attribute] pub fn Foo(_: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream { item }",
+            "Foo",
+            "Foo",
+            "Foo",
+            "#[alias::Foo] pub struct Value;",
+            "attr",
+        ),
+        (
+            true,
+            "#[proc_macro] pub fn Foo(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"1u8\".parse().unwrap() }",
+            "Foo",
+            "Foo",
+            "Foo",
+            "pub fn value() -> u8 { alias::Foo!() }",
+            "macro",
+        ),
+    ] {
+        fs::write(
+            &manifest,
+            if proc_macro {
+                format!("{original}\n[lib]\nproc-macro = true\n")
+            } else {
+                original.clone()
+            },
+        )
+        .unwrap();
+        fs::write(root.join("inner/src/lib.rs"), source).unwrap();
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "pub mod a {{ #[doc(inline)] pub use inner::{left} as {name}; }}\n\
+                 pub mod b {{ #[doc(inline)] pub use inner::{right} as {name}; }}\n\
+                 #[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("app/src/lib.rs"), usage).unwrap();
+        success(
+            Command::new("cargo")
+                .args(["check", "--offline", "--locked", "--package", "app"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let report = success(query(root, &format!("use alias::{name};"), &[]));
+        let pages = paths(&report, "source: ");
+        assert_eq!(pages.len(), 1, "{source}: {report}");
+        assert!(
+            pages[0].ends_with(format!("{kind}.{name}.html")),
+            "{report}"
+        );
+    }
+}
+
+#[test]
+fn distinct_external_facade_exports_remain_ambiguous() {
+    let dir = project();
+    let root = dir.path();
+    for (source, first, second, kind) in [
+        (
+            "mod one { pub fn item() {} } mod two { pub fn item() {} } pub use one::item as First; pub use two::item as Second;",
+            "First",
+            "Second",
+            "fn",
+        ),
+        (
+            "mod one { #[macro_export] macro_rules! First { () => { 1u8 }; } } mod two { #[macro_export] macro_rules! Second { () => { 2u8 }; } }",
+            "First",
+            "Second",
+            "macro",
+        ),
+    ] {
+        fs::write(root.join("inner/src/lib.rs"), source).unwrap();
+        fs::write(
+            root.join("api/src/lib.rs"),
+            format!(
+                "pub mod a {{ #[doc(inline)] pub use inner::{first} as Item; }}\n\
+                 pub mod b {{ #[doc(inline)] pub use inner::{second} as Item; }}\n\
+                 #[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("app/src/lib.rs"), "use alias::Item;").unwrap();
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!checked.status.success(), "{kind}: {checked:?}");
+        assert!(String::from_utf8_lossy(&checked.stderr).contains("ambiguous"));
+        let error = failure(query(root, "use alias::Item;", &[]));
+        assert!(error.contains("ambiguous"), "{kind}: {error}");
     }
 }
 

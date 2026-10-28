@@ -6,6 +6,7 @@ use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, NodeDep, Package
 use cargo_platform::{Cfg, CfgExpr};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
 use html_to_markdown_rs::{CodeBlockStyle, ConversionOptions, HeadingStyle, convert};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -24,6 +25,7 @@ pub(crate) struct Documentation {
 struct ExternalCrate {
     dependency: NodeDep,
     source: PathBuf,
+    edition_2015: bool,
 }
 
 pub(crate) fn generate(
@@ -255,6 +257,7 @@ pub(crate) fn generate(
                             .find(|package| package.id == dependency.pkg)?;
                         Some(ExternalCrate {
                             dependency: dependency.clone(),
+                            edition_2015: package.edition.as_str() == "2015",
                             source: library_target(package)
                                 .ok()?
                                 .src_path
@@ -512,22 +515,26 @@ fn item_identity(
 }
 
 fn source_link(docs: &Path, page: &Path) -> Option<HtmlItem> {
-    let html = read_html(page).ok()?;
-    for link in html.split("<a ").skip(1) {
-        let tag = link.split('>').next().unwrap_or_default();
-        if attribute(tag, "class") == Some("src")
-            && let Some(href) = attribute(tag, "href")
-            && let Ok(source) = local_link(docs, page.parent()?, href)
-        {
-            return Some(source);
-        }
-    }
-    None
+    let page_data = ParsedPage::new(read_html(page).ok()?).ok()?;
+    let source = local_link(docs, page.parent()?, page_data.source_link.as_deref()?).ok()?;
+    source.page.strip_prefix(docs.join("src")).ok()?;
+    Some(source)
 }
 
 fn source_file(page: &Path) -> Option<syn::File> {
     let html = read_html(page).ok()?;
-    let code = html.split_once("<code>")?.1.split_once("</code>")?.0;
+    let body = html.split_once("<body ")?.1.split_once('>')?.0;
+    let classes = attribute(body, "class")?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if !classes.contains(&"rustdoc") || !classes.contains(&"src") {
+        return None;
+    }
+    let code = html
+        .split_once("<pre class=\"rust\"><code>")?
+        .1
+        .split_once("</code>")?
+        .0;
     let snippet = code
         .lines()
         .map(|line| line.split_once("</a>").map_or(line, |(_, code)| code))
@@ -556,9 +563,38 @@ fn rendered_code(html: &str) -> Option<String> {
 struct SourceContext {
     cfg: Option<Vec<Cfg>>,
     edition_2015: bool,
+    external_source: Option<PathBuf>,
+    cache: RefCell<SourceCache>,
+}
+
+#[derive(Default)]
+struct SourceCache {
+    paths: HashMap<SourceQuery, Option<SourcePath>>,
+    globs: HashMap<SourceQuery, Option<HashSet<SourcePath>>>,
+    cycles: usize,
+    #[cfg(test)]
+    expansions: usize,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct SourceQuery {
+    docs: PathBuf,
+    module: PathBuf,
+    absolute: bool,
+    path: Vec<String>,
+    namespaces: u8,
 }
 
 impl SourceContext {
+    fn for_lookup(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            edition_2015: self.edition_2015,
+            external_source: self.external_source.clone(),
+            ..Default::default()
+        }
+    }
+
     fn new(
         mut cfg: Vec<Cfg>,
         features: &[String],
@@ -628,6 +664,7 @@ impl SourceContext {
         Self {
             cfg,
             edition_2015: package.edition.as_str() == "2015",
+            ..Default::default()
         }
     }
 
@@ -781,6 +818,9 @@ fn plain_attributes(attributes: &[syn::Attribute]) -> bool {
             "repr",
             "non_exhaustive",
             "derive",
+            "proc_macro",
+            "proc_macro_attribute",
+            "proc_macro_derive",
         ]
         .iter()
         .any(|name| attribute.path().is_ident(name))
@@ -855,11 +895,36 @@ fn unconditional_attributes(attributes: &[syn::Attribute]) -> bool {
             .any(|attribute| attribute.path().is_ident("cfg"))
 }
 
-fn declaration(item: &syn::Item) -> Option<(&syn::Ident, &'static str)> {
-    Some(match item {
+fn procedural_macro(item: &syn::ItemFn) -> Option<(syn::Ident, &'static str)> {
+    for attribute in &item.attrs {
+        if attribute.path().is_ident("proc_macro_derive") {
+            let arguments = attribute
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .ok()?;
+            let syn::Meta::Path(name) = arguments.first()? else {
+                return None;
+            };
+            return Some((name.get_ident()?.clone(), "derive"));
+        }
+        if attribute.path().is_ident("proc_macro_attribute") {
+            return Some((item.sig.ident.clone(), "attr"));
+        }
+        if attribute.path().is_ident("proc_macro") {
+            return Some((item.sig.ident.clone(), "macro"));
+        }
+    }
+    None
+}
+
+fn declaration(item: &syn::Item) -> Option<(syn::Ident, &'static str)> {
+    let (ident, kind) = match item {
         syn::Item::Const(item) => (&item.ident, "constant"),
         syn::Item::Enum(item) => (&item.ident, "enum"),
-        syn::Item::Fn(item) => (&item.sig.ident, "fn"),
+        syn::Item::Fn(item) => {
+            return Some(procedural_macro(item).unwrap_or_else(|| (item.sig.ident.clone(), "fn")));
+        }
         syn::Item::Macro(item) => (item.ident.as_ref()?, "macro"),
         syn::Item::Mod(item) => (&item.ident, "index"),
         syn::Item::Static(item) => (&item.ident, "static"),
@@ -869,55 +934,54 @@ fn declaration(item: &syn::Item) -> Option<(&syn::Ident, &'static str)> {
         syn::Item::Type(item) => (&item.ident, "type"),
         syn::Item::Union(item) => (&item.ident, "union"),
         _ => return None,
-    })
+    };
+    Some((ident.clone(), kind))
 }
 
-// Without dependency HTML, only unconditional declarations can prove that an
-// external re-export contributes to this page's namespace and kind.
-fn external_has_kind(source: &Path, path: &[String], kind: &str) -> Option<bool> {
+fn external_source_file(source: &Path) -> Option<syn::File> {
     let syntax = syn::parse_file(&fs::read_to_string(source).ok()?).ok()?;
-    if !unconditional_attributes(&syntax.attrs) {
+    unconditional_attributes(&syntax.attrs).then_some(syntax)
+}
+
+enum ExternalDefinition {
+    Item(Vec<String>),
+    OtherKind,
+}
+
+// Resolve source exports before comparing kinds. A known different kind is
+// irrelevant to this page; missing or conditional evidence stays unknown.
+fn external_definition(
+    source: &Path,
+    edition_2015: bool,
+    path: &[String],
+    kind: &str,
+) -> Option<ExternalDefinition> {
+    let context = SourceContext {
+        edition_2015,
+        external_source: Some(source.to_path_buf()),
+        ..Default::default()
+    };
+    let docs = source.parent()?;
+    let mut requested = vec!["crate".into()];
+    requested.extend_from_slice(path);
+    let SourcePath::Local(path) = resolve_source_path(
+        docs,
+        &context,
+        Path::new("external"),
+        false,
+        requested,
+        kind_namespace(kind),
+        &mut HashSet::new(),
+    )?
+    else {
+        return None;
+    };
+    let (name, parents) = path.split_last()?;
+    let (_, items) = module_items(docs, &context, &parents.iter().collect::<PathBuf>())?;
+    if !context.complete_items(&items) {
         return None;
     }
-    let mut items = syntax.items;
-    let mut directory = source.parent()?.to_path_buf();
-    let (name, parents) = path.split_last()?;
-    for name in parents {
-        let mut modules = items.into_iter().filter_map(|item| match item {
-            syn::Item::Mod(module) if identifier_key(&module.ident.to_string()) == *name => {
-                Some(module)
-            }
-            _ => None,
-        });
-        let module = modules.next()?;
-        if modules.next().is_some()
-            || !unconditional_attributes(&module.attrs)
-            || module
-                .attrs
-                .iter()
-                .any(|attribute| attribute.path().is_ident("path"))
-        {
-            return None;
-        }
-        if let Some((_, contents)) = module.content {
-            items = contents;
-        } else {
-            let file = directory.join(format!("{name}.rs"));
-            let nested = directory.join(name).join("mod.rs");
-            let file = match (file.is_file(), nested.is_file()) {
-                (true, false) => file,
-                (false, true) => nested,
-                _ => return None,
-            };
-            let syntax = syn::parse_file(&fs::read_to_string(file).ok()?).ok()?;
-            if !unconditional_attributes(&syntax.attrs) {
-                return None;
-            }
-            items = syntax.items;
-        }
-        directory.push(name);
-    }
-    let mut kinds = Vec::new();
+    let mut kinds = HashSet::new();
     for item in &items {
         if let Some((ident, kind)) = declaration(item)
             && identifier_key(&ident.to_string()) == *name
@@ -925,10 +989,25 @@ fn external_has_kind(source: &Path, path: &[String], kind: &str) -> Option<bool>
             if !unconditional_attributes(item_attributes(item)?) {
                 return None;
             }
-            kinds.push(kind);
+            kinds.insert(kind);
         }
     }
-    (!kinds.is_empty()).then(|| kinds.contains(&kind))
+    if parents.len() == 1 && !kinds.contains(&kind) {
+        let macros = exported_macros(docs, &context, Path::new(&parents[0]), &items, name);
+        if !macros.complete {
+            return None;
+        }
+        if macros.found {
+            kinds.insert("macro");
+        }
+    }
+    if kinds.contains(&kind) {
+        Some(ExternalDefinition::Item(path[1..].to_vec()))
+    } else if !kinds.is_empty() {
+        Some(ExternalDefinition::OtherKind)
+    } else {
+        None
+    }
 }
 
 fn module_items(
@@ -943,15 +1022,23 @@ fn module_items_with_visited(
     docs: &Path,
     context: &SourceContext,
     module: &Path,
-    visited: &mut HashSet<(PathBuf, String)>,
+    visited: &mut HashSet<(PathBuf, String, u8)>,
 ) -> Option<(PathBuf, Vec<syn::Item>)> {
     let components = module
         .iter()
         .map(|part| part.to_str())
         .collect::<Option<Vec<_>>>()?;
     let mut directory = docs.join(components.first()?);
-    let source = source_link(docs, &directory.join("index.html"))?;
-    let syntax = source_file(&source.page)?;
+    let mut source_directory = context
+        .external_source
+        .as_ref()
+        .and_then(|source| source.parent())
+        .map(Path::to_path_buf);
+    let syntax = if let Some(source) = &context.external_source {
+        external_source_file(source)?
+    } else {
+        source_file(&source_link(docs, &directory.join("index.html"))?.page)?
+    };
     if !plain_attributes(&syntax.attrs) {
         return None;
     }
@@ -1004,12 +1091,24 @@ fn module_items_with_visited(
         if modules.next().is_some()
             || !plain_attributes(&module.attrs)
             || context.enabled(&module.attrs) != Some(true)
+            || (context.external_source.is_some()
+                && (!unconditional_attributes(&module.attrs)
+                    || module.attrs.iter().any(|attr| attr.path().is_ident("path"))))
         {
             return None;
         }
         directory.push(name);
         items = context.active_items(if let Some((_, items)) = module.content {
             items
+        } else if let Some(source_directory) = &source_directory {
+            let file = source_directory.join(format!("{name}.rs"));
+            let nested = source_directory.join(name).join("mod.rs");
+            let file = match (file.is_file(), nested.is_file()) {
+                (true, false) => file,
+                (false, true) => nested,
+                _ => return None,
+            };
+            external_source_file(&file)?.items
         } else {
             let source = source_link(docs, &directory.join("index.html"))?;
             let syntax = source_file(&source.page)?;
@@ -1018,12 +1117,15 @@ fn module_items_with_visited(
             }
             syntax.items
         });
+        if let Some(source_directory) = &mut source_directory {
+            source_directory.push(name);
+        }
     }
     Some((directory.strip_prefix(docs).ok()?.to_path_buf(), items))
 }
 
-fn declaration_binding(item: &syn::Item) -> Option<(&syn::Ident, u8, &syn::Visibility)> {
-    Some(match item {
+fn declaration_binding(item: &syn::Item) -> Option<(syn::Ident, u8, &syn::Visibility)> {
+    let (ident, namespaces, visibility) = match item {
         syn::Item::Const(item) => (&item.ident, 2, &item.vis),
         syn::Item::Enum(item) => (&item.ident, 1, &item.vis),
         syn::Item::ExternCrate(item) => (
@@ -1031,7 +1133,12 @@ fn declaration_binding(item: &syn::Item) -> Option<(&syn::Ident, u8, &syn::Visib
             1,
             &item.vis,
         ),
-        syn::Item::Fn(item) => (&item.sig.ident, 2, &item.vis),
+        syn::Item::Fn(item) => {
+            if let Some((ident, _)) = procedural_macro(item) {
+                return Some((ident, 4, &item.vis));
+            }
+            (&item.sig.ident, 2, &item.vis)
+        }
         syn::Item::Mod(item) => (&item.ident, 1, &item.vis),
         syn::Item::Static(item) => (&item.ident, 2, &item.vis),
         syn::Item::Struct(item) => (
@@ -1048,7 +1155,8 @@ fn declaration_binding(item: &syn::Item) -> Option<(&syn::Ident, u8, &syn::Visib
         syn::Item::Type(item) => (&item.ident, 1, &item.vis),
         syn::Item::Union(item) => (&item.ident, 1, &item.vis),
         _ => return None,
-    })
+    };
+    Some((ident.clone(), namespaces, visibility))
 }
 
 struct ExportedMacros<'a> {
@@ -1381,13 +1489,7 @@ fn declared_reexport(
             // Expansions may introduce an explicit binding that shadows a glob.
             return None;
         }
-        let namespaces = if type_kind(kind) {
-            1
-        } else if kind == "macro" {
-            4
-        } else {
-            2
-        };
+        let namespaces = kind_namespace(kind);
         let target = resolve_source_path(
             docs,
             context,
@@ -1413,12 +1515,18 @@ fn declared_reexport(
                 if packages.any(|other| other.dependency.pkg != package.dependency.pkg) {
                     return None;
                 }
-                if !external_has_kind(&package.source, external_path, kind)? {
-                    continue;
-                }
+                let path = match external_definition(
+                    &package.source,
+                    package.edition_2015,
+                    external_path,
+                    kind,
+                )? {
+                    ExternalDefinition::Item(path) => path,
+                    ExternalDefinition::OtherKind => continue,
+                };
                 ItemIdentity::External {
                     package: package.dependency.pkg.clone(),
-                    path: external_path.to_vec(),
+                    path,
                     kind: kind.to_string(),
                     fragment: item.fragment.clone(),
                 }
@@ -1458,7 +1566,7 @@ fn declared_reexport(
     None
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SourcePath {
     Local(Vec<String>),
     External(Vec<String>),
@@ -1469,9 +1577,44 @@ fn resolve_source_path(
     context: &SourceContext,
     module: &Path,
     absolute: bool,
+    path: Vec<String>,
+    namespaces: u8,
+    visited: &mut HashSet<(PathBuf, String, u8)>,
+) -> Option<SourcePath> {
+    let key = SourceQuery {
+        docs: docs.to_path_buf(),
+        module: module.to_path_buf(),
+        absolute,
+        path: path.clone(),
+        namespaces,
+    };
+    if let Some(result) = context.cache.borrow().paths.get(&key) {
+        return result.clone();
+    }
+    let cycles = context.cache.borrow().cycles;
+    #[cfg(test)]
+    {
+        context.cache.borrow_mut().expansions += 1;
+    }
+    let result =
+        resolve_source_path_uncached(docs, context, module, absolute, path, namespaces, visited);
+    let mut cache = context.cache.borrow_mut();
+    // A cycle depends on the active branch. Never publish that branch's
+    // incomplete result as a completed resolution for another branch.
+    if cache.cycles == cycles {
+        cache.paths.insert(key, result.clone());
+    }
+    result
+}
+
+fn resolve_source_path_uncached(
+    docs: &Path,
+    context: &SourceContext,
+    module: &Path,
+    absolute: bool,
     mut path: Vec<String>,
     namespaces: u8,
-    visited: &mut HashSet<(PathBuf, String)>,
+    visited: &mut HashSet<(PathBuf, String, u8)>,
 ) -> Option<SourcePath> {
     let mut base = module
         .iter()
@@ -1571,8 +1714,9 @@ fn resolve_source_path(
         let shadowed = scope_shadows_external(&items, name, requested);
         let mut target = None;
         if (!aliases.is_empty() || (!shadowed && !globs.is_empty()))
-            && !visited.insert((scope.clone(), name.clone()))
+            && !visited.insert((scope.clone(), name.clone(), requested))
         {
+            context.cache.borrow_mut().cycles += 1;
             return None;
         }
         if !aliases.is_empty() {
@@ -1679,7 +1823,38 @@ fn source_glob_bindings(
     module: &Path,
     name: &str,
     namespaces: u8,
-    visited: &mut HashSet<(PathBuf, String)>,
+    visited: &mut HashSet<(PathBuf, String, u8)>,
+) -> Option<HashSet<SourcePath>> {
+    let key = SourceQuery {
+        docs: docs.to_path_buf(),
+        module: module.to_path_buf(),
+        absolute: false,
+        path: vec![name.to_string()],
+        namespaces,
+    };
+    if let Some(result) = context.cache.borrow().globs.get(&key) {
+        return result.clone();
+    }
+    let cycles = context.cache.borrow().cycles;
+    #[cfg(test)]
+    {
+        context.cache.borrow_mut().expansions += 1;
+    }
+    let result = source_glob_bindings_uncached(docs, context, module, name, namespaces, visited);
+    let mut cache = context.cache.borrow_mut();
+    if cache.cycles == cycles {
+        cache.globs.insert(key, result.clone());
+    }
+    result
+}
+
+fn source_glob_bindings_uncached(
+    docs: &Path,
+    context: &SourceContext,
+    module: &Path,
+    name: &str,
+    namespaces: u8,
+    visited: &mut HashSet<(PathBuf, String, u8)>,
 ) -> Option<HashSet<SourcePath>> {
     let mut definitions = HashSet::new();
     let mut pending = vec![(module.to_path_buf(), namespaces)];
@@ -1714,7 +1889,7 @@ fn source_glob_bindings(
         };
         for item in &items {
             if let Some((ident, binding, visibility)) = declaration_binding(item) {
-                record(ident, binding, visibility)?;
+                record(&ident, binding, visibility)?;
             } else if let syn::Item::ForeignMod(block) = item {
                 for item in &block.items {
                     if let Some((ident, binding, visibility)) = foreign_binding(item) {
@@ -1938,6 +2113,7 @@ struct ParsedPage {
     globs: Vec<String>,
     variants: HashSet<String>,
     identity_links: Vec<(String, String)>,
+    source_link: Option<String>,
 }
 
 struct Bindings {
@@ -1971,6 +2147,7 @@ impl ParsedPage {
             globs: bindings.globs,
             variants: bindings.variants,
             identity_links: bindings.identity_links,
+            source_link: bindings.source_link,
         })
     }
 }
@@ -1978,6 +2155,8 @@ impl ParsedPage {
 #[derive(Debug, Default)]
 struct ExportBindings {
     content_depth: Option<usize>,
+    heading_depth: Option<usize>,
+    source_heading_depth: Option<usize>,
     table_depth: Option<usize>,
     variants_depth: Option<usize>,
     synthetic_depth: Option<usize>,
@@ -1989,6 +2168,7 @@ struct ExportBindings {
     globs: Vec<String>,
     variants: HashSet<String>,
     identity_links: Vec<(String, String)>,
+    source_link: Option<String>,
 }
 
 impl HtmlVisitor for ExportBindings {
@@ -2014,7 +2194,9 @@ impl HtmlVisitor for ExportBindings {
             .content_depth
             .is_some_and(|depth| ctx.depth == depth + 1)
         {
-            if ctx.tag_name == "dl" && has_class("item-table") {
+            if ctx.tag_name == "div" && has_class("main-heading") {
+                self.heading_depth = Some(ctx.depth);
+            } else if ctx.tag_name == "dl" && has_class("item-table") {
                 self.table_depth = Some(ctx.depth);
             } else if ctx.tag_name == "div" && has_class("variants") {
                 self.variants_depth = Some(ctx.depth);
@@ -2026,6 +2208,20 @@ impl HtmlVisitor for ExportBindings {
             {
                 self.synthetic_depth = Some(ctx.depth);
             }
+        } else if ctx.tag_name == "span"
+            && has_class("sub-heading")
+            && self
+                .heading_depth
+                .is_some_and(|depth| ctx.depth == depth + 1)
+        {
+            self.source_heading_depth = Some(ctx.depth);
+        } else if ctx.tag_name == "a"
+            && has_class("src")
+            && self
+                .source_heading_depth
+                .is_some_and(|depth| ctx.depth == depth + 1)
+        {
+            self.source_link = ctx.attributes().get("href").cloned();
         } else if ctx.tag_name == "h3"
             && has_class("code-header")
             && self
@@ -2102,6 +2298,12 @@ impl HtmlVisitor for ExportBindings {
         if self.content_depth == Some(ctx.depth) {
             self.content_depth = None;
         }
+        if self.heading_depth == Some(ctx.depth) {
+            self.heading_depth = None;
+        }
+        if self.source_heading_depth == Some(ctx.depth) {
+            self.source_heading_depth = None;
+        }
         VisitResult::Continue
     }
 }
@@ -2109,7 +2311,7 @@ impl HtmlVisitor for ExportBindings {
 struct HtmlLookup<'a> {
     docs: &'a Path,
     external_crates: &'a [ExternalCrate],
-    source_context: &'a SourceContext,
+    source_context: SourceContext,
     pages: HashMap<PathBuf, ParsedPage>,
     completed: HashMap<(HtmlItem, String, bool), Result<Vec<HtmlItem>, String>>,
     #[cfg(test)]
@@ -2125,7 +2327,7 @@ impl<'a> HtmlLookup<'a> {
         Self {
             docs,
             external_crates,
-            source_context,
+            source_context: source_context.for_lookup(),
             pages: HashMap::new(),
             completed: HashMap::new(),
             #[cfg(test)]
@@ -2192,7 +2394,7 @@ impl<'a> HtmlLookup<'a> {
                         if identities.insert(item_identity(
                             self.docs,
                             self.external_crates,
-                            self.source_context,
+                            &self.source_context,
                             &item,
                             &mut HashSet::new(),
                         )?) {
@@ -2324,7 +2526,6 @@ impl<'a> HtmlLookup<'a> {
         type_only: bool,
     ) -> Result<Bindings, String> {
         let docs = self.docs;
-        let context = self.source_context;
         let page = self.page(&item.page)?;
         let directory = item.page.parent().expect("page has a parent");
         let mut candidates = Vec::new();
@@ -2388,10 +2589,12 @@ impl<'a> HtmlLookup<'a> {
         } else {
             module_items(
                 docs,
-                context,
+                &self.source_context,
                 directory.strip_prefix(docs).expect("page is inside docs"),
             )
-            .map(|(module, items)| source_bindings(docs, context, &module, &items, name))
+            .map(|(module, items)| {
+                source_bindings(docs, &self.source_context, &module, &items, name)
+            })
             .unwrap_or_default()
         };
         let mut bindings = Vec::new();
@@ -2456,14 +2659,23 @@ fn item_namespaces(item: &HtmlItem, html: &str) -> Result<u8, String> {
             // Unit and tuple constructors also occupy the value namespace.
             if constructor { 1 | 2 } else { 1 }
         }
-        Some(kind) if type_kind(kind) => 1,
-        Some("macro" | "attr" | "derive") => 4,
-        _ => 2,
+        Some(kind) => kind_namespace(kind),
+        None => 2,
     })
 }
 
 fn page_kind(page: &Path) -> Option<&str> {
     page.file_name()?.to_str()?.split('.').next()
+}
+
+fn kind_namespace(kind: &str) -> u8 {
+    if type_kind(kind) {
+        1
+    } else if matches!(kind, "macro" | "attr" | "derive") {
+        4
+    } else {
+        2
+    }
 }
 
 fn type_kind(kind: &str) -> bool {
@@ -2683,6 +2895,108 @@ fn code_node(ctx: &NodeContext<'_>) -> bool {
 mod tests {
     use super::*;
 
+    fn source_header(href: &str) -> String {
+        format!(
+            "<div class=\"main-heading\"><span class=\"sub-heading\"><a class=\"src\" href=\"{href}\">Source</a></span></div>"
+        )
+    }
+
+    fn write_source(docs: &Path, source: &str) {
+        fs::create_dir_all(docs.join("src")).unwrap();
+        let source = source
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        fs::write(
+            docs.join("src/source.rs.html"),
+            format!("<body class=\"rustdoc src\"><main><section id=\"main-content\"><pre class=\"rust\"><code>{source}</code></pre></section></main></body>"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn external_exports_keep_kind_guards_and_unknown_source_evidence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("lib.rs");
+        let path = vec!["Item".into()];
+        fs::write(
+            &source,
+            "mod nested { #[macro_export] macro_rules! Item { () => {}; } }",
+        )
+        .unwrap();
+        assert!(matches!(
+            external_definition(&source, false, &path, "index"),
+            Some(ExternalDefinition::OtherKind)
+        ));
+        assert!(matches!(
+            external_definition(&source, false, &path, "macro"),
+            Some(ExternalDefinition::Item(actual)) if actual == path
+        ));
+        for contents in [
+            "#![cfg(feature = \"enabled\")] pub fn Item() {}",
+            "#[cfg(feature = \"enabled\")] pub fn Item() {}",
+            "mod inner { #[cfg(feature = \"enabled\")] pub fn actual() {} } pub use inner::actual as Item;",
+            "#[cfg(feature = \"enabled\")] mod inner { pub fn Item() {} } pub use inner::*;",
+            "mod inner; pub use inner::Item;",
+            "#[path = \"other.rs\"] mod inner; pub use inner::Item;",
+            "macro_rules! generate { () => { pub fn Item() {} }; } generate!();",
+            "pub use missing as Item; pub use Item as missing;",
+        ] {
+            fs::write(&source, contents).unwrap();
+            assert!(
+                external_definition(&source, false, &path, "fn").is_none(),
+                "{contents}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_evidence_requires_generated_header_and_source_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docs = dir.path();
+        let page = docs.join("index.html");
+        write_source(docs, "pub struct Real;");
+        let header = source_header("src/source.rs.html");
+        for wrapper in ["div class=\"docblock\"", "nav", "aside", "dd"] {
+            let tag = wrapper.split_whitespace().next().unwrap();
+            fs::write(
+                &page,
+                format!("<main><section id=\"main-content\"><{wrapper}>{header}</{tag}></section></main>"),
+            )
+            .unwrap();
+            assert!(source_link(docs, &page).is_none(), "{wrapper}");
+        }
+        fs::write(
+            &page,
+            format!("<main><section id=\"main-content\">{header}</section></main>"),
+        )
+        .unwrap();
+        let source = source_link(docs, &page).unwrap();
+        assert!(source_file(&source.page).is_some());
+        for html in [
+            "<code>pub struct Forged;</code>",
+            "<body class=\"rustdoc struct\"><pre class=\"rust\"><code>pub struct Forged;</code></pre></body>",
+            "<body class=\"rustdoc src\"><pre class=\"rust item-decl\"><code>pub struct Forged;</code></pre></body>",
+        ] {
+            fs::write(&source.page, html).unwrap();
+            assert!(source_file(&source.page).is_none(), "{html}");
+        }
+        fs::write(
+            docs.join("struct.Forged.html"),
+            "<code>pub struct Forged;</code>",
+        )
+        .unwrap();
+        fs::write(
+            &page,
+            format!(
+                "<main><section id=\"main-content\">{}</section></main>",
+                source_header("struct.Forged.html")
+            ),
+        )
+        .unwrap();
+        assert!(source_link(docs, &page).is_none());
+    }
+
     #[test]
     fn export_metadata_excludes_documentation_and_navigation_links() {
         let page = ParsedPage::new(
@@ -2746,17 +3060,16 @@ mod tests {
         for module in ["local", "broken"] {
             fs::create_dir_all(crate_dir.join(module)).unwrap();
         }
-        fs::write(
-            docs.join("source.html"),
-            "<code>pub mod local { pub struct Item; } pub mod broken {}</code>",
-        )
-        .unwrap();
+        write_source(docs, "pub mod local { pub struct Item; } pub mod broken {}");
         fs::write(
             crate_dir.join("index.html"),
-            r#"<main><a class="src" href="../source.html">Source</a><section id="main-content"><dl class="item-table">
+            format!(
+                r#"<main><section id="main-content">{}<dl class="item-table">
 <dt><code>pub use <a href="local/index.html">local</a>::*;</code></dt>
 <dt><code>pub use <a href="broken/index.html">broken</a>::*;</code></dt>
 </dl></section></main>"#,
+                source_header("../src/source.rs.html")
+            ),
         )
         .unwrap();
         fs::write(
@@ -2797,11 +3110,11 @@ mod tests {
                 let directory = crate_dir.join(name);
                 fs::create_dir_all(&directory).unwrap();
                 let source = if name.is_empty() {
-                    "../source.html"
+                    "../src/source.rs.html"
                 } else {
-                    "../../source.html"
+                    "../../src/source.rs.html"
                 };
-                fs::write(directory.join("index.html"), format!("<main><a class=\"src\" href=\"{source}\">Source</a><section id=\"main-content\"><dl class=\"item-table\">{body}</dl></section></main>")).unwrap();
+                fs::write(directory.join("index.html"), format!("<main><section id=\"main-content\">{}<dl class=\"item-table\">{body}</dl></section></main>", source_header(source))).unwrap();
             };
             let glob = |href: &str| {
                 format!("<dt><code>pub use <a href=\"{href}\">module</a>::*;</code></dt>")
@@ -2833,7 +3146,7 @@ mod tests {
                     source.push_str(&format!("pub mod {side}{level} {{}}"));
                 }
             }
-            fs::write(docs.join("source.html"), format!("<code>{source}</code>")).unwrap();
+            write_source(docs, &source);
             write_module(
                 "",
                 glob(&format!("a{}/index.html", levels - 1))
@@ -2859,7 +3172,7 @@ mod tests {
             );
             assert_eq!(lookup.expansions, 3 * (2 * levels + 2));
             assert_eq!(lookup.pages.len(), parsed);
-            fs::remove_file(docs.join("source.html")).unwrap();
+            fs::remove_file(docs.join("src/source.rs.html")).unwrap();
             let mut lookup = HtmlLookup::new(docs, &[], &context);
             assert!(
                 lookup
@@ -2950,10 +3263,12 @@ mod tests {
         fs::create_dir(docs.join("fixture")).unwrap();
         fs::write(
             docs.join("fixture/index.html"),
-            r#"<a class="src" href="../source.html">Source</a>"#,
+            format!(
+                "<main><section id=\"main-content\">{}</section></main>",
+                source_header("../src/source.rs.html")
+            ),
         )
         .unwrap();
-        let context = SourceContext::default();
         for (source, namespaces, expected) in [
             ("pub mod nested {}", 1, Some(vec!["fixture/nested"])),
             (
@@ -3011,7 +3326,8 @@ mod tests {
                 None,
             ),
         ] {
-            fs::write(docs.join("source.html"), format!("<code>{source}</code>")).unwrap();
+            write_source(docs, source);
+            let context = SourceContext::default();
             let actual = source_glob_bindings(
                 docs,
                 &context,
@@ -3037,7 +3353,10 @@ mod tests {
         fs::create_dir(docs.join("fixture")).unwrap();
         fs::write(
             docs.join("fixture/index.html"),
-            r#"<a class="src" href="../source.html">Source</a>"#,
+            format!(
+                "<main><section id=\"main-content\">{}</section></main>",
+                source_header("../src/source.rs.html")
+            ),
         )
         .unwrap();
         let mut source = "pub mod leaf { pub mod nested {} }\n".to_string();
@@ -3056,7 +3375,7 @@ mod tests {
             }
         }
         source.push_str("pub use a29::*; pub use b29::*;");
-        fs::write(docs.join("source.html"), format!("<code>{source}</code>")).unwrap();
+        write_source(docs, &source);
         assert_eq!(
             source_glob_bindings(
                 docs,
@@ -3075,20 +3394,137 @@ mod tests {
     }
 
     #[test]
+    fn mixed_alias_glob_layers_share_completed_source_resolutions() {
+        for levels in [4, 8, 16] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let docs = dir.path();
+            fs::create_dir(docs.join("fixture")).unwrap();
+            fs::write(
+                docs.join("fixture/index.html"),
+                format!(
+                    "<main><section id=\"main-content\">{}</section></main>",
+                    source_header("../src/source.rs.html")
+                ),
+            )
+            .unwrap();
+            let mut source = "pub mod leaf { pub mod M0 { pub struct Item; } }".to_string();
+            for level in 1..=levels {
+                let previous = level - 1;
+                let imports = if level == 1 {
+                    "pub use crate::leaf::*;".to_string()
+                } else {
+                    format!("pub use crate::a{previous}::*; pub use crate::b{previous}::*;")
+                };
+                for side in ["a", "b"] {
+                    source.push_str(&format!(
+                        "pub mod {side}{level} {{ {imports} pub use M{previous} as M{level}; }}"
+                    ));
+                }
+            }
+            source.push_str(&format!("pub use a{levels}::*; pub use b{levels}::*;"));
+            write_source(docs, &source);
+            let context = SourceContext::default();
+            let resolve = || {
+                resolve_source_path(
+                    docs,
+                    &context,
+                    Path::new("fixture"),
+                    false,
+                    vec![format!("M{levels}"), "Item".into()],
+                    1,
+                    &mut HashSet::new(),
+                )
+            };
+            let expected = Some(SourcePath::Local(
+                ["fixture", "leaf", "M0", "Item"]
+                    .map(str::to_string)
+                    .to_vec(),
+            ));
+            assert_eq!(resolve(), expected);
+            let expansions = context.cache.borrow().expansions;
+            assert!(expansions <= 40 * levels, "{levels}: {expansions}");
+            assert_eq!(resolve(), expected);
+            assert_eq!(context.cache.borrow().expansions, expansions);
+        }
+    }
+
+    #[test]
+    fn source_cache_separates_namespaces_and_does_not_publish_cycle_failures() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docs = dir.path();
+        fs::create_dir(docs.join("fixture")).unwrap();
+        fs::write(
+            docs.join("fixture/index.html"),
+            format!(
+                "<main><section id=\"main-content\">{}</section></main>",
+                source_header("../src/source.rs.html")
+            ),
+        )
+        .unwrap();
+        write_source(
+            docs,
+            "pub mod origin { pub struct Item { pub field: u8 } } pub use origin::Item as Alias; pub fn Alias() {}",
+        );
+        let context = SourceContext::default();
+        let mut active = HashSet::from([(PathBuf::from("fixture"), "Alias".into(), 1)]);
+        assert_eq!(
+            resolve_source_path(
+                docs,
+                &context,
+                Path::new("fixture"),
+                false,
+                vec!["Alias".into()],
+                1,
+                &mut active,
+            ),
+            None
+        );
+        assert!(context.cache.borrow().paths.is_empty());
+        for (namespaces, path) in [
+            (1, vec!["fixture", "origin", "Item"]),
+            (2, vec!["fixture", "Alias"]),
+        ] {
+            let expected = SourcePath::Local(path.into_iter().map(str::to_string).collect());
+            assert_eq!(
+                resolve_source_path(
+                    docs,
+                    &context,
+                    Path::new("fixture"),
+                    false,
+                    vec!["Alias".into()],
+                    namespaces,
+                    &mut HashSet::new(),
+                ),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                source_glob_bindings(
+                    docs,
+                    &context,
+                    Path::new("fixture"),
+                    "Alias",
+                    namespaces,
+                    &mut HashSet::new(),
+                ),
+                Some(HashSet::from([expected]))
+            );
+        }
+    }
+
+    #[test]
     fn cyclic_source_aliases_and_parent_paths_stop_without_identity_evidence() {
         let dir = tempfile::TempDir::new().unwrap();
         let docs = dir.path();
         fs::create_dir(docs.join("fixture")).unwrap();
         fs::write(
             docs.join("fixture/index.html"),
-            "<a class=\"src\" href=\"../source.html\">Source</a>",
+            format!(
+                "<main><section id=\"main-content\">{}</section></main>",
+                source_header("../src/source.rs.html")
+            ),
         )
         .unwrap();
-        fs::write(
-            docs.join("source.html"),
-            "<code>use b as a; use a as b;</code>",
-        )
-        .unwrap();
+        write_source(docs, "use b as a; use a as b;");
         let context = SourceContext::default();
         for path in [vec!["a", "item"], vec!["super", "item"]] {
             assert_eq!(
@@ -3112,11 +3548,8 @@ mod tests {
             "pub mod original {} #[cfg(unknown_flag)] pub use original as alias;",
             "pub mod original {} #[cfg_attr(all(), doc(inline))] pub use original as alias;",
         ] {
-            fs::write(
-                docs.join("source.html"),
-                format!("<code>{declaration}</code>"),
-            )
-            .unwrap();
+            write_source(docs, declaration);
+            let context = SourceContext::default();
             assert!(module_items(docs, &context, Path::new("fixture/alias")).is_none());
         }
     }
