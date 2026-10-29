@@ -2043,10 +2043,30 @@ fn exported_macros_shadow_globs_at_the_crate_root() {
             false,
         ),
         (
+            "macro_rules! install { () => {{ #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } }}; } pub fn define() { install!(); }",
+            false,
+        ),
+        (
+            "macro_rules! install { () => {{ #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } }}; } pub fn define() { let _ = install!(); }",
+            false,
+        ),
+        (
+            "macro_rules! install { () => { fn define() { #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } } }; } pub struct Setup; impl Setup { install!(); }",
+            false,
+        ),
+        (
+            "macro_rules! install { () => { fn define() { #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } } }; } pub trait Setup { install!(); }",
+            false,
+        ),
+        (
             "#[cfg(any())] #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; }",
             true,
         ),
         ("macro_rules! Item { () => { 2u64 }; }", true),
+        (
+            "macro_rules! unused { () => { #[doc(hidden)] #[macro_export] macro_rules! Item { () => { 2u64 }; } }; }",
+            true,
+        ),
     ] {
         fs::write(
             root.join("api/src/lib.rs"),
@@ -2104,6 +2124,11 @@ fn exported_macros_shadow_globs_at_the_crate_root() {
         assert!(report.contains("pub struct Control"), "{report}");
         let report = success(query(root, "use alias::Direct;", &[]));
         assert!(report.contains("macro_rules!"), "{report}");
+        let report = success(query(root, "use alias::Visible;", &[]));
+        assert!(
+            paths(&report, "source: ")[0].ends_with("macro.Visible.html"),
+            "{report}"
+        );
         if binding == "pub mod nested;" {
             let report = success(query(root, "use alias::NestedAlias;", &[]));
             assert!(report.contains("macro_rules! Extra"), "{report}");
@@ -2834,6 +2859,188 @@ fn external_facade_and_macro_exports_share_their_canonical_definitions() {
             pages[0].ends_with(format!("{kind}.{name}.html")),
             "{report}"
         );
+    }
+}
+
+#[test]
+fn reexport_chains_across_packages_share_only_the_defining_identity() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = ['app', 'api', 'facade', 'leaf', 'other']\nresolver = '3'\n",
+    )
+    .unwrap();
+    member(
+        root,
+        "app",
+        "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nalias = { package = 'api', path = '../api' }\n",
+        "pub fn probe() -> u8 { alias::item() }",
+    );
+    member(
+        root,
+        "api",
+        "[package]\nname = 'api'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\norigin = { package = 'facade', path = '../facade' }\nleaf = { path = '../leaf' }\n",
+        "pub mod a { #[doc(inline)] pub use origin::Alias as item; }\n\
+         pub mod b { #[doc(inline)] pub use leaf::item; }\n\
+         #[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;",
+    );
+    for name in ["leaf", "other"] {
+        member(
+            root,
+            name,
+            &format!("[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2024'\n"),
+            "pub fn item() -> u8 { 1 }",
+        );
+    }
+    for defining in ["leaf", "other"] {
+        member(
+            root,
+            "facade",
+            &format!(
+                "[package]\nname = 'facade'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\norigin = {{ package = '{defining}', path = '../{defining}' }}\n"
+            ),
+            "mod nested { pub use origin::item as Value; } pub use nested::Value as Alias;",
+        );
+        success(
+            Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let checked = Command::new("cargo")
+            .args(["check", "--offline", "--locked", "--package", "app"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        for module in ["a", "b"] {
+            let report = success(query(root, &format!("use alias::{module}::item;"), &[]));
+            assert!(
+                paths(&report, "source: ")[0].ends_with(format!("{module}/fn.item.html")),
+                "{report}"
+            );
+        }
+        let output = query(root, "use alias::item;", &[]);
+        if defining == "leaf" {
+            success(checked);
+            let report = success(output);
+            assert_eq!(paths(&report, "source: ").len(), 1, "{report}");
+            assert!(report.contains("pub fn item() -> u8"), "{report}");
+        } else {
+            assert!(!checked.status.success());
+            assert!(String::from_utf8_lossy(&checked.stderr).contains("ambiguous"));
+            let error = failure(output);
+            assert!(error.contains("ambiguous"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn external_identities_use_active_target_and_host_dependency_units() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = ['app', 'api']\nresolver = '3'\n",
+    )
+    .unwrap();
+    for (version, result) in [("1.0.0", "u8"), ("2.0.0", "u16")] {
+        let name = format!("vendor/leaf-{version}");
+        member(
+            root,
+            &name,
+            &format!("[package]\nname = 'leaf'\nversion = '{version}'\nedition = '2024'\n"),
+            &format!("pub fn item() -> {result} {{ 1 }}"),
+        );
+        fs::write(
+            root.join(name).join(".cargo-checksum.json"),
+            r#"{"package":null,"files":{}}"#,
+        )
+        .unwrap();
+    }
+    fs::create_dir(root.join(".cargo")).unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = 'vendored'\n[source.vendored]\ndirectory = {:?}\n",
+            root.join("vendor")
+        ),
+    )
+    .unwrap();
+    let (result, other_target) = if cfg!(windows) {
+        ("u16", "x86_64-unknown-linux-gnu")
+    } else {
+        ("u8", "x86_64-pc-windows-gnu")
+    };
+    for optional in [false, true] {
+        member(
+            root,
+            "api",
+            &format!(
+                "[package]\nname = 'api'\nversion = '0.1.0'\nedition = '2024'\n\
+                 [features]\nenabled = {}\n\
+                 [target.'cfg(unix)'.dependencies]\ninner = {{ package = 'leaf', version = '=1.0.0', optional = {optional} }}\n\
+                 [target.'cfg(windows)'.dependencies]\ninner = {{ package = 'leaf', version = '=2.0.0', optional = {optional} }}\n",
+                if optional { "['dep:inner']" } else { "[]" }
+            ),
+            "pub mod a { #[doc(inline)] pub use inner::item; }\n\
+             pub mod b { #[doc(inline)] pub use inner::item; }\n\
+             #[doc(no_inline)] pub use a::*;\n#[doc(no_inline)] pub use b::*;",
+        );
+        for build in [false, true] {
+            member(
+                root,
+                "app",
+                &format!(
+                    "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2024'\n[{}dependencies]\nalias = {{ package = 'api', path = '../api', features = ['enabled'] }}\n",
+                    if build { "build-" } else { "" }
+                ),
+                if build { "" } else { "pub use alias::item;" },
+            );
+            fs::write(
+                root.join("app/build.rs"),
+                if build {
+                    format!("fn main() {{ let _: {result} = alias::item(); }}")
+                } else {
+                    "fn main() {}".into()
+                },
+            )
+            .unwrap();
+            success(
+                Command::new("cargo")
+                    .args(["generate-lockfile", "--offline"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            success(
+                Command::new("cargo")
+                    .args(["check", "--offline", "--locked", "--package", "app"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap(),
+            );
+            let flags = if build {
+                vec!["--include-build", "--target", other_target]
+            } else {
+                vec![]
+            };
+            let report = success(query(root, "use alias::item;", &flags));
+            assert_eq!(paths(&report, "source: ").len(), 1, "{report}");
+            assert!(
+                report.contains(&format!("pub fn item() -> {result}")),
+                "{report}"
+            );
+            assert!(
+                report.contains(if build {
+                    "dependency: build"
+                } else {
+                    "dependency: normal"
+                }),
+                "{report}"
+            );
+        }
     }
 }
 

@@ -215,7 +215,7 @@ pub(crate) struct Unit {
     pub(crate) package: PackageId,
     pub(crate) host: bool,
     pub(crate) features: Vec<String>,
-    dependencies: Vec<(DependencyKind, UnitKey)>,
+    pub(crate) dependencies: Vec<(DependencyKind, UnitKey)>,
 }
 
 pub(crate) struct FeatureGraph {

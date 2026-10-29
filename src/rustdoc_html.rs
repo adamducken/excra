@@ -1,8 +1,8 @@
-use crate::cargo_graph::{self, FeatureGraph};
+use crate::cargo_graph::{self, FeatureGraph, UnitKey};
 use crate::cli::FeatureSelection;
 use crate::imports::{ImportPath, identifier_key};
 use crate::resolver::{ResolvedDependency, library_target, package_spec};
-use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, NodeDep, Package, PackageId};
+use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package, PackageId};
 use cargo_platform::{Cfg, CfgExpr};
 use html_to_markdown_rs::visitor::{HtmlVisitor, NodeContext, VisitResult};
 use html_to_markdown_rs::{
@@ -25,7 +25,9 @@ pub(crate) struct Documentation {
 }
 
 struct ExternalCrate {
-    dependency: NodeDep,
+    parent: UnitKey,
+    name: String,
+    unit: UnitKey,
     source: PathBuf,
     edition_2015: bool,
 }
@@ -156,9 +158,9 @@ pub(crate) fn generate(
         false,
         &compiler,
     )?;
-    let expected = graph
-        .closure((package.id.clone(), host_context))?
-        .into_iter()
+    let units = graph.closure((package.id.clone(), host_context))?;
+    let expected = units
+        .iter()
         .map(|unit| {
             (
                 unit.package.clone(),
@@ -234,44 +236,73 @@ pub(crate) fn generate(
     }
     let docs = docs?;
     convert_crate(&docs, &docs.join(dependency.target.name.replace('-', "_")))?;
+    let host_platform = if !host_context && units.iter().any(|unit| unit.host) {
+        Some(cargo_graph::host_platform(manifest, metadata, target)?)
+    } else {
+        None
+    };
+    let mut external_crates = Vec::new();
+    for unit in &units {
+        let platform = if unit.host {
+            host_platform.as_ref().unwrap_or(&effective_target)
+        } else {
+            &effective_target
+        };
+        let Some(node) = metadata
+            .resolve
+            .as_ref()
+            .and_then(|resolve| resolve.nodes.iter().find(|node| node.id == unit.package))
+        else {
+            continue;
+        };
+        for dependency in &node.deps {
+            if !dependency.dep_kinds.iter().any(|kind| {
+                kind.kind == DependencyKind::Normal && platform.matches(kind.target.as_ref())
+            }) {
+                continue;
+            }
+            // Cargo's unit edges exclude optional dependencies inactive here,
+            // even when another host/target unit enables the same package.
+            let Some((_, key)) = unit
+                .dependencies
+                .iter()
+                .find(|(kind, key)| *kind == DependencyKind::Normal && key.0 == dependency.pkg)
+            else {
+                continue;
+            };
+            let Some(package) = metadata
+                .packages
+                .iter()
+                .find(|package| package.id == dependency.pkg)
+            else {
+                continue;
+            };
+            let Ok(library) = library_target(package) else {
+                continue;
+            };
+            external_crates.push(ExternalCrate {
+                parent: (unit.package.clone(), unit.host),
+                name: dependency.name.replace('-', "_"),
+                unit: key.clone(),
+                edition_2015: package.edition.as_str() == "2015",
+                source: library.src_path.clone().into_std_path_buf(),
+            });
+        }
+    }
     Ok(Documentation {
         directory: docs,
         source_context: SourceContext::new(
             effective_target.cfg,
-            &graph
-                .closure((package.id.clone(), host_context))?
-                .into_iter()
+            &units
+                .iter()
                 .find(|unit| unit.package == package.id && unit.host == host_context)
                 .expect("documented unit is in closure")
                 .features,
             package,
             &configuration,
+            host_context,
         ),
-        external_crates: generated_metadata
-            .resolve
-            .as_ref()
-            .and_then(|resolve| resolve.nodes.iter().find(|node| node.id == documented.id))
-            .map(|node| {
-                node.deps
-                    .iter()
-                    .filter_map(|dependency| {
-                        let package = generated_metadata
-                            .packages
-                            .iter()
-                            .find(|package| package.id == dependency.pkg)?;
-                        Some(ExternalCrate {
-                            dependency: dependency.clone(),
-                            edition_2015: package.edition.as_str() == "2015",
-                            source: library_target(package)
-                                .ok()?
-                                .src_path
-                                .clone()
-                                .into_std_path_buf(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        external_crates,
         _generation_lock: generation_lock,
     })
 }
@@ -577,6 +608,7 @@ fn rendered_code(html: &str) -> Option<String> {
 #[derive(Default)]
 struct SourceContext {
     cfg: Option<Vec<Cfg>>,
+    unit: Option<UnitKey>,
     edition_2015: bool,
     external_source: Option<PathBuf>,
     cache: RefCell<SourceCache>,
@@ -605,6 +637,7 @@ impl SourceContext {
     fn for_lookup(&self) -> Self {
         Self {
             cfg: self.cfg.clone(),
+            unit: self.unit.clone(),
             edition_2015: self.edition_2015,
             external_source: self.external_source.clone(),
             ..Default::default()
@@ -616,6 +649,7 @@ impl SourceContext {
         features: &[String],
         package: &Package,
         configuration: &[(PathBuf, String)],
+        host: bool,
     ) -> Self {
         // The platform probe supplies compiler cfg, not arbitrary rustdoc or
         // build-script cfg. Such contexts must remain unknown to this pass.
@@ -679,6 +713,7 @@ impl SourceContext {
         };
         Self {
             cfg,
+            unit: Some((package.id.clone(), host)),
             edition_2015: package.edition.as_str() == "2015",
             ..Default::default()
         }
@@ -961,6 +996,7 @@ fn external_source_file(source: &Path) -> Option<syn::File> {
 
 enum ExternalDefinition {
     Item(Vec<String>),
+    Reexport(Vec<String>),
     OtherKind,
 }
 
@@ -980,7 +1016,7 @@ fn external_definition(
     let docs = source.parent()?;
     let mut requested = vec!["crate".into()];
     requested.extend_from_slice(path);
-    let SourcePath::Local(path) = resolve_source_path(
+    let path = match resolve_source_path(
         docs,
         &context,
         Path::new("external"),
@@ -988,9 +1024,9 @@ fn external_definition(
         requested,
         kind_namespace(kind),
         &mut HashSet::new(),
-    )?
-    else {
-        return None;
+    )? {
+        SourcePath::Local(path) => path,
+        SourcePath::External(path) => return Some(ExternalDefinition::Reexport(path)),
     };
     let (name, parents) = path.split_last()?;
     let (_, items) = module_items(docs, &context, &parents.iter().collect::<PathBuf>())?;
@@ -1344,6 +1380,12 @@ impl<'ast> syn::visit::Visit<'ast> for ExportedMacros<'_> {
         }
     }
 
+    fn visit_macro(&mut self, _: &'ast syn::Macro) {
+        // Invocations in bodies and associated items may generate root exports.
+        // Definitions are handled above without visiting their unexpanded tokens.
+        self.complete = false;
+    }
+
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
         // Attributes on expressions or associated items can also hide or
         // generate nested macro exports. Keep unmodeled contexts uncertain.
@@ -1459,11 +1501,11 @@ fn local_source_namespaces(
     }
     if parents.len() == 1 && variant.is_none() {
         let macros = exported_macros(docs, context, Path::new(&parents[0]), &items, name);
-        if !macros.complete {
-            return None;
-        }
         if macros.found {
             namespaces |= 4;
+        }
+        if !macros.complete && namespaces & 4 == 0 {
+            return None;
         }
     }
     Some(namespaces)
@@ -1609,7 +1651,7 @@ fn declared_reexport(
     }
     targets.sort_by_key(|(glob, _, _, _)| *glob);
     let mut resolved = Vec::new();
-    for (glob, absolute, path, unconditional) in targets {
+    'targets: for (glob, absolute, path, unconditional) in targets {
         if glob && resolved.iter().any(|(glob, _)| !glob) {
             continue;
         }
@@ -1631,35 +1673,42 @@ fn declared_reexport(
             &mut HashSet::new(),
         )?;
         let definition = match target {
-            SourcePath::External(path) => {
+            SourcePath::External(mut path) => {
                 // --no-deps may omit both the external page and its source.
-                let (crate_name, external_path) = path.split_first()?;
-                let mut packages = external_crates.iter().filter(|dep| {
-                    dep.dependency.name.replace('-', "_") == *crate_name
-                        && dep
-                            .dependency
-                            .dep_kinds
-                            .iter()
-                            .any(|kind| kind.kind == DependencyKind::Normal)
-                });
-                let package = packages.next()?;
-                if packages.any(|other| other.dependency.pkg != package.dependency.pkg) {
-                    return None;
-                }
-                let path = match external_definition(
-                    &package.source,
-                    package.edition_2015,
-                    external_path,
-                    kind,
-                )? {
-                    ExternalDefinition::Item(path) => path,
-                    ExternalDefinition::OtherKind => continue,
-                };
-                ItemIdentity::External {
-                    package: package.dependency.pkg.clone(),
-                    path,
-                    kind: kind.to_string(),
-                    fragment: item.fragment.clone(),
+                let mut parent = context.unit.as_ref()?;
+                let mut visited = HashSet::new();
+                loop {
+                    let (crate_name, external_path) = path.split_first()?;
+                    let mut packages = external_crates
+                        .iter()
+                        .filter(|dep| dep.parent == *parent && dep.name == *crate_name);
+                    let package = packages.next()?;
+                    if packages.any(|other| other.unit != package.unit) {
+                        return None;
+                    }
+                    if !visited.insert((package.unit.clone(), external_path.to_vec())) {
+                        return None;
+                    }
+                    let path = match external_definition(
+                        &package.source,
+                        package.edition_2015,
+                        external_path,
+                        kind,
+                    )? {
+                        ExternalDefinition::Item(path) => path,
+                        ExternalDefinition::Reexport(next) => {
+                            parent = &package.unit;
+                            path = next;
+                            continue;
+                        }
+                        ExternalDefinition::OtherKind => continue 'targets,
+                    };
+                    break ItemIdentity::External {
+                        package: package.unit.0.clone(),
+                        path,
+                        kind: kind.to_string(),
+                        fragment: item.fragment.clone(),
+                    };
                 }
             }
             SourcePath::Local(path) => {
@@ -3137,6 +3186,58 @@ mod tests {
                 "{contents}"
             );
         }
+    }
+
+    #[test]
+    fn external_reexport_chains_stop_at_cycles_and_uncertain_definitions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docs = dir.path();
+        write_source(docs, "pub use first::Item;");
+        fs::create_dir(docs.join("api")).unwrap();
+        fs::write(
+            docs.join("api/index.html"),
+            format!(
+                "<main><section id=\"main-content\">{}</section></main>",
+                source_header("../src/source.rs.html")
+            ),
+        )
+        .unwrap();
+        let package = |name: &str| PackageId { repr: name.into() };
+        let context = SourceContext {
+            unit: Some((package("api"), false)),
+            ..Default::default()
+        };
+        let crates = [
+            ("api", "first", "first"),
+            ("first", "inner", "second"),
+            ("second", "inner", "first"),
+        ]
+        .map(|(parent, name, dependency)| ExternalCrate {
+            parent: (package(parent), false),
+            name: name.into(),
+            unit: (package(dependency), false),
+            source: docs.join(format!("{dependency}.rs")),
+            edition_2015: false,
+        });
+        fs::write(docs.join("first.rs"), "pub use inner::Item;").unwrap();
+        let item = HtmlItem::new(docs.join("api/fn.Item.html"));
+        for contents in [
+            "pub use inner::Item;",
+            "#[cfg(feature = \"unknown\")] pub fn Item() {}",
+            "pub struct Item;",
+        ] {
+            fs::write(docs.join("second.rs"), contents).unwrap();
+            assert!(
+                declared_reexport(docs, &crates, &context, &item).is_none(),
+                "{contents}"
+            );
+        }
+        fs::write(docs.join("second.rs"), "pub fn Item() {}").unwrap();
+        assert!(matches!(
+            declared_reexport(docs, &crates, &context, &item),
+            Some(ItemIdentity::External { package: id, path, .. })
+                if id == package("second") && path == ["Item"]
+        ));
     }
 
     #[test]
